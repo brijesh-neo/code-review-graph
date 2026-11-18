@@ -59,6 +59,7 @@ from .migrations import (
     TARGET_RESOLUTION_EXPR,
     TARGET_RESOLUTION_KINDS,
     get_schema_version,
+    refresh_planner_stats,
     run_migrations,
     target_resolution_expr,
 )
@@ -2327,6 +2328,11 @@ class GraphStore:
     def commit(self) -> None:
         self._conn.commit()
         self._invalidate_cache()
+
+    def refresh_planner_stats(self) -> None:
+        """Commit, then write ``sqlite_stat1``; see ``migrations.refresh_planner_stats``."""
+        self.commit()
+        refresh_planner_stats(self._conn)
 
     def rollback(self) -> None:
         """Rollback the current transaction."""
