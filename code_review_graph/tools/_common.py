@@ -358,8 +358,15 @@ def _resolve_graph_file_paths_with_unmatched(
     for file_path in file_paths:
         matched = False
         raw = file_path.replace("\\", "/")
-        candidates = [raw]
         path = Path(file_path)
+        # The usual case is a graph that stores the absolute path, which is
+        # one index seek. The suffix lookups below are a LIKE scan of every
+        # node row (seconds on a large graph), so they only run on a miss.
+        exact = raw if path.is_absolute() else normalize_file_path(root / path)
+        if store.get_nodes_by_file(exact):
+            add(exact)
+            continue
+        candidates = [raw]
         if path.is_absolute():
             try:
                 candidates.append(str(path.resolve().relative_to(root)).replace("\\", "/"))
