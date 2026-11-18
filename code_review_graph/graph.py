@@ -4788,8 +4788,11 @@ class GraphStore:
             )
         try:
             row = self._conn.execute(
-                "SELECT COUNT(*) FROM edges "  # noqa: S608
-                "JOIN _impact_seed_names s ON s.name = edges.target_qualified "
+                # CROSS JOIN drives the count from the seed names, one index
+                # seek each. With a plain JOIN SQLite walked every CALLS and
+                # REFERENCES edge and probed the names: 13.9s on 10M edges.
+                "SELECT COUNT(*) FROM _impact_seed_names s "  # noqa: S608
+                "CROSS JOIN edges ON s.name = edges.target_qualified "
                 "WHERE edges.kind IN ('CALLS', 'REFERENCES') "
                 f"AND COALESCE(edges.target_resolution, {TARGET_RESOLUTION_EXPR}) "
                 "= 'unresolved'",
