@@ -775,6 +775,12 @@ def _impact_candidate_sql(resolution_guard: str) -> str:
     one edge per import buys: the alternative is one edge per file in the
     package, which on kubernetes is 73,507 edges for a single directory.
 
+    The first two branches use ``CROSS JOIN`` for the same reason: it makes
+    the frontier the outer loop, so each hop is one index seek per frontier
+    node. With a plain ``JOIN`` SQLite scanned every row of ``edges`` per hop
+    and probed the frontier for each one: 99 seconds against 0.15 on a graph
+    of 10 million edges.
+
     ``CROSS JOIN`` and ``INDEXED BY`` pin that branch to one index seek per
     frontier package. Left to itself SQLite drove it from the covering index
     on ``kind`` alone and rescanned every IMPORTS_FROM row once per
@@ -788,14 +794,14 @@ def _impact_candidate_sql(resolution_guard: str) -> str:
         SELECT e.target_qualified AS node_qn,
                f.score * COALESCE(p.weight, ?) * ? AS score
         FROM _impact_frontier f
-        JOIN edges e ON e.source_qualified = f.node_qn
+        CROSS JOIN edges e ON e.source_qualified = f.node_qn
         LEFT JOIN _impact_policies p ON p.kind = e.kind
         WHERE {_IMPACT_AOP_DIRECTION_CASE} = ?{resolution_guard}
         UNION ALL
         SELECT e.source_qualified AS node_qn,
                f.score * COALESCE(p.weight, ?) * ? AS score
         FROM _impact_frontier f
-        JOIN edges e ON e.target_qualified = f.node_qn
+        CROSS JOIN edges e ON e.target_qualified = f.node_qn
         LEFT JOIN _impact_policies p ON p.kind = e.kind
         WHERE {_IMPACT_AOP_DIRECTION_CASE} = ?{resolution_guard}
         UNION ALL
