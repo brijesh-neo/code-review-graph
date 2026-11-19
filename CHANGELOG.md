@@ -4,6 +4,16 @@
 
 ### Added
 
+- The graph stores paths relative to the repository (schema v16), so a
+  `graph.db` copied into a linked worktree, fork or clone answers with that
+  checkout's paths. Its first `update` there runs a full build, because some
+  resolver details still name the checkout it was built in; updates after that
+  are incremental. The first open converts an older graph in a copy and swaps
+  it in; other processes wait and retry. Releases before this one refuse a v16
+  graph, so a downgrade means a full rebuild. The VS Code extension reads both.
+- MCP tools take an optional `cwd`. When it is inside the repository, paths in
+  the result are repo-relative; without it, or outside the repository, they
+  stay absolute.
 - `install` keeps a record of the files it writes inside the repository, in
   `.code-review-graph/install-manifest.json`, even when `--data-dir` or
   `CRG_DATA_DIR` keeps the graph somewhere else. Each install adds to it and
@@ -32,6 +42,9 @@
   `detail_level="minimal"` drops source, so a search with
   `include_source=True` and `get_review_context_tool` stay at standard. Run
   `install` again for the new text.
+- Parsing a Python file runs Python's own `ast` parser once instead of three
+  times, so a build or update of a Python repository parses about 7% faster
+  (408 files: 9.3 s to 8.7 s). The graph is unchanged.
 
 ### Fixed
 
