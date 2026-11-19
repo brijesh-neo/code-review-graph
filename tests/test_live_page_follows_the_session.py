@@ -22,14 +22,29 @@ def test_state_splits_edited_read_and_unchecked(tmp_path: Path) -> None:
     assert state["unchecked"] == ["tests/test_lib.py"]
 
 
-def test_page_reloads_and_colours_the_sets(tmp_path: Path) -> None:
+def _stamp(out: Path) -> str:
+    text = (out.parent / (out.name + ".stamp.js")).read_text(encoding="utf-8")
+    return text.split('"')[1]
+
+
+def test_page_colours_the_sets_and_reloads_only_on_change(tmp_path: Path) -> None:
     repo = _repo(tmp_path)
     out = tmp_path / "live.html"
     render_live(repo, out, interval=2)
     page = out.read_text(encoding="utf-8")
-    assert '<meta http-equiv="refresh" content="2">' in page
+    assert "http-equiv" not in page  # a timed reload would restart the layout
     assert '"edited": ["lib.py"]' in page
     assert "crg-live" in page and "node-shape" in page
+    first = _stamp(out)
+    assert f'var mine = "{first}"' in page and "setInterval(check, 2000)" in page
+
+    render_live(repo, out, interval=2)
+    assert _stamp(out) == first  # nothing changed: the open page stays
+
+    record_tool_use(repo, {"tool_name": "Read", "session_id": "s1",
+                           "tool_input": {"file_path": str(repo / "app.py")}})
+    render_live(repo, out, interval=2)
+    assert _stamp(out) != first
 
 
 def test_nothing_changed_writes_a_waiting_page(tmp_path: Path) -> None:
@@ -51,3 +66,17 @@ def test_cli_once(tmp_path: Path) -> None:
     )
     assert result.returncode == 0, result.stderr
     assert "1 edited" in result.stdout and out.is_file()
+
+
+def test_page_carries_d3_itself_so_it_opens_from_disk(tmp_path: Path) -> None:
+    """Chrome blocks a file:// script with an integrity attribute, so the
+    page must not depend on loading D3 by src."""
+    from code_review_graph.visualization import D3_LOCAL_FILENAME, _d3_script_tags
+
+    repo = _repo(tmp_path)
+    out = tmp_path / "live.html"
+    render_live(repo, out)
+    page = out.read_text(encoding="utf-8")
+    assert _d3_script_tags() not in page
+    assert f'src="{D3_LOCAL_FILENAME}"' not in page
+    assert "document.write(" not in page

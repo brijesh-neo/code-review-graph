@@ -2,12 +2,16 @@
 
 ``live`` redraws a k-hop neighbourhood of the files changed since ``HEAD``
 (plus the files the activity log says were edited) whenever the graph or the
-log changes. The page reloads itself, so leaving it open in a browser tab is
-enough. Edited files are drawn red, files read green, and callers never read
+log changes. Next to the page sits ``<page>.stamp.js``; the page loads it
+every few seconds and reloads only when it names a newer drawing, so the
+layout is not thrown away while nothing changed. Leaving the page open in a
+browser tab is enough. Edited files are drawn red, files read green, and callers never read
 or tests never run amber.
 """
 from __future__ import annotations
 
+import base64
+import hashlib
 import html
 import json
 import logging
@@ -48,15 +52,40 @@ def live_state(repo_root: Path, *, base: str = "HEAD",
     }
 
 
+def _stamp_path(out: Path) -> Path:
+    return out.with_name(out.name + ".stamp.js")
+
+
+def _reload_script(out: Path, stamp: str, interval: float) -> str:
+    """Reload the page when the stamp file names a drawing other than this one."""
+    src = json.dumps(_stamp_path(out).name)
+    return f'''<script>
+(function () {{
+  var mine = {json.dumps(stamp)};
+  function check() {{
+    var s = document.createElement("script");
+    s.src = {src} + "?t=" + Date.now();
+    s.onload = function () {{
+      s.remove();
+      if (window.__crgLiveStamp && window.__crgLiveStamp !== mine) location.reload();
+    }};
+    s.onerror = function () {{ s.remove(); }};
+    document.head.appendChild(s);
+  }}
+  setInterval(check, {int(max(1.0, interval) * 1000)});
+}})();
+</script>'''
+
+
 def _overlay(state: dict, interval: float) -> tuple[str, str]:
-    """The ``<head>`` refresh tag and the ``<body>`` legend and colouring script."""
+    """The ``<head>`` tag and the ``<body>`` legend and colouring script."""
     sets = json.dumps({k: state[k] for k in COLOURS}).replace("</", "<\\/")
     colours = json.dumps(COLOURS)
     rows = "".join(
         f'<div><span style="color:{c}">&#9679;</span> {k}: {len(state[k])}</div>'
         for k, c in COLOURS.items()
     )
-    head = f'<meta http-equiv="refresh" content="{max(1, int(interval))}">'
+    head = '<meta name="crg-live" content="1">'
     body = f'''<div id="crg-live" style="position:fixed;right:12px;bottom:12px;z-index:9;
 background:rgba(20,20,24,.85);color:#ddd;font:12px sans-serif;padding:8px 10px;
 border-radius:6px">code-review-graph live{rows}</div>
@@ -89,9 +118,34 @@ border-radius:6px">code-review-graph live{rows}</div>
     return head, body
 
 
-def _empty_page(state: dict, interval: float) -> str:
-    head, _ = _overlay(state, interval)
-    return (f"<!DOCTYPE html><html><head><meta charset='utf-8'>{head}"
+def _inline_d3(page: str, directory: Path) -> str:
+    """Put the bundled D3 inside the page instead of loading it by ``src``.
+
+    Chrome refuses a ``file://`` script that carries an ``integrity``
+    attribute, so the loader tags ``generate_html`` writes leave a page opened
+    from disk without D3. The copy next to the page was checked against the
+    pinned hash when it was written; it is checked again here before it is
+    inlined, and the loader tags stay when it does not match.
+    """
+    from .visualization import D3_LOCAL_FILENAME, D3_SRI_HASH, _d3_script_tags
+
+    tags = _d3_script_tags()
+    if tags not in page:
+        return page
+    try:
+        data = (directory / D3_LOCAL_FILENAME).read_bytes()
+    except OSError as exc:
+        logger.warning("No D3 copy to inline (%s); the page loads it by src.", exc)
+        return page
+    digest = base64.b64encode(hashlib.sha384(data).digest()).decode()
+    if f"sha384-{digest}" != D3_SRI_HASH or b"</script" in data.lower():
+        logger.warning("The D3 copy does not match the pinned hash; not inlining it.")
+        return page
+    return page.replace(tags, "<script>" + data.decode("utf-8") + "</script>", 1)
+
+
+def _empty_page(state: dict) -> str:
+    return ("<!DOCTYPE html><html><head><meta charset='utf-8'>"
             "<title>code-review-graph live</title></head><body style='font:14px sans-serif'>"
             f"<p>Nothing changed since the base yet (session "
             f"{html.escape(str(state['session'] or 'none'))}). This page reloads by itself."
@@ -111,23 +165,30 @@ def render_live(repo_root: Path, out: Path, *, base: str = "HEAD",
     state = live_state(repo_root, base=base, session=session)
     out.parent.mkdir(parents=True, exist_ok=True)
     seeds = [str(repo_root / rel) for rel in state["edited"]]
-    if not seeds:
-        out.write_text(_empty_page(state, interval), encoding="utf-8")
-        return state
-    store = GraphStore(get_db_path(repo_root, read_only=True), read_only=True)
-    try:
-        generate_html(store, out, seed_files=seeds, depth=depth)
-    except SeedResolutionError:
-        out.write_text(_empty_page(state, interval), encoding="utf-8")
-        return state
-    finally:
-        store.close()
-    page = out.read_text(encoding="utf-8")
-    head, body = _overlay(state, interval)
-    page = page.replace("</head>", head + "</head>", 1)
+    page = ""
+    if seeds:
+        store = GraphStore(get_db_path(repo_root, read_only=True), read_only=True)
+        try:
+            generate_html(store, out, seed_files=seeds, depth=depth)
+            page = _inline_d3(out.read_text(encoding="utf-8"), out.parent)
+        except SeedResolutionError:
+            page = ""
+        finally:
+            store.close()
+    if page:
+        head, body = _overlay(state, interval)
+        page = page.replace("</head>", head + "</head>", 1)
+    else:
+        page, body = _empty_page(state), ""
+    stamp = hashlib.sha256(page.encode("utf-8") + body.encode("utf-8")).hexdigest()[:16]
+    body += _reload_script(out, stamp, interval)
     cut = page.rfind("</body>")
     page = page[:cut] + body + page[cut:] if cut >= 0 else page + body
-    out.write_text(page, encoding="utf-8")
+    if not out.is_file() or out.read_text(encoding="utf-8") != page:
+        out.write_text(page, encoding="utf-8")
+    _stamp_path(out).write_text(
+        f"window.__crgLiveStamp = {json.dumps(stamp)};\n", encoding="utf-8",
+    )
     return state
 
 
