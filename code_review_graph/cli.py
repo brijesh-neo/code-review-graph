@@ -175,6 +175,7 @@ _BANNER_GROUPS: tuple[tuple[str, tuple[tuple[str, str], ...]], ...] = (
         ("conflicts", "Find changes in other worktrees that touch yours"),
         ("structural-diff", "Compare this graph's edges with another checkout's"),
         ("affected-tests", "List the test files a change can reach"),
+        ("unchecked", "Callers you never read and tests you never ran"),
         ("check-rules", "Check the architecture rules in rules.toml"),
         ("history", "Record and query when edges appeared or went"),
         ("dead-code", "Find code that nothing calls or tests"),
@@ -1000,6 +1001,7 @@ _PATH_REPO_COMMANDS = frozenset({
     "export-absolute",
     "structural-diff",
     "affected-tests",
+    "unchecked",
     "check-rules",
     "history",
     "context-history",
@@ -1164,6 +1166,23 @@ def _handle_affected_tests(args) -> None:
 
     result = affected_tests(_explicit_or_found_root(args), args.base)
     print(json.dumps(result, indent=2) if args.json_output else format_affected(result))
+
+
+def _handle_unchecked(args) -> None:
+    """Changed symbols with unread callers and unrun tests."""
+    from .activity import activity_path, format_unchecked, unchecked
+
+    repo_root = _explicit_or_found_root(args)
+    if args.start:
+        log = activity_path(repo_root)
+        log.parent.mkdir(parents=True, exist_ok=True)
+        log.touch()
+        print(f"Activity log started: {log}")
+        return
+    result = unchecked(repo_root, base=args.base, session=args.session)
+    print(json.dumps(result, indent=2) if args.json_output else format_unchecked(result))
+    if result.get("error"):
+        raise SystemExit(1)
 
 
 def _handle_structural_diff(args) -> None:
@@ -2165,6 +2184,30 @@ def build_parser() -> argparse.ArgumentParser:
         help="Output one machine-readable JSON object",
     )
 
+    # unchecked
+    unchecked_cmd = sub.add_parser(
+        "unchecked",
+        help="Callers you never read and tests you never ran",
+        description=(
+            "For every symbol changed since BASE: its callers in files the session never "
+            "read and its tests the session never ran, from the activity log "
+            "(.code-review-graph/activity.jsonl) the enrich hook and the edit hook "
+            "write. --start begins the log. Read-only otherwise."
+        ),
+    )
+    unchecked_cmd.add_argument("--base", default="HEAD", help="Git ref (default HEAD)")
+    unchecked_cmd.add_argument(
+        "--session", default=None, help="Session id (default: the newest one logged)",
+    )
+    unchecked_cmd.add_argument(
+        "--start", action="store_true", help="Create the activity log here and exit",
+    )
+    unchecked_cmd.add_argument("--repo", default=None, help="Repository root (auto-detected)")
+    unchecked_cmd.add_argument(
+        "--json", action="store_true", dest="json_output",
+        help="Output one machine-readable JSON object",
+    )
+
     # structural-diff
     sdiff_cmd = sub.add_parser(
         "structural-diff",
@@ -3148,6 +3191,10 @@ def _dispatch() -> None:
 
     if args.command == "affected-tests":
         _handle_affected_tests(args)
+        return
+
+    if args.command == "unchecked":
+        _handle_unchecked(args)
         return
 
     if args.command == "structural-diff":

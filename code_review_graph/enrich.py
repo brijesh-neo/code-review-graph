@@ -291,6 +291,10 @@ def run_hook() -> None:
     if not db_path.exists():
         return
 
+    from .activity import record_tool_use
+
+    record_tool_use(repo_path, hook_input)
+
     # Dispatch. The tool call goes ahead either way, so a graph that cannot be
     # read costs the extra context and nothing else.
     context = ""

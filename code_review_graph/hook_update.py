@@ -10,11 +10,14 @@ to the file (#311).
 from __future__ import annotations
 
 import json
+import logging
 import sqlite3
 import subprocess
 import sys
 from pathlib import Path
 from typing import Any
+
+logger = logging.getLogger(__name__)
 
 # Keys an edit tool uses for the file it changed: ``file_path`` for Claude
 # Code's Edit, Write and MultiEdit, ``notebook_path`` for its NotebookEdit.
@@ -221,6 +224,32 @@ def run_update_hook(existing_only: bool = False) -> None:
         if not existing_only and _is_post_tool_use(payload):
             _tell_agent_not_updated(repo_root, failed.reason)
         raise
+    if not existing_only and _is_post_tool_use(payload):
+        _note_unchecked_impact(repo_root, payload)
+
+
+def _note_unchecked_impact(repo_root: Path, payload: Any) -> None:
+    """With an activity log started, log the edit and name the impact not checked.
+
+    Without ``.code-review-graph/activity.jsonl`` this does nothing at all.
+    """
+    from .activity import activity_path, hook_summary, log_event, unchecked
+
+    if not activity_path(repo_root).is_file():
+        return
+    edited = _payload_file(payload, _payload_cwd(payload))
+    if edited is not None:
+        log_event(repo_root, "edit", session=str(payload.get("session_id", "")),
+                  path=str(edited))
+    try:
+        note = hook_summary(unchecked(repo_root, session=str(payload.get("session_id", ""))))
+    except (OSError, sqlite3.Error, ValueError) as exc:
+        logger.warning("Could not work out the unchecked impact: %s", exc)
+        return
+    if note:
+        print(json.dumps({
+            "hookSpecificOutput": {"hookEventName": "PostToolUse", "additionalContext": note},
+        }))
 
 
 def _is_post_tool_use(payload: Any) -> bool:
