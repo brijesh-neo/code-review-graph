@@ -1875,7 +1875,7 @@ def _check_visualize_flags(args: argparse.Namespace, fmt: str) -> None:
 
 
 def _visualize_live(args: argparse.Namespace, repo_root: Path, html_path: Path) -> None:
-    """``visualize --live``: keep graph.html following the session, served or not."""
+    """``visualize --live``: keep live.html following the session, served or not."""
     from .live import DEFAULT_INTERVAL, run_live
 
     depth = 1 if args.depth is None else args.depth
@@ -2651,13 +2651,14 @@ def build_parser() -> argparse.ArgumentParser:
     live_group = vis_cmd.add_argument_group(
         "live view",
         "Draw the files changed since --live-base and the files the session "
-        "edited, and redraw graph.html whenever the graph or the activity log "
+        "edited, and redraw the page whenever the graph or the activity log "
         "changes. Edited files are red, files read green, callers never read "
-        "and tests never run amber. The open page reloads itself; Ctrl-C stops.",
+        "and tests never run amber. It writes live.html next to graph.html, so "
+        "the full view stays. The open page reloads itself; Ctrl-C stops.",
     )
     live_group.add_argument(
         "--live", action="store_true",
-        help="Keep graph.html following the session (default --depth 1)",
+        help="Keep live.html following the session (default --depth 1)",
     )
     live_group.add_argument(
         "--live-base", default=None, metavar="REF",
@@ -3878,7 +3879,7 @@ def _dispatch() -> None:
 
                 html_path = data_dir / "graph.html"
                 if getattr(args, "live", False):
-                    _visualize_live(args, repo_root, html_path)
+                    _visualize_live(args, repo_root, data_dir / "live.html")
                     return
                 vis_mode = getattr(args, "mode", "auto") or "auto"
                 depth = getattr(args, "depth", None)

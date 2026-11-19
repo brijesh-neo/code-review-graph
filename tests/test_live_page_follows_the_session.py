@@ -63,15 +63,17 @@ def _visualize(repo: Path, *flags: str) -> subprocess.CompletedProcess:
     )
 
 
-def test_visualize_live_once_draws_graph_html(tmp_path: Path) -> None:
-    """The live view is ``visualize --live``: the same graph.html, no second page."""
+def test_visualize_live_once_draws_live_html_and_leaves_graph_html(tmp_path: Path) -> None:
+    """``visualize --live`` is an add-on page: live.html, next to an untouched graph.html."""
     repo = _repo(tmp_path)
+    data = repo / ".code-review-graph"
+    assert _visualize(repo).returncode == 0
+    full = (data / "graph.html").read_text(encoding="utf-8")
     result = _visualize(repo, "--live", "--once")
     assert result.returncode == 0, result.stderr
     assert "1 edited" in result.stdout
-    page = repo / ".code-review-graph" / "graph.html"
-    assert "crg-live" in page.read_text(encoding="utf-8")
-    assert not (repo / ".code-review-graph" / "live.html").exists()
+    assert "crg-live" in (data / "live.html").read_text(encoding="utf-8")
+    assert (data / "graph.html").read_text(encoding="utf-8") == full
 
 
 def test_live_flags_that_cannot_apply_are_usage_errors(tmp_path: Path) -> None:
