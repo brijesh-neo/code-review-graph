@@ -173,6 +173,7 @@ _BANNER_GROUPS: tuple[tuple[str, tuple[tuple[str, str], ...]], ...] = (
         ("detect-changes", "Score the risk of your changes (read-only)"),
         ("impact", "Show what a change can reach"),
         ("conflicts", "Find changes in other worktrees that touch yours"),
+        ("structural-diff", "Compare this graph's edges with another checkout's"),
         ("dead-code", "Find code that nothing calls or tests"),
         ("refactor", "Preview a rename, dead code or suggestions"),
     )),
@@ -994,6 +995,7 @@ _PATH_REPO_COMMANDS = frozenset({
     "conflicts",
     "seed",
     "export-absolute",
+    "structural-diff",
     "context-history",
     "doctor",
     "install",
@@ -1093,6 +1095,21 @@ def _explicit_or_found_root(args) -> Path:
         given = Path(args.repo).expanduser()
         return _find_explicit_repo_root(given) or given.resolve()
     return find_project_root()
+
+
+def _handle_structural_diff(args) -> None:
+    """Edges, lost tests, new dependencies and flows that differ from a base graph."""
+    from .structural_diff import StructuralDiffError, run_structural_diff
+
+    repo_root = _explicit_or_found_root(args)
+    try:
+        run_structural_diff(
+            repo_root, Path(args.base_graph).expanduser().resolve(),
+            as_json=args.json_output, limit=args.limit,
+        )
+    except StructuralDiffError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        raise SystemExit(1) from exc
 
 
 def _handle_seed(args) -> None:
@@ -2008,6 +2025,26 @@ def build_parser() -> argparse.ArgumentParser:
         "--exit-code",
         action="store_true",
         help="Exit 1 when anything is found",
+    )
+
+    # structural-diff
+    sdiff_cmd = sub.add_parser(
+        "structural-diff",
+        help="Compare this checkout's graph with another checkout's or a graph file",
+        description=(
+            "Compare the graph here with a base graph (another worktree, clone, or a "
+            "graph.db file): edges added and removed by kind, functions that lost "
+            "every test, new file-to-file imports and flows whose criticality moved. "
+            "Read-only."
+        ),
+    )
+    sdiff_cmd.add_argument("base_graph", metavar="BASE",
+                           help="A checkout with a graph, or a graph.db file")
+    sdiff_cmd.add_argument("--repo", default=None, help="Repository root (auto-detected)")
+    sdiff_cmd.add_argument("--limit", type=int, default=50, help="Rows per section (50)")
+    sdiff_cmd.add_argument(
+        "--json", action="store_true", dest="json_output",
+        help="Output one machine-readable JSON object",
     )
 
     # seed
@@ -2961,6 +2998,10 @@ def _dispatch() -> None:
 
     if args.command == "conflicts":
         _handle_conflicts(args)
+        return
+
+    if args.command == "structural-diff":
+        _handle_structural_diff(args)
         return
 
     if args.command == "seed":
