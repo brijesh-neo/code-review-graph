@@ -79,6 +79,19 @@ export interface GraphEdge {
   line: number;
 }
 
+/** What a CodeLens above one function or class says. */
+export interface LensSummary {
+  node: GraphNode;
+  /** Distinct functions and classes that call or reference the node. */
+  callers: GraphNode[];
+  /** Callers with no TESTED_BY edge of their own (tests excluded). */
+  untestedCallers: number;
+  /** Tests linked to the node by a TESTED_BY edge. */
+  tests: number;
+  /** Execution flows the node is a step of. */
+  flows: number;
+}
+
 export interface GraphStats {
   totalNodes: number;
   totalEdges: number;
@@ -529,6 +542,47 @@ export class SqliteReader {
       lastUpdated,
       embeddingsCount,
     };
+  }
+
+  /** Callers, untested callers, tests and flows of each function and class in a file. */
+  getLensSummaries(filePath: string): LensSummary[] {
+    const db = this._db();
+    const callerRows = db.prepare(
+      `SELECT DISTINCT n.* FROM edges e JOIN nodes n ON n.qualified_name = e.source_qualified
+       WHERE e.target_qualified = ? AND e.kind IN ('CALLS', 'REFERENCES')
+       ORDER BY n.file_path, n.line_start`
+    );
+    const testCount = db.prepare(
+      "SELECT COUNT(DISTINCT target_qualified) AS cnt FROM edges " +
+      "WHERE source_qualified = ? AND kind = 'TESTED_BY'"
+    );
+    let flowCount: { get(id: number): unknown } | undefined;
+    try {
+      flowCount = db.prepare(
+        'SELECT COUNT(DISTINCT flow_id) AS cnt FROM flow_memberships WHERE node_id = ?'
+      );
+    } catch {
+      flowCount = undefined; // a graph built before flows existed
+    }
+    const out: LensSummary[] = [];
+    for (const node of this.getNodesByFile(filePath)) {
+      if (node.isTest || (node.kind !== 'Function' && node.kind !== 'Class')) { continue; }
+      const callers = (callerRows.all(this._in(node.qualifiedName)) as NodeRow[])
+        .map((r) => this._rowToNode(r))
+        .filter((c) => !c.isTest && c.kind !== 'Test');
+      let untested = 0;
+      for (const c of callers) {
+        if ((testCount.get(this._in(c.qualifiedName)) as CountRow).cnt === 0) { untested++; }
+      }
+      out.push({
+        node,
+        callers,
+        untestedCallers: untested,
+        tests: (testCount.get(this._in(node.qualifiedName)) as CountRow).cnt,
+        flows: flowCount ? (flowCount.get(node.id) as CountRow).cnt : 0,
+      });
+    }
+    return out;
   }
 
   /** Read a single key from the metadata table. */

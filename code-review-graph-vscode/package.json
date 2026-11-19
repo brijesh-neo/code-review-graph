@@ -185,6 +185,11 @@
           "maximum": 10,
           "description": "Maximum depth for blast radius traversal."
         },
+        "codeReviewGraph.codeLens.enabled": {
+          "type": "boolean",
+          "default": true,
+          "description": "Show callers, untested callers, tests and flows above each function and class."
+        },
         "codeReviewGraph.graph.maxNodes": {
           "type": "number",
           "default": 500,
