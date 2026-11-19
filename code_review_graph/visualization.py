@@ -70,15 +70,8 @@ def _d3_script_tags() -> str:
     return local_tag + "\n" + fallback_tag
 
 
-def _write_d3_asset(directory: Path) -> Path | None:
-    """Copy the vendored D3 build next to the generated HTML.
-
-    The copy is verified against the pinned SRI hash before writing. Returns
-    the written path, or ``None`` if the bundled asset is missing, corrupt, or
-    unwritable — the generated page then loads D3 via the SRI-pinned CDN
-    fallback tag instead.
-    """
-    dest = directory / D3_LOCAL_FILENAME
+def _bundled_d3() -> bytes | None:
+    """The vendored D3 build, or ``None`` when it is missing or fails the pinned hash."""
     try:
         asset = resources.files("code_review_graph") / "assets" / D3_LOCAL_FILENAME
         data = asset.read_bytes()
@@ -95,10 +88,37 @@ def _write_d3_asset(directory: Path) -> Path | None:
             data, digest = normalized, normalized_digest
     if f"sha384-{digest}" != D3_SRI_HASH:
         logger.error(
-            "Bundled D3 asset does not match the pinned SRI hash; refusing to write %s. "
+            "Bundled D3 asset does not match the pinned SRI hash; not using it. "
             "The page will use the CDN fallback.",
-            dest,
         )
+        return None
+    return data
+
+
+def _d3_loader() -> str:
+    """D3 for the page: the verified bundled build inline, else the loader tags.
+
+    Chrome gives a ``file://`` page an opaque origin and blocks a ``src``
+    script carrying ``integrity`` there, so a page that loads D3 by ``src``
+    draws nothing when opened from disk. Inlining the build after checking it
+    against the pinned hash keeps the same guarantee without the request.
+    """
+    data = _bundled_d3()
+    if data is None or b"</script" in data.lower():
+        return _d3_script_tags()
+    return "<script>" + data.decode("utf-8") + "</script>"
+
+
+def _write_d3_asset(directory: Path) -> Path | None:
+    """Copy the vendored D3 build next to the generated HTML.
+
+    The copy is verified against the pinned SRI hash before writing. Returns
+    the written path, or ``None`` if the bundled asset is missing, corrupt, or
+    unwritable.
+    """
+    dest = directory / D3_LOCAL_FILENAME
+    data = _bundled_d3()
+    if data is None:
         return None
     try:
         dest.write_bytes(data)
@@ -957,7 +977,7 @@ def generate_html(
     # Substitute the script tags into the trusted template BEFORE the graph
     # data: graph content is repo-derived, and running a replace over it would
     # let a node literally named __D3_SCRIPTS__ inject markup into the page.
-    html = template.replace("__D3_SCRIPTS__", _d3_script_tags())
+    html = template.replace("__D3_SCRIPTS__", _d3_loader())
     sidecar_tag, payload = _write_sidecar(output_path, data_json, sidecar)
     html = html.replace("__SIDECAR_SCRIPT__", sidecar_tag)
     html = html.replace("__GRAPH_DATA__", payload)

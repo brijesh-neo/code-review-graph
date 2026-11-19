@@ -481,6 +481,20 @@ describe('SqliteReader', () => {
 
   // -- close / isValid after close ----------------------------------------
 
+  it('getLensSummaries() counts callers, untested callers and tests', () => {
+    const lenses = reader.getLensSummaries('src/auth.py');
+    const login = lenses.find((l) => l.node.name === 'login');
+    assert.ok(login);
+    assert.deepStrictEqual(login.callers.map((c) => c.name), ['handle_login']);
+    assert.strictEqual(login.untestedCallers, 1);
+    assert.strictEqual(login.tests, 1);
+    assert.strictEqual(login.flows, 0);
+    const logout = lenses.find((l) => l.node.name === 'logout');
+    assert.ok(logout);
+    assert.strictEqual(logout.callers.length, 0);
+    assert.ok(!lenses.some((l) => l.node.kind === 'File'));
+  });
+
   it('isValid() returns false after close()', () => {
     const tmpPath = createTestDb();
     const tmpReader = new SqliteReader(tmpPath);
@@ -571,6 +585,13 @@ describe('SqliteReader on a relative graph', () => {
     assert.deepStrictEqual(sized.map((n) => n.filePath), [file]);
     const impact = reader.getImpactRadius([file], 1);
     assert.ok(impact.impactedFiles.includes('/elsewhere/lib.py'));
+  });
+
+  it('getLensSummaries() takes the absolute path the editor gives', () => {
+    const file = `${repo}/app.py`;
+    const lenses = reader.getLensSummaries(file);
+    assert.deepStrictEqual(lenses.map((l) => l.node.qualifiedName), [`${file}::run`]);
+    assert.strictEqual(lenses[0].callers.length, 0);
   });
 
   it('accepts schema v16', () => {

@@ -166,10 +166,18 @@ _BANNER_GROUPS: tuple[tuple[str, tuple[tuple[str, str], ...]], ...] = (
         ("postprocess", "Redo flows, communities and the search index"),
         ("embed", "Add vectors for search by meaning"),
         ("forget", "Drop files from the graph"),
+        ("seed", "Start this graph from another checkout's or a graph file"),
+        ("export-absolute", "Write a copy older releases can open"),
     )),
     ("Review", (
         ("detect-changes", "Score the risk of your changes (read-only)"),
         ("impact", "Show what a change can reach"),
+        ("conflicts", "Find changes in other worktrees that touch yours"),
+        ("structural-diff", "Compare this graph's edges with another checkout's"),
+        ("affected-tests", "List the test files a change can reach"),
+        ("unchecked", "Callers you never read and tests you never ran"),
+        ("check-rules", "Check the architecture rules in rules.toml"),
+        ("history", "Record and query when edges appeared or went"),
         ("dead-code", "Find code that nothing calls or tests"),
         ("refactor", "Preview a rename, dead code or suggestions"),
     )),
@@ -988,6 +996,14 @@ _GRAPH_TOOL_COMMANDS = {
 
 
 _PATH_REPO_COMMANDS = frozenset({
+    "conflicts",
+    "seed",
+    "export-absolute",
+    "structural-diff",
+    "affected-tests",
+    "unchecked",
+    "check-rules",
+    "history",
     "context-history",
     "doctor",
     "install",
@@ -1060,6 +1076,166 @@ def _handle_doctor(args) -> None:
     code = run_doctor(repo_root, as_json=args.json_output)
     if code:
         raise SystemExit(code)
+
+
+def _handle_conflicts(args) -> None:
+    """Print the conflict radar, read-only; ``--exit-code`` exits 1 on findings."""
+    from .conflicts import run_conflicts
+    from .incremental import find_project_root
+
+    if args.repo:
+        given = Path(args.repo).expanduser()
+        repo_root = _find_explicit_repo_root(given) or given.resolve()
+    else:
+        repo_root = find_project_root()
+    others = [Path(p).expanduser() for p in args.worktree] if args.worktree else None
+    code = run_conflicts(
+        repo_root, others, args.base, as_json=args.json_output, exit_code=args.exit_code,
+    )
+    if code:
+        raise SystemExit(code)
+
+
+def _explicit_or_found_root(args) -> Path:
+    from .incremental import find_project_root
+
+    if args.repo:
+        given = Path(args.repo).expanduser()
+        return _find_explicit_repo_root(given) or given.resolve()
+    return find_project_root()
+
+
+def _handle_history(args) -> None:
+    """``history record`` or ``history show``."""
+    from .history import HistoryError, format_events, record, show
+
+    repo_root = _explicit_or_found_root(args)
+    try:
+        if args.history_command == "record":
+            result = record(repo_root)
+            if args.json_output:
+                print(json.dumps(result, indent=2))
+            elif result["baseline"]:
+                print(f"Recorded a baseline of the graph at {result['commit'][:12]}.")
+            else:
+                print(
+                    f"Recorded {result['commit'][:12]}: +{result['added']} "
+                    f"-{result['removed']} edge(s); "
+                    f"{len(result['lost_last_test'])} symbol(s) lost their last test."
+                )
+            return
+        if args.history_command == "show":
+            result = show(
+                repo_root, source=args.source, target=args.target, kind=args.kind,
+                lost_tests=args.lost_tests, limit=args.limit,
+            )
+            print(json.dumps(result, indent=2) if args.json_output else format_events(result))
+            return
+    except HistoryError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        raise SystemExit(1) from exc
+    print("Usage: code-review-graph history {record,show}", file=sys.stderr)
+    raise SystemExit(2)
+
+
+def _handle_check_rules(args) -> None:
+    """Report rule violations; exit 1 when there are any."""
+    from .incremental import get_changed_files
+    from .rules import RulesError, check_rules, format_rules_report
+
+    repo_root = _explicit_or_found_root(args)
+    changed = None
+    if args.changed_only:
+        changed = get_changed_files(repo_root, args.base, strict=True)
+    try:
+        report = check_rules(
+            repo_root, changed_files=changed,
+            rules_path=Path(args.rules).expanduser() if args.rules else None,
+        )
+    except RulesError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        raise SystemExit(2) from exc
+    print(json.dumps(report, indent=2) if args.json_output else format_rules_report(report))
+    if report["violations"] or report["community_cycles"]:
+        raise SystemExit(1)
+
+
+def _handle_affected_tests(args) -> None:
+    """Print the test files the change reaches, or say to run them all."""
+    from .affected_tests import affected_tests, format_affected
+
+    result = affected_tests(_explicit_or_found_root(args), args.base)
+    print(json.dumps(result, indent=2) if args.json_output else format_affected(result))
+
+
+def _handle_unchecked(args) -> None:
+    """Changed symbols with unread callers and unrun tests."""
+    from .activity import activity_path, format_unchecked, unchecked
+
+    repo_root = _explicit_or_found_root(args)
+    if args.start:
+        log = activity_path(repo_root)
+        log.parent.mkdir(parents=True, exist_ok=True)
+        log.touch()
+        print(f"Activity log started: {log}")
+        return
+    result = unchecked(repo_root, base=args.base, session=args.session)
+    print(json.dumps(result, indent=2) if args.json_output else format_unchecked(result))
+    if result.get("error"):
+        raise SystemExit(1)
+
+
+def _handle_structural_diff(args) -> None:
+    """Edges, lost tests, new dependencies and flows that differ from a base graph."""
+    from .structural_diff import StructuralDiffError, run_structural_diff
+
+    repo_root = _explicit_or_found_root(args)
+    try:
+        run_structural_diff(
+            repo_root, Path(args.base_graph).expanduser().resolve(),
+            as_json=args.json_output, limit=args.limit,
+        )
+    except StructuralDiffError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        raise SystemExit(1) from exc
+
+
+def _handle_seed(args) -> None:
+    """Copy another checkout's graph here, then update what differs."""
+    from .portable import PortableGraphError, seed_graph
+
+    repo_root = _explicit_or_found_root(args)
+    try:
+        result = seed_graph(repo_root, Path(args.source), force=args.force)
+    except PortableGraphError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        raise SystemExit(1) from exc
+    if args.json_output:
+        print(json.dumps(result, indent=2))
+        return
+    print(
+        f"Seeded {result['graph']} from {result['source']}: "
+        f"{result['files_reparsed']} file(s) differed and were parsed again; "
+        f"{result['extra_rows_rewritten']} edge hint(s) re-pointed at this checkout."
+    )
+    for warning in result["warnings"]:
+        print(f"Warning: {warning}", file=sys.stderr)
+
+
+def _handle_export_absolute(args) -> None:
+    """Write a schema v15 copy with absolute paths for older releases."""
+    from .portable import PortableGraphError, export_absolute
+
+    repo_root = _explicit_or_found_root(args)
+    try:
+        result = export_absolute(repo_root, Path(args.out))
+    except PortableGraphError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        raise SystemExit(1) from exc
+    print(
+        f"Wrote {result['out']} (schema v{result['schema_version']}, absolute paths). "
+        "Put it at .code-review-graph/graph.db for a release before schema v16."
+    )
 
 
 def _handle_context_history(args) -> None:
@@ -1643,6 +1819,24 @@ def _check_visualize_flags(args: argparse.Namespace, fmt: str) -> None:
     """
     error = _SUBCOMMANDS["visualize"].error
     seeded = _is_seeded(args)
+    if getattr(args, "live", False):
+        if fmt != "html":
+            error(f"--live draws an interactive page; it has no effect on --format {fmt}")
+        if seeded:
+            error("--live seeds from the session's edits; drop the seed flags")
+        for name in ("render_depth", "max_nodes"):
+            if getattr(args, name, None) is not None:
+                error(f"--{name.replace('_', '-')} has no effect with --live")
+        if getattr(args, "sidecar", False):
+            error("--sidecar has no effect with --live")
+        if (getattr(args, "mode", "auto") or "auto") not in ("auto", "full"):
+            error(f"--mode {args.mode} has no effect with --live")
+        return
+    for name in ("live_base", "session", "interval"):
+        if getattr(args, name, None) is not None:
+            error(f"--{name.replace('_', '-')} requires --live")
+    if getattr(args, "once", False):
+        error("--once requires --live")
     tuning = [
         name for name in ("depth", "render_depth", "max_nodes")
         if getattr(args, name, None) is not None
@@ -1678,6 +1872,38 @@ def _check_visualize_flags(args: argparse.Namespace, fmt: str) -> None:
             "the opposite of a seeded neighbourhood; use --mode full or drop "
             "the seed"
         )
+
+
+def _visualize_live(args: argparse.Namespace, repo_root: Path, html_path: Path) -> None:
+    """``visualize --live``: keep live.html following the session, served or not."""
+    from .live import DEFAULT_INTERVAL, run_live
+
+    depth = 1 if args.depth is None else args.depth
+    interval = DEFAULT_INTERVAL if args.interval is None else args.interval
+    httpd = None
+    if getattr(args, "serve", False) and not args.once:
+        import functools
+        import http.server
+        import threading
+
+        port = 8765
+        handler = functools.partial(
+            http.server.SimpleHTTPRequestHandler, directory=str(html_path.parent),
+        )
+        httpd = http.server.HTTPServer(("localhost", port), handler)
+        threading.Thread(target=httpd.serve_forever, daemon=True).start()
+        print(f"Serving at http://localhost:{port}/{html_path.name}")
+    elif not args.once:
+        print(f"Open {html_path} in a browser; it reloads itself. Ctrl-C stops.")
+    try:
+        run_live(repo_root, html_path, base=args.live_base or "HEAD",
+                 session=args.session, depth=depth, interval=interval, once=args.once)
+    except KeyboardInterrupt:
+        print("\nLive view stopped.")
+    finally:
+        if httpd is not None:
+            httpd.shutdown()
+            httpd.server_close()
 
 
 def _print_seed_budget(report: dict) -> None:
@@ -1901,6 +2127,188 @@ def build_parser() -> argparse.ArgumentParser:
         dest="json_output",
         help="Output one machine-readable JSON object",
     )
+
+    # conflicts
+    conflicts_cmd = sub.add_parser(
+        "conflicts",
+        help="Find changes in other worktrees that touch yours (read-only)",
+        description=(
+            "Compare this worktree's changes with every other worktree of the "
+            "repository, measured from where the two branches split: symbols both "
+            "change, and changed symbols that call, reference, inherit or test a "
+            "symbol the other side changes. Each worktree needs its own graph. "
+            "Nothing is built or written."
+        ),
+    )
+    conflicts_cmd.add_argument("--repo", default=None, help="Repository root (auto-detected)")
+    conflicts_cmd.add_argument(
+        "--worktree",
+        action="append",
+        default=None,
+        metavar="PATH",
+        help="Compare with this worktree only (repeatable; default: all others)",
+    )
+    conflicts_cmd.add_argument(
+        "--base",
+        default=None,
+        help="Measure both sides from this ref (default: the merge base of each pair)",
+    )
+    conflicts_cmd.add_argument(
+        "--json",
+        action="store_true",
+        dest="json_output",
+        help="Output one machine-readable JSON object",
+    )
+    conflicts_cmd.add_argument(
+        "--exit-code",
+        action="store_true",
+        help="Exit 1 when anything is found",
+    )
+
+    # history
+    history_cmd = sub.add_parser(
+        "history",
+        help="Record and query when edges appeared or went",
+        description=(
+            "'history record' stores the edges added and removed since the last "
+            "record, tagged with HEAD, in .code-review-graph/history.db (run it "
+            "after each commit; the first run stores a baseline). 'history show' "
+            "lists those changes."
+        ),
+    )
+    history_sub = history_cmd.add_subparsers(dest="history_command", metavar="<action>")
+    for action, text in (("record", "Store what changed since the last record"),
+                         ("show", "List recorded changes")):
+        h = history_sub.add_parser(action, help=text, description=text + ".")
+        h.add_argument("--repo", default=None, help="Repository root (auto-detected)")
+        h.add_argument("--json", action="store_true", dest="json_output",
+                       help="Output one machine-readable JSON object")
+        if action == "show":
+            h.add_argument("--from", dest="source", default=None,
+                           help="Source path or qualified-name prefix, e.g. app/ui.py")
+            h.add_argument("--to", dest="target", default=None,
+                           help="Target path or qualified-name prefix")
+            h.add_argument("--kind", default=None, help="Edge kind, e.g. IMPORTS_FROM")
+            h.add_argument("--lost-tests", action="store_true",
+                           help="Only symbols that lost their last test")
+            h.add_argument("--limit", type=int, default=100, help="Events listed (100)")
+
+    # check-rules
+    rules_cmd = sub.add_parser(
+        "check-rules",
+        help="Check the architecture rules in .code-review-graph/rules.toml",
+        description=(
+            "Check forbidden dependencies ([[forbid]] with 'from' and 'to' globs) and, "
+            "with [no_cycles] between = \"communities\", import rings between "
+            "communities. Exits 1 on a violation, 2 when the rules or the graph "
+            "cannot be read."
+        ),
+    )
+    rules_cmd.add_argument("--rules", default=None, help="Rules file (default "
+                           ".code-review-graph/rules.toml)")
+    rules_cmd.add_argument("--changed-only", action="store_true",
+                           help="Only edges that start in files changed since --base")
+    rules_cmd.add_argument("--base", default="HEAD", help="Git ref for --changed-only")
+    rules_cmd.add_argument("--repo", default=None, help="Repository root (auto-detected)")
+    rules_cmd.add_argument(
+        "--json", action="store_true", dest="json_output",
+        help="Output one machine-readable JSON object",
+    )
+
+    # affected-tests
+    affected_cmd = sub.add_parser(
+        "affected-tests",
+        help="List the test files a change can reach",
+        description=(
+            "List the test files the graph links to the files changed since BASE "
+            "(callers, importers and tests of them). When unsure (a file the graph "
+            "lacks, a stale graph, changed test configuration, a capped walk) it "
+            "says to run every test. Read-only. For pytest: "
+            "pytest -p code_review_graph.pytest_plugin --crg-affected"
+        ),
+    )
+    affected_cmd.add_argument("--base", default="HEAD", help="Git ref (default HEAD)")
+    affected_cmd.add_argument("--repo", default=None, help="Repository root (auto-detected)")
+    affected_cmd.add_argument(
+        "--json", action="store_true", dest="json_output",
+        help="Output one machine-readable JSON object",
+    )
+
+    # unchecked
+    unchecked_cmd = sub.add_parser(
+        "unchecked",
+        help="Callers you never read and tests you never ran",
+        description=(
+            "For every symbol changed since BASE: its callers in files the session never "
+            "read and its tests the session never ran, from the activity log "
+            "(.code-review-graph/activity.jsonl) the enrich hook and the edit hook "
+            "write. --start begins the log. Read-only otherwise."
+        ),
+    )
+    unchecked_cmd.add_argument("--base", default="HEAD", help="Git ref (default HEAD)")
+    unchecked_cmd.add_argument(
+        "--session", default=None, help="Session id (default: the newest one logged)",
+    )
+    unchecked_cmd.add_argument(
+        "--start", action="store_true", help="Create the activity log here and exit",
+    )
+    unchecked_cmd.add_argument("--repo", default=None, help="Repository root (auto-detected)")
+    unchecked_cmd.add_argument(
+        "--json", action="store_true", dest="json_output",
+        help="Output one machine-readable JSON object",
+    )
+
+    # structural-diff
+    sdiff_cmd = sub.add_parser(
+        "structural-diff",
+        help="Compare this checkout's graph with another checkout's or a graph file",
+        description=(
+            "Compare the graph here with a base graph (another worktree, clone, or a "
+            "graph.db file): edges added and removed by kind, functions that lost "
+            "every test, new file-to-file imports and flows whose criticality moved. "
+            "Read-only."
+        ),
+    )
+    sdiff_cmd.add_argument("base_graph", metavar="BASE",
+                           help="A checkout with a graph, or a graph.db file")
+    sdiff_cmd.add_argument("--repo", default=None, help="Repository root (auto-detected)")
+    sdiff_cmd.add_argument("--limit", type=int, default=50, help="Rows per section (50)")
+    sdiff_cmd.add_argument(
+        "--json", action="store_true", dest="json_output",
+        help="Output one machine-readable JSON object",
+    )
+
+    # seed
+    seed_cmd = sub.add_parser(
+        "seed",
+        help="Start this graph from another checkout's graph or a graph file",
+        description=(
+            "Copy the graph of another worktree, fork or clone (or a graph.db "
+            "file, such as one a CI run built) into this checkout, then parse "
+            "only the files whose contents differ. The result matches a full "
+            "build. Refuses to replace an existing graph without --force."
+        ),
+    )
+    seed_cmd.add_argument("source", help="A checkout with a graph, or a graph.db file")
+    seed_cmd.add_argument("--repo", default=None, help="Repository root (auto-detected)")
+    seed_cmd.add_argument("--force", action="store_true", help="Replace an existing graph")
+    seed_cmd.add_argument(
+        "--json", action="store_true", dest="json_output",
+        help="Output one machine-readable JSON object",
+    )
+
+    # export-absolute
+    export_abs_cmd = sub.add_parser(
+        "export-absolute",
+        help="Write a copy of the graph that releases before schema v16 open",
+        description=(
+            "Write a copy of the graph with absolute paths, marked schema v15, "
+            "so a release before repository-relative paths can open it without "
+            "a rebuild. The graph itself is not changed."
+        ),
+    )
+    export_abs_cmd.add_argument("out", help="Path of the copy to write (must not exist)")
+    export_abs_cmd.add_argument("--repo", default=None, help="Repository root (auto-detected)")
 
     # build
     build_cmd = sub.add_parser("build", help="Full graph build (re-parse all files)")
@@ -2239,6 +2647,34 @@ def build_parser() -> argparse.ArgumentParser:
         help="Write the payload to graph.data.js next to the page instead of "
              "inlining it. Off by default: the default output is one "
              "self-contained file",
+    )
+    live_group = vis_cmd.add_argument_group(
+        "live view",
+        "Draw the files changed since --live-base and the files the session "
+        "edited, and redraw the page whenever the graph or the activity log "
+        "changes. Edited files are red, files read green, callers never read "
+        "and tests never run amber. It writes live.html next to graph.html, so "
+        "the full view stays. The open page reloads itself; Ctrl-C stops.",
+    )
+    live_group.add_argument(
+        "--live", action="store_true",
+        help="Keep live.html following the session (default --depth 1)",
+    )
+    live_group.add_argument(
+        "--live-base", default=None, metavar="REF",
+        help="Git ref the live view diffs against (default: HEAD)",
+    )
+    live_group.add_argument(
+        "--session", default=None, metavar="ID",
+        help="Activity-log session to follow (default: the newest)",
+    )
+    live_group.add_argument(
+        "--interval", type=float, default=None, metavar="SECONDS",
+        help="Seconds between checks for a change (default: 3)",
+    )
+    live_group.add_argument(
+        "--once", action="store_true",
+        help="Draw the live view once and exit",
     )
     vis_cmd.add_argument(
         "--format",
@@ -2817,6 +3253,40 @@ def _dispatch() -> None:
 
     if args.command == "doctor":
         _handle_doctor(args)
+        return
+
+    if args.command == "conflicts":
+        _handle_conflicts(args)
+        return
+
+    if args.command == "history":
+        _handle_history(args)
+        return
+
+    if args.command == "check-rules":
+        _handle_check_rules(args)
+        return
+
+    if args.command == "affected-tests":
+        _handle_affected_tests(args)
+        return
+
+        return
+
+    if args.command == "unchecked":
+        _handle_unchecked(args)
+        return
+
+    if args.command == "structural-diff":
+        _handle_structural_diff(args)
+        return
+
+    if args.command == "seed":
+        _handle_seed(args)
+        return
+
+    if args.command == "export-absolute":
+        _handle_export_absolute(args)
         return
 
     embedding_refresh_kwargs = _embedding_refresh_kwargs(args, ap)
@@ -3408,6 +3878,9 @@ def _dispatch() -> None:
                 from .visualization import generate_html
 
                 html_path = data_dir / "graph.html"
+                if getattr(args, "live", False):
+                    _visualize_live(args, repo_root, data_dir / "live.html")
+                    return
                 vis_mode = getattr(args, "mode", "auto") or "auto"
                 depth = getattr(args, "depth", None)
                 depth = NB_DEFAULT_DEPTH if depth is None else depth
