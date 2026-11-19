@@ -175,6 +175,7 @@ _BANNER_GROUPS: tuple[tuple[str, tuple[tuple[str, str], ...]], ...] = (
         ("conflicts", "Find changes in other worktrees that touch yours"),
         ("structural-diff", "Compare this graph's edges with another checkout's"),
         ("affected-tests", "List the test files a change can reach"),
+        ("check-rules", "Check the architecture rules in rules.toml"),
         ("dead-code", "Find code that nothing calls or tests"),
         ("refactor", "Preview a rename, dead code or suggestions"),
     )),
@@ -998,6 +999,7 @@ _PATH_REPO_COMMANDS = frozenset({
     "export-absolute",
     "structural-diff",
     "affected-tests",
+    "check-rules",
     "context-history",
     "doctor",
     "install",
@@ -1097,6 +1099,28 @@ def _explicit_or_found_root(args) -> Path:
         given = Path(args.repo).expanduser()
         return _find_explicit_repo_root(given) or given.resolve()
     return find_project_root()
+
+
+def _handle_check_rules(args) -> None:
+    """Report rule violations; exit 1 when there are any."""
+    from .incremental import get_changed_files
+    from .rules import RulesError, check_rules, format_rules_report
+
+    repo_root = _explicit_or_found_root(args)
+    changed = None
+    if args.changed_only:
+        changed = get_changed_files(repo_root, args.base, strict=True)
+    try:
+        report = check_rules(
+            repo_root, changed_files=changed,
+            rules_path=Path(args.rules).expanduser() if args.rules else None,
+        )
+    except RulesError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        raise SystemExit(2) from exc
+    print(json.dumps(report, indent=2) if args.json_output else format_rules_report(report))
+    if report["violations"] or report["community_cycles"]:
+        raise SystemExit(1)
 
 
 def _handle_affected_tests(args) -> None:
@@ -2035,6 +2059,28 @@ def build_parser() -> argparse.ArgumentParser:
         "--exit-code",
         action="store_true",
         help="Exit 1 when anything is found",
+    )
+
+    # check-rules
+    rules_cmd = sub.add_parser(
+        "check-rules",
+        help="Check the architecture rules in .code-review-graph/rules.toml",
+        description=(
+            "Check forbidden dependencies ([[forbid]] with 'from' and 'to' globs) and, "
+            "with [no_cycles] between = \"communities\", import rings between "
+            "communities. Exits 1 on a violation, 2 when the rules or the graph "
+            "cannot be read."
+        ),
+    )
+    rules_cmd.add_argument("--rules", default=None, help="Rules file (default "
+                           ".code-review-graph/rules.toml)")
+    rules_cmd.add_argument("--changed-only", action="store_true",
+                           help="Only edges that start in files changed since --base")
+    rules_cmd.add_argument("--base", default="HEAD", help="Git ref for --changed-only")
+    rules_cmd.add_argument("--repo", default=None, help="Repository root (auto-detected)")
+    rules_cmd.add_argument(
+        "--json", action="store_true", dest="json_output",
+        help="Output one machine-readable JSON object",
     )
 
     # affected-tests
@@ -3027,6 +3073,10 @@ def _dispatch() -> None:
 
     if args.command == "conflicts":
         _handle_conflicts(args)
+        return
+
+    if args.command == "check-rules":
+        _handle_check_rules(args)
         return
 
     if args.command == "affected-tests":
