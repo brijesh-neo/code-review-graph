@@ -4,6 +4,7 @@
 
 ### Added
 
+- `code-review-graph conflicts`: compares this worktree's changes with every other worktree of the repository, measured from where the two branches split, and lists the symbols both change and the changed symbols that call, reference, inherit or test one the other side changes. Git merges these without a conflict. Read-only; `--json` and `--exit-code` for scripts.
 - The graph stores paths relative to the repository (schema v16), so a
   `graph.db` copied into a linked worktree, fork or clone answers with that
   checkout's paths. Its first `update` there runs a full build, because some

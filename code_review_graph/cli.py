@@ -170,6 +170,7 @@ _BANNER_GROUPS: tuple[tuple[str, tuple[tuple[str, str], ...]], ...] = (
     ("Review", (
         ("detect-changes", "Score the risk of your changes (read-only)"),
         ("impact", "Show what a change can reach"),
+        ("conflicts", "Find changes in other worktrees that touch yours"),
         ("dead-code", "Find code that nothing calls or tests"),
         ("refactor", "Preview a rename, dead code or suggestions"),
     )),
@@ -988,6 +989,7 @@ _GRAPH_TOOL_COMMANDS = {
 
 
 _PATH_REPO_COMMANDS = frozenset({
+    "conflicts",
     "context-history",
     "doctor",
     "install",
@@ -1058,6 +1060,24 @@ def _handle_doctor(args) -> None:
     else:
         repo_root = find_project_root()
     code = run_doctor(repo_root, as_json=args.json_output)
+    if code:
+        raise SystemExit(code)
+
+
+def _handle_conflicts(args) -> None:
+    """Print the conflict radar, read-only; ``--exit-code`` exits 1 on findings."""
+    from .conflicts import run_conflicts
+    from .incremental import find_project_root
+
+    if args.repo:
+        given = Path(args.repo).expanduser()
+        repo_root = _find_explicit_repo_root(given) or given.resolve()
+    else:
+        repo_root = find_project_root()
+    others = [Path(p).expanduser() for p in args.worktree] if args.worktree else None
+    code = run_conflicts(
+        repo_root, others, args.base, as_json=args.json_output, exit_code=args.exit_code,
+    )
     if code:
         raise SystemExit(code)
 
@@ -1900,6 +1920,43 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         dest="json_output",
         help="Output one machine-readable JSON object",
+    )
+
+    # conflicts
+    conflicts_cmd = sub.add_parser(
+        "conflicts",
+        help="Find changes in other worktrees that touch yours (read-only)",
+        description=(
+            "Compare this worktree's changes with every other worktree of the "
+            "repository, measured from where the two branches split: symbols both "
+            "change, and changed symbols that call, reference, inherit or test a "
+            "symbol the other side changes. Each worktree needs its own graph. "
+            "Nothing is built or written."
+        ),
+    )
+    conflicts_cmd.add_argument("--repo", default=None, help="Repository root (auto-detected)")
+    conflicts_cmd.add_argument(
+        "--worktree",
+        action="append",
+        default=None,
+        metavar="PATH",
+        help="Compare with this worktree only (repeatable; default: all others)",
+    )
+    conflicts_cmd.add_argument(
+        "--base",
+        default=None,
+        help="Measure both sides from this ref (default: the merge base of each pair)",
+    )
+    conflicts_cmd.add_argument(
+        "--json",
+        action="store_true",
+        dest="json_output",
+        help="Output one machine-readable JSON object",
+    )
+    conflicts_cmd.add_argument(
+        "--exit-code",
+        action="store_true",
+        help="Exit 1 when anything is found",
     )
 
     # build
@@ -2817,6 +2874,10 @@ def _dispatch() -> None:
 
     if args.command == "doctor":
         _handle_doctor(args)
+        return
+
+    if args.command == "conflicts":
+        _handle_conflicts(args)
         return
 
     embedding_refresh_kwargs = _embedding_refresh_kwargs(args, ap)
