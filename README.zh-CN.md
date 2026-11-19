@@ -488,6 +488,7 @@ code-review-graph query path_to <from> --to <to>  # How one symbol reaches anoth
 code-review-graph impact --detail-level compact  # Blast radius as ranked file paths
 code-review-graph visualize        # Interactive HTML graph
 code-review-graph visualize --seed-symbol <name>  # Neighbourhood of one symbol
+code-review-graph visualize --live --serve  # live.html: session edits red, reads green, unchecked amber
 code-review-graph visualize --format json      # Export graph data as JSON
 code-review-graph visualize --format graphml   # Export as GraphML
 code-review-graph visualize --format svg       # Export as SVG (needs matplotlib)
@@ -500,6 +501,17 @@ code-review-graph update --brief                 # Refresh graph + same panel
 code-review-graph detect-changes --brief --verify  # Cross-check against tiktoken
 code-review-graph detect-changes --details all  # Add graph context to the JSON
 code-review-graph context-history  # Trend of the opt-in savings log (CRG_CONTEXT_HISTORY=1)
+code-review-graph seed <other-checkout>  # Start from another checkout's graph, parse only what differs
+code-review-graph export-absolute <out.db>  # Copy of the graph that releases before v16 can open
+code-review-graph conflicts         # Changes in other worktrees that touch yours
+code-review-graph structural-diff <base>  # Edges, lost tests and new deps against another graph
+code-review-graph affected-tests    # Test files the change can reach (all when unsure)
+pytest -p code_review_graph.pytest_plugin --crg-affected  # Run only those tests
+code-review-graph check-rules       # Forbidden dependencies from .code-review-graph/rules.toml
+code-review-graph history record    # Store edges added and removed since the last record
+code-review-graph history show      # Structural changes per commit
+code-review-graph unchecked --start  # Start the activity log that unchecked and visualize --live read
+code-review-graph unchecked         # Callers the session never read, tests it never ran
 code-review-graph register <path>  # Register repo in the multi-repo registry
 code-review-graph unregister <path|alias>  # Remove repo from the registry
 code-review-graph repos            # List registered repositories
