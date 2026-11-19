@@ -48,7 +48,7 @@ code-review-graph is a local development tool. It:
 - Cloud embeddings: only when an OpenAI-compatible, Google Gemini, MiniMax or Voyage AI provider is configured. Cloud providers print an egress warning unless `CRG_ACCEPT_CLOUD_EMBEDDINGS=1` is set.
 - Local embedding model: `sentence-transformers` downloads the model from Hugging Face on first use.
 - Benchmarks: `code-review-graph eval` clones or fetches the pinned benchmark repositories with git.
-- D3.js: the visualization HTML loads the D3 v7 copy shipped with the package (same origin, SRI-verified) and falls back to the `d3js.org` CDN (also SRI-verified, `crossorigin="anonymous"`) only if the local copy is unavailable.
+- D3.js: the visualization HTML carries the D3 v7 copy shipped with the package inline, after checking it against the pinned SRI hash, so it opens from disk without a network request. Only if that copy is missing or fails the check does the page load D3 by `src` (same origin, SRI-verified) with the `d3js.org` CDN as a fallback (also SRI-verified, `crossorigin="anonymous"`).
 
 ## Security Scanning
 

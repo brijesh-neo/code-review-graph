@@ -268,7 +268,7 @@ def test_generate_html(store_with_data, tmp_path):
     assert output_path.exists()
     content = output_path.read_text()
     script_sources, _inline_scripts = _extract_scripts(content)
-    assert script_sources == [_D3_FILENAME]
+    assert script_sources == []
     assert "auth.py" in content
     assert "AuthService" in content
     assert "<!DOCTYPE html>" in content
@@ -288,11 +288,10 @@ def _sha384_sri(data: bytes) -> str:
 
 
 @pytest.mark.parametrize("vis_mode", ["full", "community"])
-def test_generated_html_loads_d3_same_origin_with_sri(store_with_data, tmp_path, vis_mode):
-    """Regression test for #475: `visualize --serve` must not depend on the
-    d3js.org CDN being reachable. The generated page loads a vendored,
-    same-origin D3 file (with the SRI hash intact) and only falls back to
-    the CDN — still SRI-pinned with crossorigin — if the local copy fails."""
+def test_generated_html_carries_the_pinned_d3_inline(store_with_data, tmp_path, vis_mode):
+    """The page needs neither d3js.org (#475) nor a ``src`` request: Chrome
+    blocks a ``file://`` script that carries ``integrity``, so D3 is inlined,
+    and only a build that matches the pinned hash is."""
     from code_review_graph.visualization import generate_html
 
     output_path = tmp_path / "graph.html"
@@ -300,26 +299,37 @@ def test_generated_html_loads_d3_same_origin_with_sri(store_with_data, tmp_path,
     content = output_path.read_text()
 
     script_sources, inline_scripts = _extract_scripts(content)
-    # Same-origin, offline-first D3 reference — no external host required.
-    assert script_sources == [_D3_FILENAME]
+    assert script_sources == []
+    asset = resources.files("code_review_graph") / "assets" / _D3_FILENAME
+    bundled = asset.read_bytes().decode("utf-8")
+    assert _sha384_sri(bundled.encode("utf-8")) == _D3_SRI_HASH
+    assert bundled in inline_scripts
+    assert _D3_CDN_URL not in "".join(s for s in inline_scripts if s != bundled)
 
-    # The local script tag keeps SRI integrity verification.
+    # The copy next to the HTML stays for `visualize --serve` and older pages.
+    asset_copy = tmp_path / _D3_FILENAME
+    assert asset_copy.exists()
+    assert _sha384_sri(asset_copy.read_bytes()) == _D3_SRI_HASH
+
+
+def test_a_d3_build_that_fails_the_pin_is_not_inlined(store_with_data, tmp_path, monkeypatch):
+    """Without a verified build the page falls back to the SRI-pinned tags."""
+    from code_review_graph import visualization
+
+    monkeypatch.setattr(visualization, "_bundled_d3", lambda: None)
+    output_path = tmp_path / "graph.html"
+    visualization.generate_html(store_with_data, output_path)
+    content = output_path.read_text()
+
+    script_sources, inline_scripts = _extract_scripts(content)
+    assert script_sources == [_D3_FILENAME]
     local_tag = re.search(r"<script src=\"d3\.v7\.min\.js\"[^>]*>", content)
     assert local_tag is not None
     assert f'integrity="{_D3_SRI_HASH}"' in local_tag.group(0)
-
-    # CDN fallback (only used when the local asset is missing) keeps the
-    # security invariant: SRI hash AND crossorigin on the d3js.org tag.
     fallback = [s for s in inline_scripts if _D3_CDN_URL in s]
     assert len(fallback) == 1
     assert f'integrity="{_D3_SRI_HASH}"' in fallback[0]
     assert 'crossorigin="anonymous"' in fallback[0]
-
-    # The vendored asset is written next to the HTML, i.e. inside the
-    # directory `visualize --serve` exposes, so GET /d3.v7.min.js succeeds.
-    asset = tmp_path / _D3_FILENAME
-    assert asset.exists()
-    assert _sha384_sri(asset.read_bytes()) == _D3_SRI_HASH
 
 
 def test_bundled_d3_asset_is_packaged_and_pinned():
@@ -374,8 +384,8 @@ def test_graph_data_containing_script_sentinel_is_not_expanded(tmp_path, vis_mod
     content = output_path.read_text()
 
     script_sources, inline_scripts = _extract_scripts(content)
-    # Exactly the vendored D3 reference — no injected external script tags.
-    assert script_sources == [_D3_FILENAME]
+    # D3 is inline: no injected external script tags at all.
+    assert script_sources == []
     data_scripts = [s for s in inline_scripts if "graphData" in s]
     assert data_scripts, "graphData script missing — data script was truncated"
     for script in data_scripts:

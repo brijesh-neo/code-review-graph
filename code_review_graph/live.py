@@ -10,7 +10,6 @@ or tests never run amber.
 """
 from __future__ import annotations
 
-import base64
 import hashlib
 import html
 import json
@@ -118,32 +117,6 @@ border-radius:6px">code-review-graph live{rows}</div>
     return head, body
 
 
-def _inline_d3(page: str, directory: Path) -> str:
-    """Put the bundled D3 inside the page instead of loading it by ``src``.
-
-    Chrome refuses a ``file://`` script that carries an ``integrity``
-    attribute, so the loader tags ``generate_html`` writes leave a page opened
-    from disk without D3. The copy next to the page was checked against the
-    pinned hash when it was written; it is checked again here before it is
-    inlined, and the loader tags stay when it does not match.
-    """
-    from .visualization import D3_LOCAL_FILENAME, D3_SRI_HASH, _d3_script_tags
-
-    tags = _d3_script_tags()
-    if tags not in page:
-        return page
-    try:
-        data = (directory / D3_LOCAL_FILENAME).read_bytes()
-    except OSError as exc:
-        logger.warning("No D3 copy to inline (%s); the page loads it by src.", exc)
-        return page
-    digest = base64.b64encode(hashlib.sha384(data).digest()).decode()
-    if f"sha384-{digest}" != D3_SRI_HASH or b"</script" in data.lower():
-        logger.warning("The D3 copy does not match the pinned hash; not inlining it.")
-        return page
-    return page.replace(tags, "<script>" + data.decode("utf-8") + "</script>", 1)
-
-
 def _empty_page(state: dict) -> str:
     return ("<!DOCTYPE html><html><head><meta charset='utf-8'>"
             "<title>code-review-graph live</title></head><body style='font:14px sans-serif'>"
@@ -170,7 +143,7 @@ def render_live(repo_root: Path, out: Path, *, base: str = "HEAD",
         store = GraphStore(get_db_path(repo_root, read_only=True), read_only=True)
         try:
             generate_html(store, out, seed_files=seeds, depth=depth)
-            page = _inline_d3(out.read_text(encoding="utf-8"), out.parent)
+            page = out.read_text(encoding="utf-8")
         except SeedResolutionError:
             page = ""
         finally:

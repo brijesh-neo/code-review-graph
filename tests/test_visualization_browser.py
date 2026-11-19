@@ -7,18 +7,9 @@ still render nothing because D3 failed to load, a handler threw, or a selector
 matched the wrong element. These tests drive the real page in headless
 Chromium via Playwright and assert on what the browser actually produced.
 
-Why the page is served over ``http://127.0.0.1`` instead of opened as a
-``file://`` URL: the generated page loads its vendored D3 with an ``integrity``
-attribute (issue #475). Chromium treats every ``file://`` document as an opaque
-origin, so the same-origin ``<script src="d3.v7.min.js" integrity="...">`` is
-*blocked* ("the resource requires the request to be CORS enabled to check the
-integrity") and the page falls back to the d3js.org CDN — i.e. a ``file://``
-open needs the network. ``code-review-graph visualize --serve`` publishes the
-same directory over HTTP, where the integrity check passes against the
-same-origin copy and nothing leaves the machine. The local ``http.server``
-below mirrors that supported path, which is also the only way these tests can
-be offline and deterministic. ``test_file_url_open_needs_the_cdn`` pins the
-``file://`` limitation so a future fix is noticed.
+The page carries the pinned D3 build inline, so it opens from disk too
+(``test_file_url_open_renders_offline``). The other tests serve it over
+``http://127.0.0.1``, mirroring ``code-review-graph visualize --serve``.
 
 Every page in this module runs behind a ``page.route`` guard that aborts any
 request leaving the test's own origin, so no test can silently depend on the
@@ -665,8 +656,7 @@ def test_page_renders_offline_from_the_vendored_d3(chromium, graph_site):
 
     The page fixture already aborts every request that leaves the test's own
     origin, so this asserts the consequence explicitly: D3 v7 is live, the
-    graph painted, and the only subresource fetched is the same-origin
-    ``d3.v7.min.js`` written next to the HTML.
+    graph painted, and nothing was fetched from another origin.
     """
     base_url, urls = graph_site
     with _open(chromium, base_url, urls["auto"]) as probe:
@@ -678,23 +668,14 @@ def test_page_renders_offline_from_the_vendored_d3(chromium, graph_site):
 
         foreign = [url for url in probe.requests if not url.startswith(base_url)]
         assert foreign == [], f"page reached outside its origin: {foreign}"
-        assert any(url.endswith("/d3.v7.min.js") for url in probe.requests)
         probe.assert_no_errors()
 
 
-def test_file_url_open_needs_the_cdn(chromium, graph_site, tmp_path):
-    """Characterisation test: ``file://`` opens cannot use the vendored D3.
+def test_file_url_open_renders_offline(chromium, graph_site, tmp_path):
+    """A page opened as ``file://`` draws the graph with the network blocked.
 
-    Chromium gives every ``file://`` document an opaque origin, so the
-    SRI-pinned ``<script src="d3.v7.min.js" integrity="...">`` cannot be
-    validated and is blocked; the page then falls back to the d3js.org CDN.
-    With the network blocked (as it is here) nothing renders. This is why
-    ``visualize --serve`` — not a double-click on ``graph.html`` — is the
-    offline-capable path, and why the rest of this module uses HTTP.
-
-    If this test ever fails, the ``file://`` limitation has been fixed (for
-    example by inlining D3 or dropping ``integrity`` from the local tag) and
-    this test should be replaced by a positive one.
+    Chromium blocks a ``file://`` script that carries ``integrity``, so a page
+    loading D3 by ``src`` drew nothing from disk. D3 is inline now.
     """
     store = _build_store(tmp_path / "graph.db")
     try:
@@ -702,21 +683,15 @@ def test_file_url_open_needs_the_cdn(chromium, graph_site, tmp_path):
         generate_html(store, output, mode="full")
     finally:
         store.close()
-    assert (tmp_path / "d3.v7.min.js").exists()
 
     page = chromium.new_page(viewport=VIEWPORT)
     probe = _Probe(page)
     page.route("**/*", _block_foreign_requests("file://"))
     try:
         page.goto(output.as_uri(), wait_until="load", timeout=LAYOUT_TIMEOUT_MS)
-        assert page.evaluate("() => typeof window.d3") == "undefined"
-        assert probe.node_groups.count() == 0
-        # The overlay never clears because the layout never starts.
-        assert "hidden" not in (
-            page.locator("#loading-overlay").get_attribute("class") or ""
-        )
-        assert any("integrity" in msg.lower() for msg in probe.console_errors), (
-            f"expected a Subresource Integrity console error, got {probe.console_errors}"
-        )
+        probe.wait_for_layout()
+        assert page.evaluate("() => window.d3.version").startswith("7.")
+        assert probe.node_groups.count() == TOTAL_NODES
+        probe.assert_no_errors()
     finally:
         page.close()

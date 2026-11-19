@@ -77,7 +77,7 @@ uv run code-review-graph --help             # full command list
 - `_validate_repo_root()` requires an existing directory containing `.git`, `.svn` or `.code-review-graph`, which blocks path traversal through `repo_root`.
 - `_sanitize_name()` strips control characters and caps names at 256 characters.
 - `escH()` in `visualization.py` escapes HTML entities including quotes and backticks; `</script>` is escaped inside embedded JSON.
-- D3.js is bundled and loaded with an SRI hash; the CDN fallback carries the same hash.
+- D3.js is bundled; a page inlines it only after it matches the pinned SRI hash. Without a match the page loads it by `src` with that hash, and the CDN fallback carries the same hash.
 - `http_origin_guard.py` validates Host and Origin for `serve --http`.
 - API keys come from environment variables only.
 
