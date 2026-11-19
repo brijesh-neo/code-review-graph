@@ -174,6 +174,7 @@ _BANNER_GROUPS: tuple[tuple[str, tuple[tuple[str, str], ...]], ...] = (
         ("impact", "Show what a change can reach"),
         ("conflicts", "Find changes in other worktrees that touch yours"),
         ("structural-diff", "Compare this graph's edges with another checkout's"),
+        ("affected-tests", "List the test files a change can reach"),
         ("dead-code", "Find code that nothing calls or tests"),
         ("refactor", "Preview a rename, dead code or suggestions"),
     )),
@@ -996,6 +997,7 @@ _PATH_REPO_COMMANDS = frozenset({
     "seed",
     "export-absolute",
     "structural-diff",
+    "affected-tests",
     "context-history",
     "doctor",
     "install",
@@ -1095,6 +1097,14 @@ def _explicit_or_found_root(args) -> Path:
         given = Path(args.repo).expanduser()
         return _find_explicit_repo_root(given) or given.resolve()
     return find_project_root()
+
+
+def _handle_affected_tests(args) -> None:
+    """Print the test files the change reaches, or say to run them all."""
+    from .affected_tests import affected_tests, format_affected
+
+    result = affected_tests(_explicit_or_found_root(args), args.base)
+    print(json.dumps(result, indent=2) if args.json_output else format_affected(result))
 
 
 def _handle_structural_diff(args) -> None:
@@ -2025,6 +2035,25 @@ def build_parser() -> argparse.ArgumentParser:
         "--exit-code",
         action="store_true",
         help="Exit 1 when anything is found",
+    )
+
+    # affected-tests
+    affected_cmd = sub.add_parser(
+        "affected-tests",
+        help="List the test files a change can reach",
+        description=(
+            "List the test files the graph links to the files changed since BASE "
+            "(callers, importers and tests of them). When unsure (a file the graph "
+            "lacks, a stale graph, changed test configuration, a capped walk) it "
+            "says to run every test. Read-only. For pytest: "
+            "pytest -p code_review_graph.pytest_plugin --crg-affected"
+        ),
+    )
+    affected_cmd.add_argument("--base", default="HEAD", help="Git ref (default HEAD)")
+    affected_cmd.add_argument("--repo", default=None, help="Repository root (auto-detected)")
+    affected_cmd.add_argument(
+        "--json", action="store_true", dest="json_output",
+        help="Output one machine-readable JSON object",
     )
 
     # structural-diff
@@ -2998,6 +3027,10 @@ def _dispatch() -> None:
 
     if args.command == "conflicts":
         _handle_conflicts(args)
+        return
+
+    if args.command == "affected-tests":
+        _handle_affected_tests(args)
         return
 
     if args.command == "structural-diff":
