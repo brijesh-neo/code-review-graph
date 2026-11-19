@@ -5,6 +5,8 @@
 ### Added
 
 - `code-review-graph conflicts`: compares this worktree's changes with every other worktree of the repository, measured from where the two branches split, and lists the symbols both change and the changed symbols that call, reference, inherit or test one the other side changes. Git merges these without a conflict. Read-only; `--json` and `--exit-code` for scripts.
+- `code-review-graph seed SOURCE`: starts this checkout's graph from another worktree's, fork's or clone's graph (or a `graph.db` file, such as one a CI run built), then parses only the files whose contents differ. The result equals a full build. On a 182-file repository: 0.74 s against 3.01 s for `build`. Refuses to replace an existing graph without `--force`.
+- `code-review-graph export-absolute OUT`: writes a copy of the graph with absolute paths, marked schema v15, which releases before schema v16 open without a rebuild (checked with 2.4.0). The graph itself is not changed.
 - The graph stores paths relative to the repository (schema v16), so a
   `graph.db` copied into a linked worktree, fork or clone answers with that
   checkout's paths. Its first `update` there runs a full build, because some

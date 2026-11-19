@@ -166,6 +166,8 @@ _BANNER_GROUPS: tuple[tuple[str, tuple[tuple[str, str], ...]], ...] = (
         ("postprocess", "Redo flows, communities and the search index"),
         ("embed", "Add vectors for search by meaning"),
         ("forget", "Drop files from the graph"),
+        ("seed", "Start this graph from another checkout's or a graph file"),
+        ("export-absolute", "Write a copy older releases can open"),
     )),
     ("Review", (
         ("detect-changes", "Score the risk of your changes (read-only)"),
@@ -990,6 +992,8 @@ _GRAPH_TOOL_COMMANDS = {
 
 _PATH_REPO_COMMANDS = frozenset({
     "conflicts",
+    "seed",
+    "export-absolute",
     "context-history",
     "doctor",
     "install",
@@ -1080,6 +1084,53 @@ def _handle_conflicts(args) -> None:
     )
     if code:
         raise SystemExit(code)
+
+
+def _explicit_or_found_root(args) -> Path:
+    from .incremental import find_project_root
+
+    if args.repo:
+        given = Path(args.repo).expanduser()
+        return _find_explicit_repo_root(given) or given.resolve()
+    return find_project_root()
+
+
+def _handle_seed(args) -> None:
+    """Copy another checkout's graph here, then update what differs."""
+    from .portable import PortableGraphError, seed_graph
+
+    repo_root = _explicit_or_found_root(args)
+    try:
+        result = seed_graph(repo_root, Path(args.source), force=args.force)
+    except PortableGraphError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        raise SystemExit(1) from exc
+    if args.json_output:
+        print(json.dumps(result, indent=2))
+        return
+    print(
+        f"Seeded {result['graph']} from {result['source']}: "
+        f"{result['files_reparsed']} file(s) differed and were parsed again; "
+        f"{result['extra_rows_rewritten']} edge hint(s) re-pointed at this checkout."
+    )
+    for warning in result["warnings"]:
+        print(f"Warning: {warning}", file=sys.stderr)
+
+
+def _handle_export_absolute(args) -> None:
+    """Write a schema v15 copy with absolute paths for older releases."""
+    from .portable import PortableGraphError, export_absolute
+
+    repo_root = _explicit_or_found_root(args)
+    try:
+        result = export_absolute(repo_root, Path(args.out))
+    except PortableGraphError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        raise SystemExit(1) from exc
+    print(
+        f"Wrote {result['out']} (schema v{result['schema_version']}, absolute paths). "
+        "Put it at .code-review-graph/graph.db for a release before schema v16."
+    )
 
 
 def _handle_context_history(args) -> None:
@@ -1958,6 +2009,38 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Exit 1 when anything is found",
     )
+
+    # seed
+    seed_cmd = sub.add_parser(
+        "seed",
+        help="Start this graph from another checkout's graph or a graph file",
+        description=(
+            "Copy the graph of another worktree, fork or clone (or a graph.db "
+            "file, such as one a CI run built) into this checkout, then parse "
+            "only the files whose contents differ. The result matches a full "
+            "build. Refuses to replace an existing graph without --force."
+        ),
+    )
+    seed_cmd.add_argument("source", help="A checkout with a graph, or a graph.db file")
+    seed_cmd.add_argument("--repo", default=None, help="Repository root (auto-detected)")
+    seed_cmd.add_argument("--force", action="store_true", help="Replace an existing graph")
+    seed_cmd.add_argument(
+        "--json", action="store_true", dest="json_output",
+        help="Output one machine-readable JSON object",
+    )
+
+    # export-absolute
+    export_abs_cmd = sub.add_parser(
+        "export-absolute",
+        help="Write a copy of the graph that releases before schema v16 open",
+        description=(
+            "Write a copy of the graph with absolute paths, marked schema v15, "
+            "so a release before repository-relative paths can open it without "
+            "a rebuild. The graph itself is not changed."
+        ),
+    )
+    export_abs_cmd.add_argument("out", help="Path of the copy to write (must not exist)")
+    export_abs_cmd.add_argument("--repo", default=None, help="Repository root (auto-detected)")
 
     # build
     build_cmd = sub.add_parser("build", help="Full graph build (re-parse all files)")
@@ -2878,6 +2961,14 @@ def _dispatch() -> None:
 
     if args.command == "conflicts":
         _handle_conflicts(args)
+        return
+
+    if args.command == "seed":
+        _handle_seed(args)
+        return
+
+    if args.command == "export-absolute":
+        _handle_export_absolute(args)
         return
 
     embedding_refresh_kwargs = _embedding_refresh_kwargs(args, ap)
