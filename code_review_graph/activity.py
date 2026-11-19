@@ -191,7 +191,8 @@ def unchecked(repo_root: Path, *, base: str = "HEAD", session: Optional[str] = N
             # A test that calls the symbol is counted under tests, not callers.
             rel_callers = {f[len(prefix):] for f in caller_files
                            if f.startswith(prefix) and f not in tests}
-            seen = activity["read"] | activity["edited"]
+            # A file changed since the base was in front of whoever changed it.
+            seen = activity["read"] | activity["edited"] | set(ranges)
             unread = sorted(rel_callers - seen)
             unrun = [t for t in rel_tests if not _test_was_run(t, activity["tests"])]
             symbols.append({

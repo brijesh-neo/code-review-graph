@@ -81,6 +81,24 @@ def test_reading_the_caller_and_running_the_test_clears_them(tmp_path: Path) -> 
     assert _only(unchecked(repo, session="s2"))["unread_caller_files"] == ["app.py"]
 
 
+def test_a_caller_in_a_changed_file_counts_as_read(tmp_path: Path) -> None:
+    repo = _repo(tmp_path)
+    (repo / "lib.py").write_text(
+        LIB.replace("x + 1", "x + 2") + "\n\ndef twice(x):\n    return helper(helper(x))\n",
+        encoding="utf-8",
+    )
+    from code_review_graph.incremental import incremental_update
+
+    store = GraphStore(get_db_path(repo))
+    try:
+        incremental_update(repo, store, changed_files=["lib.py"])
+    finally:
+        store.close()
+    entry = _only(unchecked(repo))
+    assert entry["caller_files"] == 2
+    assert entry["unread_caller_files"] == ["app.py"]
+
+
 def test_test_commands_are_recognised() -> None:
     assert is_test_command("pytest")
     assert is_test_command("cd x && uv run pytest tests/ -q")
