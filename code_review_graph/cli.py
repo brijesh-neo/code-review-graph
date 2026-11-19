@@ -176,6 +176,7 @@ _BANNER_GROUPS: tuple[tuple[str, tuple[tuple[str, str], ...]], ...] = (
         ("structural-diff", "Compare this graph's edges with another checkout's"),
         ("affected-tests", "List the test files a change can reach"),
         ("check-rules", "Check the architecture rules in rules.toml"),
+        ("history", "Record and query when edges appeared or went"),
         ("dead-code", "Find code that nothing calls or tests"),
         ("refactor", "Preview a rename, dead code or suggestions"),
     )),
@@ -1000,6 +1001,7 @@ _PATH_REPO_COMMANDS = frozenset({
     "structural-diff",
     "affected-tests",
     "check-rules",
+    "history",
     "context-history",
     "doctor",
     "install",
@@ -1099,6 +1101,39 @@ def _explicit_or_found_root(args) -> Path:
         given = Path(args.repo).expanduser()
         return _find_explicit_repo_root(given) or given.resolve()
     return find_project_root()
+
+
+def _handle_history(args) -> None:
+    """``history record`` or ``history show``."""
+    from .history import HistoryError, format_events, record, show
+
+    repo_root = _explicit_or_found_root(args)
+    try:
+        if args.history_command == "record":
+            result = record(repo_root)
+            if args.json_output:
+                print(json.dumps(result, indent=2))
+            elif result["baseline"]:
+                print(f"Recorded a baseline of the graph at {result['commit'][:12]}.")
+            else:
+                print(
+                    f"Recorded {result['commit'][:12]}: +{result['added']} "
+                    f"-{result['removed']} edge(s); "
+                    f"{len(result['lost_last_test'])} symbol(s) lost their last test."
+                )
+            return
+        if args.history_command == "show":
+            result = show(
+                repo_root, source=args.source, target=args.target, kind=args.kind,
+                lost_tests=args.lost_tests, limit=args.limit,
+            )
+            print(json.dumps(result, indent=2) if args.json_output else format_events(result))
+            return
+    except HistoryError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        raise SystemExit(1) from exc
+    print("Usage: code-review-graph history {record,show}", file=sys.stderr)
+    raise SystemExit(2)
 
 
 def _handle_check_rules(args) -> None:
@@ -2060,6 +2095,34 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Exit 1 when anything is found",
     )
+
+    # history
+    history_cmd = sub.add_parser(
+        "history",
+        help="Record and query when edges appeared or went",
+        description=(
+            "'history record' stores the edges added and removed since the last "
+            "record, tagged with HEAD, in .code-review-graph/history.db (run it "
+            "after each commit; the first run stores a baseline). 'history show' "
+            "lists those changes."
+        ),
+    )
+    history_sub = history_cmd.add_subparsers(dest="history_command", metavar="<action>")
+    for action, text in (("record", "Store what changed since the last record"),
+                         ("show", "List recorded changes")):
+        h = history_sub.add_parser(action, help=text, description=text + ".")
+        h.add_argument("--repo", default=None, help="Repository root (auto-detected)")
+        h.add_argument("--json", action="store_true", dest="json_output",
+                       help="Output one machine-readable JSON object")
+        if action == "show":
+            h.add_argument("--from", dest="source", default=None,
+                           help="Source path or qualified-name prefix, e.g. app/ui.py")
+            h.add_argument("--to", dest="target", default=None,
+                           help="Target path or qualified-name prefix")
+            h.add_argument("--kind", default=None, help="Edge kind, e.g. IMPORTS_FROM")
+            h.add_argument("--lost-tests", action="store_true",
+                           help="Only symbols that lost their last test")
+            h.add_argument("--limit", type=int, default=100, help="Events listed (100)")
 
     # check-rules
     rules_cmd = sub.add_parser(
@@ -3073,6 +3136,10 @@ def _dispatch() -> None:
 
     if args.command == "conflicts":
         _handle_conflicts(args)
+        return
+
+    if args.command == "history":
+        _handle_history(args)
         return
 
     if args.command == "check-rules":
