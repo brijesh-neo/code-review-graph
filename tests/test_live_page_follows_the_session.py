@@ -110,3 +110,23 @@ def test_page_carries_d3_itself_so_it_opens_from_disk(tmp_path: Path) -> None:
     assert _d3_script_tags() not in page
     assert f'src="{D3_LOCAL_FILENAME}"' not in page
     assert "document.write(" not in page
+
+
+def test_without_an_activity_log_the_page_and_output_say_how_to_start_one(
+    tmp_path: Path,
+) -> None:
+    """Read and unchecked stay empty without a log; say so instead of
+    drawing a page that looks like nothing needs checking."""
+    repo = _repo(tmp_path)
+    assert not activity_path(repo).exists()
+    out = tmp_path / "live.html"
+    render_live(repo, out)
+    assert "unchecked --start" in out.read_text(encoding="utf-8")
+    result = _visualize(repo, "--live", "--once")
+    assert result.returncode == 0, result.stderr
+    assert "unchecked --start" in result.stdout
+
+    record_tool_use(repo, {"tool_name": "Read", "session_id": "s1",
+                           "tool_input": {"file_path": str(repo / "app.py")}})
+    render_live(repo, out)
+    assert "unchecked --start" not in out.read_text(encoding="utf-8")

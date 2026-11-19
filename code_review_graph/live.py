@@ -22,6 +22,8 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_INTERVAL = 3.0
 COLOURS = {"edited": "#e5484d", "read": "#30a46c", "unchecked": "#f5a623"}
+NOT_LOGGED = ("No activity log here, so nothing counts as read or run. Start one with "
+              "`code-review-graph unchecked --start` or the enrich hook.")
 
 
 def live_state(repo_root: Path, *, base: str = "HEAD",
@@ -47,6 +49,7 @@ def live_state(repo_root: Path, *, base: str = "HEAD",
         "edited": edited,
         "read": sorted(activity["read"] - set(edited)),
         "unchecked": sorted(pending - set(edited)),
+        "logged": activity["logged"],
         "report": report,
     }
 
@@ -84,6 +87,8 @@ def _overlay(state: dict, interval: float) -> tuple[str, str]:
         f'<div><span style="color:{c}">&#9679;</span> {k}: {len(state[k])}</div>'
         for k, c in COLOURS.items()
     )
+    if not state.get("logged", True):
+        rows += f'<div style="max-width:260px;color:#f5a623">{html.escape(NOT_LOGGED)}</div>'
     head = '<meta name="crg-live" content="1">'
     body = f'''<div id="crg-live" style="position:fixed;right:12px;bottom:12px;z-index:9;
 background:rgba(20,20,24,.85);color:#ddd;font:12px sans-serif;padding:8px 10px;
@@ -185,6 +190,7 @@ def run_live(repo_root: Path, out: Path, *, base: str = "HEAD",
              interval: float = DEFAULT_INTERVAL, once: bool = False) -> None:
     """Redraw *out* whenever the graph or the activity log changes."""
     last: tuple = ()
+    warned = False
     while True:
         stamp = _stamp(repo_root)
         if stamp != last:
@@ -192,6 +198,9 @@ def run_live(repo_root: Path, out: Path, *, base: str = "HEAD",
                                 depth=depth, interval=interval)
             print(f"live: {len(state['edited'])} edited, {len(state['read'])} read, "
                   f"{len(state['unchecked'])} unchecked -> {out}", flush=True)
+            if not state["logged"] and not warned:
+                print(NOT_LOGGED, flush=True)
+                warned = True
             last = stamp
         if once:
             return
