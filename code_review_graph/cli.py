@@ -176,6 +176,7 @@ _BANNER_GROUPS: tuple[tuple[str, tuple[tuple[str, str], ...]], ...] = (
         ("structural-diff", "Compare this graph's edges with another checkout's"),
         ("affected-tests", "List the test files a change can reach"),
         ("unchecked", "Callers you never read and tests you never ran"),
+        ("live", "A self-refreshing page of what the session touched"),
         ("check-rules", "Check the architecture rules in rules.toml"),
         ("history", "Record and query when edges appeared or went"),
         ("dead-code", "Find code that nothing calls or tests"),
@@ -1002,6 +1003,7 @@ _PATH_REPO_COMMANDS = frozenset({
     "structural-diff",
     "affected-tests",
     "unchecked",
+    "live",
     "check-rules",
     "history",
     "context-history",
@@ -1183,6 +1185,24 @@ def _handle_unchecked(args) -> None:
     print(json.dumps(result, indent=2) if args.json_output else format_unchecked(result))
     if result.get("error"):
         raise SystemExit(1)
+
+
+def _handle_live(args) -> None:
+    """Keep a page of the session's edits, reads and unchecked impact current."""
+    from .incremental import get_db_path
+    from .live import run_live
+
+    repo_root = _explicit_or_found_root(args)
+    db = get_db_path(repo_root, read_only=True)
+    if not db.is_file():
+        print("Error: no graph here; run `code-review-graph build` first", file=sys.stderr)
+        raise SystemExit(1)
+    out = Path(args.out).expanduser() if args.out else db.parent / "live.html"
+    try:
+        run_live(repo_root, out.resolve(), base=args.base, session=args.session,
+                 depth=args.depth, interval=args.interval, once=args.once)
+    except KeyboardInterrupt:
+        pass
 
 
 def _handle_structural_diff(args) -> None:
@@ -2208,6 +2228,30 @@ def build_parser() -> argparse.ArgumentParser:
         help="Output one machine-readable JSON object",
     )
 
+    # live
+    live_cmd = sub.add_parser(
+        "live",
+        help="A self-refreshing page of what the session touched",
+        description=(
+            "Write an HTML page of the graph around the files changed since BASE and "
+            "redraw it whenever the graph or the activity log changes. Edited files "
+            "are red, files read green, callers never read and tests never run amber. "
+            "Open the page once; it reloads itself. Ctrl-C stops."
+        ),
+    )
+    live_cmd.add_argument(
+        "--out", default=None,
+        help="Page to write (default .code-review-graph/live.html)",
+    )
+    live_cmd.add_argument("--base", default="HEAD", help="Git ref (default HEAD)")
+    live_cmd.add_argument("--session", default=None, help="Session id (default: newest)")
+    live_cmd.add_argument("--depth", type=int, default=1, help="Hops around the edits")
+    live_cmd.add_argument(
+        "--interval", type=float, default=3.0, help="Seconds between checks (default 3)",
+    )
+    live_cmd.add_argument("--once", action="store_true", help="Write the page once and exit")
+    live_cmd.add_argument("--repo", default=None, help="Repository root (auto-detected)")
+
     # structural-diff
     sdiff_cmd = sub.add_parser(
         "structural-diff",
@@ -3191,6 +3235,10 @@ def _dispatch() -> None:
 
     if args.command == "affected-tests":
         _handle_affected_tests(args)
+        return
+
+    if args.command == "live":
+        _handle_live(args)
         return
 
     if args.command == "unchecked":
