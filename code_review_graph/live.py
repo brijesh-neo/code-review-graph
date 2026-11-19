@@ -1,6 +1,6 @@
 """A page that follows the session: what it edited, read and has not checked.
 
-``live`` redraws a k-hop neighbourhood of the files changed since ``HEAD``
+``visualize --live`` redraws a k-hop neighbourhood of the files changed since ``HEAD``
 (plus the files the activity log says were edited) whenever the graph or the
 log changes. Next to the page sits ``<page>.stamp.js``; the page loads it
 every few seconds and reloads only when it names a newer drawing, so the

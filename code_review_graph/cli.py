@@ -176,7 +176,6 @@ _BANNER_GROUPS: tuple[tuple[str, tuple[tuple[str, str], ...]], ...] = (
         ("structural-diff", "Compare this graph's edges with another checkout's"),
         ("affected-tests", "List the test files a change can reach"),
         ("unchecked", "Callers you never read and tests you never ran"),
-        ("live", "A self-refreshing page of what the session touched"),
         ("check-rules", "Check the architecture rules in rules.toml"),
         ("history", "Record and query when edges appeared or went"),
         ("dead-code", "Find code that nothing calls or tests"),
@@ -1003,7 +1002,6 @@ _PATH_REPO_COMMANDS = frozenset({
     "structural-diff",
     "affected-tests",
     "unchecked",
-    "live",
     "check-rules",
     "history",
     "context-history",
@@ -1185,24 +1183,6 @@ def _handle_unchecked(args) -> None:
     print(json.dumps(result, indent=2) if args.json_output else format_unchecked(result))
     if result.get("error"):
         raise SystemExit(1)
-
-
-def _handle_live(args) -> None:
-    """Keep a page of the session's edits, reads and unchecked impact current."""
-    from .incremental import get_db_path
-    from .live import run_live
-
-    repo_root = _explicit_or_found_root(args)
-    db = get_db_path(repo_root, read_only=True)
-    if not db.is_file():
-        print("Error: no graph here; run `code-review-graph build` first", file=sys.stderr)
-        raise SystemExit(1)
-    out = Path(args.out).expanduser() if args.out else db.parent / "live.html"
-    try:
-        run_live(repo_root, out.resolve(), base=args.base, session=args.session,
-                 depth=args.depth, interval=args.interval, once=args.once)
-    except KeyboardInterrupt:
-        pass
 
 
 def _handle_structural_diff(args) -> None:
@@ -1839,6 +1819,24 @@ def _check_visualize_flags(args: argparse.Namespace, fmt: str) -> None:
     """
     error = _SUBCOMMANDS["visualize"].error
     seeded = _is_seeded(args)
+    if getattr(args, "live", False):
+        if fmt != "html":
+            error(f"--live draws an interactive page; it has no effect on --format {fmt}")
+        if seeded:
+            error("--live seeds from the session's edits; drop the seed flags")
+        for name in ("render_depth", "max_nodes"):
+            if getattr(args, name, None) is not None:
+                error(f"--{name.replace('_', '-')} has no effect with --live")
+        if getattr(args, "sidecar", False):
+            error("--sidecar has no effect with --live")
+        if (getattr(args, "mode", "auto") or "auto") not in ("auto", "full"):
+            error(f"--mode {args.mode} has no effect with --live")
+        return
+    for name in ("live_base", "session", "interval"):
+        if getattr(args, name, None) is not None:
+            error(f"--{name.replace('_', '-')} requires --live")
+    if getattr(args, "once", False):
+        error("--once requires --live")
     tuning = [
         name for name in ("depth", "render_depth", "max_nodes")
         if getattr(args, name, None) is not None
@@ -1874,6 +1872,38 @@ def _check_visualize_flags(args: argparse.Namespace, fmt: str) -> None:
             "the opposite of a seeded neighbourhood; use --mode full or drop "
             "the seed"
         )
+
+
+def _visualize_live(args: argparse.Namespace, repo_root: Path, html_path: Path) -> None:
+    """``visualize --live``: keep graph.html following the session, served or not."""
+    from .live import DEFAULT_INTERVAL, run_live
+
+    depth = 1 if args.depth is None else args.depth
+    interval = DEFAULT_INTERVAL if args.interval is None else args.interval
+    httpd = None
+    if getattr(args, "serve", False) and not args.once:
+        import functools
+        import http.server
+        import threading
+
+        port = 8765
+        handler = functools.partial(
+            http.server.SimpleHTTPRequestHandler, directory=str(html_path.parent),
+        )
+        httpd = http.server.HTTPServer(("localhost", port), handler)
+        threading.Thread(target=httpd.serve_forever, daemon=True).start()
+        print(f"Serving at http://localhost:{port}/{html_path.name}")
+    elif not args.once:
+        print(f"Open {html_path} in a browser; it reloads itself. Ctrl-C stops.")
+    try:
+        run_live(repo_root, html_path, base=args.live_base or "HEAD",
+                 session=args.session, depth=depth, interval=interval, once=args.once)
+    except KeyboardInterrupt:
+        print("\nLive view stopped.")
+    finally:
+        if httpd is not None:
+            httpd.shutdown()
+            httpd.server_close()
 
 
 def _print_seed_budget(report: dict) -> None:
@@ -2227,30 +2257,6 @@ def build_parser() -> argparse.ArgumentParser:
         "--json", action="store_true", dest="json_output",
         help="Output one machine-readable JSON object",
     )
-
-    # live
-    live_cmd = sub.add_parser(
-        "live",
-        help="A self-refreshing page of what the session touched",
-        description=(
-            "Write an HTML page of the graph around the files changed since BASE and "
-            "redraw it whenever the graph or the activity log changes. Edited files "
-            "are red, files read green, callers never read and tests never run amber. "
-            "Open the page once; it reloads itself. Ctrl-C stops."
-        ),
-    )
-    live_cmd.add_argument(
-        "--out", default=None,
-        help="Page to write (default .code-review-graph/live.html)",
-    )
-    live_cmd.add_argument("--base", default="HEAD", help="Git ref (default HEAD)")
-    live_cmd.add_argument("--session", default=None, help="Session id (default: newest)")
-    live_cmd.add_argument("--depth", type=int, default=1, help="Hops around the edits")
-    live_cmd.add_argument(
-        "--interval", type=float, default=3.0, help="Seconds between checks (default 3)",
-    )
-    live_cmd.add_argument("--once", action="store_true", help="Write the page once and exit")
-    live_cmd.add_argument("--repo", default=None, help="Repository root (auto-detected)")
 
     # structural-diff
     sdiff_cmd = sub.add_parser(
@@ -2641,6 +2647,33 @@ def build_parser() -> argparse.ArgumentParser:
         help="Write the payload to graph.data.js next to the page instead of "
              "inlining it. Off by default: the default output is one "
              "self-contained file",
+    )
+    live_group = vis_cmd.add_argument_group(
+        "live view",
+        "Draw the files changed since --live-base and the files the session "
+        "edited, and redraw graph.html whenever the graph or the activity log "
+        "changes. Edited files are red, files read green, callers never read "
+        "and tests never run amber. The open page reloads itself; Ctrl-C stops.",
+    )
+    live_group.add_argument(
+        "--live", action="store_true",
+        help="Keep graph.html following the session (default --depth 1)",
+    )
+    live_group.add_argument(
+        "--live-base", default=None, metavar="REF",
+        help="Git ref the live view diffs against (default: HEAD)",
+    )
+    live_group.add_argument(
+        "--session", default=None, metavar="ID",
+        help="Activity-log session to follow (default: the newest)",
+    )
+    live_group.add_argument(
+        "--interval", type=float, default=None, metavar="SECONDS",
+        help="Seconds between checks for a change (default: 3)",
+    )
+    live_group.add_argument(
+        "--once", action="store_true",
+        help="Draw the live view once and exit",
     )
     vis_cmd.add_argument(
         "--format",
@@ -3237,8 +3270,6 @@ def _dispatch() -> None:
         _handle_affected_tests(args)
         return
 
-    if args.command == "live":
-        _handle_live(args)
         return
 
     if args.command == "unchecked":
@@ -3846,6 +3877,9 @@ def _dispatch() -> None:
                 from .visualization import generate_html
 
                 html_path = data_dir / "graph.html"
+                if getattr(args, "live", False):
+                    _visualize_live(args, repo_root, html_path)
+                    return
                 vis_mode = getattr(args, "mode", "auto") or "auto"
                 depth = getattr(args, "depth", None)
                 depth = NB_DEFAULT_DEPTH if depth is None else depth

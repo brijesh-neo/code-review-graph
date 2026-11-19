@@ -1,4 +1,4 @@
-"""``live`` draws the files a session edited, read and left unchecked."""
+"""``visualize --live`` draws the files a session edited, read and left unchecked."""
 
 from __future__ import annotations
 
@@ -56,16 +56,44 @@ def test_nothing_changed_writes_a_waiting_page(tmp_path: Path) -> None:
     assert not activity_path(repo).exists()
 
 
-def test_cli_once(tmp_path: Path) -> None:
-    repo = _repo(tmp_path)
-    out = tmp_path / "page.html"
-    result = subprocess.run(
-        [sys.executable, "-m", "code_review_graph", "live", "--repo", str(repo),
-         "--out", str(out), "--once"],
+def _visualize(repo: Path, *flags: str) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        [sys.executable, "-m", "code_review_graph", "visualize", "--repo", str(repo), *flags],
         capture_output=True, text=True, env={**os.environ, "PYTHONUTF8": "1"}, cwd=str(repo),
     )
+
+
+def test_visualize_live_once_draws_graph_html(tmp_path: Path) -> None:
+    """The live view is ``visualize --live``: the same graph.html, no second page."""
+    repo = _repo(tmp_path)
+    result = _visualize(repo, "--live", "--once")
     assert result.returncode == 0, result.stderr
-    assert "1 edited" in result.stdout and out.is_file()
+    assert "1 edited" in result.stdout
+    page = repo / ".code-review-graph" / "graph.html"
+    assert "crg-live" in page.read_text(encoding="utf-8")
+    assert not (repo / ".code-review-graph" / "live.html").exists()
+
+
+def test_live_flags_that_cannot_apply_are_usage_errors(tmp_path: Path) -> None:
+    repo = _repo(tmp_path)
+    for flags, message in (
+        (("--once",), "--once requires --live"),
+        (("--session", "s1"), "--session requires --live"),
+        (("--live", "--seed-file", "lib.py"), "drop the seed flags"),
+        (("--live", "--format", "json"), "no effect on --format json"),
+        (("--live", "--mode", "community"), "--mode community has no effect with --live"),
+    ):
+        result = _visualize(repo, *flags)
+        assert result.returncode == 2, (flags, result.stderr)
+        assert message in result.stderr, (flags, result.stderr)
+
+
+def test_the_live_command_is_gone(tmp_path: Path) -> None:
+    result = subprocess.run(
+        [sys.executable, "-m", "code_review_graph", "live", "--once"],
+        capture_output=True, text=True, cwd=str(tmp_path),
+    )
+    assert result.returncode != 0
 
 
 def test_page_carries_d3_itself_so_it_opens_from_disk(tmp_path: Path) -> None:
