@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.5.0 - 2026-11-19
+
+### Added
+- CodeLens above each function and class: how many callers it has, how many
+  of those callers have no test, and how many tests and flows reach it.
+  Clicking it lists the callers. Turn it off with
+  `codeReviewGraph.codeLens.enabled`.
+
+### Changed
+- Accepts Python backend schema v16, where the graph stores paths relative to
+  the repository (`./<path>`). The extension turns them back into absolute
+  paths when it reads them. 0.4.0 answers a v16 database with "Database was
+  created with a newer version".
+
 ## 0.4.0 - 2026-11-10
 
 ### Changed
