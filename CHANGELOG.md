@@ -51,6 +51,7 @@
 
 ### Fixed
 
+- When the Claude Code edit hook fails to update the graph, it now also prints PostToolUse `additionalContext` telling the agent the graph was not updated and why. The installed hook ignores the exit code and the agent never saw stderr, so it went on answering from a stale graph. Other events and the Codex hook print nothing new.
 - The MCP entry and every hook `install` writes now run the copy of
   code-review-graph that ran `install`. The MCP entry used `uvx` whenever it
   was on PATH, and hooks ran the first copy on PATH, so an older copy could

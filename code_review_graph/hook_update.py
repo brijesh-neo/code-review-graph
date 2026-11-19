@@ -211,25 +211,65 @@ def run_update_hook(existing_only: bool = False) -> None:
     built: the Codex hook asks for that, as Codex builds a graph only when the
     user asks for one.
     """
-    repo_root = _update_target(_read_payload(), existing_only)
+    payload = _read_payload()
+    repo_root = _update_target(payload, existing_only)
     if repo_root is None:
         return
-    _update_repo(repo_root)
+    try:
+        _update_repo(repo_root)
+    except _UpdateFailed as failed:
+        if not existing_only and _is_post_tool_use(payload):
+            _tell_agent_not_updated(repo_root, failed.reason)
+        raise
+
+
+def _is_post_tool_use(payload: Any) -> bool:
+    return isinstance(payload, dict) and payload.get("hook_event_name") == "PostToolUse"
+
+
+def _tell_agent_not_updated(repo_root: Path, reason: str) -> None:
+    """Put the failure in the agent's context, not only in a stderr it never sees.
+
+    The installed Claude Code hook swallows the exit code, so without this
+    the agent goes on answering from a graph that no longer matches the code.
+    """
+    message = (
+        f"code-review-graph: the graph of {repo_root} was NOT updated after this "
+        f"edit ({reason}). Graph answers about the edited files may be stale; read "
+        "the source, or run `code-review-graph update` and check its error."
+    )
+    print(json.dumps({
+        "hookSpecificOutput": {
+            "hookEventName": "PostToolUse",
+            "additionalContext": message,
+        },
+    }))
+
+
+class _UpdateFailed(SystemExit):
+    """Exit 1 from a failed hook update, carrying the reason."""
+
+    def __init__(self, reason: str) -> None:
+        super().__init__(1)
+        self.reason = reason
 
 
 def _update_repo(repo_root: Path) -> None:
+    from .errors import CodeReviewGraphError
     from .tools.build import build_or_update_graph
 
     try:
         result = build_or_update_graph(
             full_rebuild=False, repo_root=str(repo_root), postprocess="minimal"
         )
-    except RuntimeError as exc:
-        print(f"Error: {exc}", file=sys.stderr)
-        sys.exit(1)
-    if result.get("status") == "error":
-        print(f"Error: {result.get('summary', 'update failed')}", file=sys.stderr)
-        sys.exit(1)
+    except (RuntimeError, OSError, sqlite3.Error, CodeReviewGraphError) as exc:
+        reason = str(exc) or type(exc).__name__
+    else:
+        if result.get("status") != "error":
+            return
+        reason = str(result.get("summary", "update failed"))
+    print(f"Error: {reason}", file=sys.stderr)
+    raise _UpdateFailed(reason)
 
 
 def run_status_hook() -> None:
