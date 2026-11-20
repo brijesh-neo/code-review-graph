@@ -7,7 +7,7 @@
 - Python walks skip statements that cannot hold a declaration or method scope.
 - full_build and incremental_update run with a larger page cache, put back afterwards.
 
-From PR #4.
+From PR #3.
 """
 
 import sqlite3
