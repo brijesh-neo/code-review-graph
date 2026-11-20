@@ -4,6 +4,8 @@
 plain ``JOIN``, so SQLite walked every CALLS and REFERENCES edge through
 ``idx_edges_kind`` and probed the names: 13.9 seconds on a graph of 10
 million edges. ``CROSS JOIN`` makes the names the outer loop, one seek each.
+
+From PR #5.
 """
 
 from code_review_graph.graph import GraphStore

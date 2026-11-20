@@ -4,6 +4,8 @@
 over every node row for each input, even when the absolute path was stored
 exactly: 3.4 seconds per call on a large graph. The exact path is now one
 index seek, and the suffix scan only runs for an input it misses.
+
+From PR #5.
 """
 
 import pytest

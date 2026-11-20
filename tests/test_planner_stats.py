@@ -2,6 +2,8 @@
 
 Without ``sqlite_stat1`` SQLite guesses table sizes, and on a large graph it
 picks the low-selectivity ``kind`` indexes and drives joins from ``edges``.
+
+From PR #5.
 """
 
 import logging

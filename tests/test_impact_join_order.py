@@ -4,6 +4,8 @@ With a plain ``JOIN`` SQLite made ``edges`` the outer loop of the two edge
 branches of ``_impact_candidate_sql`` and probed the frontier for each row, so
 every hop read the whole table: 99 seconds against 0.15 on a graph of 10
 million edges. ``CROSS JOIN`` pins the frontier as the outer loop.
+
+From PR #5.
 """
 
 from code_review_graph import graph as graph_module
