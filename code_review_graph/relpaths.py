@@ -164,6 +164,9 @@ class PathCodec:
             _JSON_STRING_START + rf"(?:(?P<rel>!*(?:{_JSON_RELATIVE}))|(?P<root>"
             + "|".join(re.escape(v) for v in self._json_roots) + r')(?P<end>[/"]))',
         )
+        # Besides JSON text, the first characters a value must start with for strip() to change it:
+        # a root spelling's, or "." / "!" (what _looks_relative needs).
+        self._leads = frozenset({v[:1] for v in self._roots} | {".", ESCAPE})
         self._lock = threading.Lock()
         self._specs: dict[int, tuple[Any, tuple[int, ...]]] = {}
 
@@ -195,6 +198,8 @@ class PathCodec:
         """The stored form of *value*: root stripped, or escaped if it needs it."""
         if value[:1] in _JSON_FIRST:
             return self.strip_json(value)
+        if value[:1] not in self._leads:
+            return value
         stripped = self.strip_root(value)
         if stripped is value and _looks_relative(value):
             return ESCAPE + value
@@ -204,7 +209,8 @@ class PathCodec:
         if isinstance(params, dict):
             return {k: self.strip(v) if isinstance(v, str) else v for k, v in params.items()}
         if isinstance(params, (tuple, list)):
-            return tuple(self.strip(v) if isinstance(v, str) else v for v in params)
+            strip = self.strip
+            return tuple([strip(v) if isinstance(v, str) else v for v in params])
         return params
 
     # -- outbound ------------------------------------------------------------

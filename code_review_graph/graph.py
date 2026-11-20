@@ -1021,6 +1021,10 @@ def discard_corrupt_database(db_path: str | Path) -> bool:
     return removed
 
 
+# Page cache for builds and updates, in KiB (see GraphStore.build_cache).
+BUILD_CACHE_KIB = 100 * 1024
+
+
 class GraphStore:
     """SQLite-backed code knowledge graph."""
 
@@ -1199,6 +1203,23 @@ class GraphStore:
             self._cache_epoch += 1
             self._nxg_cache = None
             self._bare_endpoint_context_cache = None
+
+    @contextmanager
+    def build_cache(self) -> Iterator[None]:
+        """Give a build or update a 100 MB page cache, then put the old size back.
+
+        Each edge insert also updates indexes keyed on the target name, so on a
+        large graph the default 2 MB cache misses on nearly every row. The store
+        can stay open afterwards (watch mode, the MCP server), so the pages are
+        released when the build ends.
+        """
+        previous = int(self._conn.execute("PRAGMA cache_size").fetchone()[0])
+        self._conn.execute(f"PRAGMA cache_size=-{BUILD_CACHE_KIB}")
+        try:
+            yield
+        finally:
+            self._conn.execute(f"PRAGMA cache_size={previous}")
+            self._conn.execute("PRAGMA shrink_memory")
 
     def shrink_memory(self, clear_nx_cache: bool = True) -> None:
         """Release cached in-memory structures and shrink SQLite page cache."""

@@ -115,6 +115,15 @@ _PYTHON_MODULE_CLASS_IDENTITY_CACHE_LOCK = threading.RLock()
 # in the receiver-evidence map. ``\x00`` cannot occur in a Python identifier,
 # so the two key spaces cannot collide.
 _PY_EXPR_RECEIVER_KEY = "\x00expr:"
+
+# Python nodes that hold no statement, so no class, def or import below them.
+# A walk looking only for those skips them unless tree-sitter found an error
+# inside, where recovery can nest a statement anywhere.
+_PY_STATEMENT_FREE_TYPES = frozenset({
+    "expression_statement", "return_statement", "raise_statement",
+    "assert_statement", "delete_statement", "decorator", "parameters",
+    "argument_list", "comment",
+})
 _PY_CLASS_IDENTITY_PREFIX = "\x00python-class\x00"
 
 _PY_TUPLE_ANNOTATION_NAMES = frozenset({"Tuple", "tuple"})
@@ -3926,6 +3935,9 @@ class CodeParser:
         self._import_types: dict[str, list[str]] = _IMPORT_TYPES
         self._call_types: dict[str, list[str]] = _CALL_TYPES
         self._custom_languages: dict[str, CustomLanguage] = {}
+        self._type_set_cache: dict[
+            str, tuple[frozenset[str], frozenset[str], frozenset[str], frozenset[str]]
+        ] = {}
         if repo_root is not None:
             self._custom_languages = load_custom_languages(
                 Path(repo_root),
@@ -9287,6 +9299,8 @@ class CodeParser:
                         symbol_binding_candidates.setdefault(name, set()).add(
                             (origin, imported_name),
                         )
+            elif node.type in _PY_STATEMENT_FREE_TYPES and not node.has_error:
+                return
             for child in node.children:
                 scan_declarations(
                     child, owner_class,
@@ -12353,10 +12367,7 @@ class CodeParser:
         """Recursively walk the AST and extract nodes/edges."""
         if _depth > self._MAX_AST_DEPTH:
             return
-        class_types = set(self._class_types.get(language, []))
-        func_types = set(self._function_types.get(language, []))
-        import_types = set(self._import_types.get(language, []))
-        call_types = set(self._call_types.get(language, []))
+        class_types, func_types, import_types, call_types = self._node_type_sets(language)
 
         for child in root.children:
             node_type = child.type
@@ -12615,6 +12626,26 @@ class CodeParser:
                 _depth=_depth + 1,
                 _go_receiver_bindings=_go_receiver_bindings,
             )
+
+    def _node_type_sets(
+        self, language: str,
+    ) -> tuple[frozenset[str], frozenset[str], frozenset[str], frozenset[str]]:
+        """Class, function, import and call node types for *language*.
+
+        Built once per language: ``_extract_from_tree`` recurses once per AST
+        node and asked for these on every call. The tables do not change after
+        ``__init__``.
+        """
+        cached = self._type_set_cache.get(language)
+        if cached is None:
+            cached = (
+                frozenset(self._class_types.get(language, [])),
+                frozenset(self._function_types.get(language, [])),
+                frozenset(self._import_types.get(language, [])),
+                frozenset(self._call_types.get(language, [])),
+            )
+            self._type_set_cache[language] = cached
+        return cached
 
     def _elixir_call_identifier(self, node) -> Optional[str]:
         """Return the leading identifier of an Elixir ``call`` node.
@@ -16854,6 +16885,8 @@ class CodeParser:
                     scopes.setdefault(name, set()).add(scope)
             if node.type in self._function_types[language] and scope:
                 methods.append((node.id, scope.rsplit(".", 1)[-1], scope))
+            elif node.type in _PY_STATEMENT_FREE_TYPES and not node.has_error:
+                continue
             pending.extend((child, scope) for child in reversed(node.named_children))
         for node_id, leaf, scope in methods:
             if len(scopes.get(leaf, ())) > 1:
@@ -19021,6 +19054,14 @@ class CodeParser:
     # Python uses ``argument_list``. Both share the same identifier-child shape
     # for bare-identifier callbacks like ``executor.submit(my_handler)``.
     _ARGUMENTS_TYPES = frozenset({"arguments", "argument_list"})
+    # Every node type _extract_value_references acts on.
+    _VALUE_REFERENCE_TYPES = (
+        _PAIR_TYPES | _ARRAY_TYPES | _ARGUMENTS_TYPES
+        | frozenset({
+            "shorthand_property_identifier",
+            "assignment_expression", "augmented_assignment", "assignment",
+        })
+    )
 
     # Names that are almost certainly not function references (constants,
     # common primitives).  All-uppercase identifiers and very short names
@@ -19124,6 +19165,9 @@ class CodeParser:
         name or an imported symbol, avoiding noise from arbitrary
         variable references.
         """
+        if node_type not in self._VALUE_REFERENCE_TYPES:
+            # Most nodes are none of the patterns below; skip naming the caller.
+            return
         imap = import_map or {}
         dnames = defined_names or set()
 
