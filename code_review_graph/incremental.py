@@ -3161,6 +3161,9 @@ def full_build(
     # anchor still describes the commit the stored files were parsed at.
     _store_vcs_metadata(repo_root, store)
     store.commit()
+    # A full build rewrites most rows; an incremental update does not move the
+    # table sizes enough to need this.
+    store.refresh_planner_stats()
 
     return {
         "files_parsed": len(files),

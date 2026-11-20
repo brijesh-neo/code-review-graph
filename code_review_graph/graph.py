@@ -59,6 +59,7 @@ from .migrations import (
     TARGET_RESOLUTION_EXPR,
     TARGET_RESOLUTION_KINDS,
     get_schema_version,
+    refresh_planner_stats,
     run_migrations,
     target_resolution_expr,
 )
@@ -775,6 +776,12 @@ def _impact_candidate_sql(resolution_guard: str) -> str:
     one edge per import buys: the alternative is one edge per file in the
     package, which on kubernetes is 73,507 edges for a single directory.
 
+    The first two branches use ``CROSS JOIN`` for the same reason: it makes
+    the frontier the outer loop, so each hop is one index seek per frontier
+    node. With a plain ``JOIN`` SQLite scanned every row of ``edges`` per hop
+    and probed the frontier for each one: 99 seconds against 0.15 on a graph
+    of 10 million edges.
+
     ``CROSS JOIN`` and ``INDEXED BY`` pin that branch to one index seek per
     frontier package. Left to itself SQLite drove it from the covering index
     on ``kind`` alone and rescanned every IMPORTS_FROM row once per
@@ -788,14 +795,14 @@ def _impact_candidate_sql(resolution_guard: str) -> str:
         SELECT e.target_qualified AS node_qn,
                f.score * COALESCE(p.weight, ?) * ? AS score
         FROM _impact_frontier f
-        JOIN edges e ON e.source_qualified = f.node_qn
+        CROSS JOIN edges e ON e.source_qualified = f.node_qn
         LEFT JOIN _impact_policies p ON p.kind = e.kind
         WHERE {_IMPACT_AOP_DIRECTION_CASE} = ?{resolution_guard}
         UNION ALL
         SELECT e.source_qualified AS node_qn,
                f.score * COALESCE(p.weight, ?) * ? AS score
         FROM _impact_frontier f
-        JOIN edges e ON e.target_qualified = f.node_qn
+        CROSS JOIN edges e ON e.target_qualified = f.node_qn
         LEFT JOIN _impact_policies p ON p.kind = e.kind
         WHERE {_IMPACT_AOP_DIRECTION_CASE} = ?{resolution_guard}
         UNION ALL
@@ -2321,6 +2328,11 @@ class GraphStore:
     def commit(self) -> None:
         self._conn.commit()
         self._invalidate_cache()
+
+    def refresh_planner_stats(self) -> None:
+        """Commit, then write ``sqlite_stat1``; see ``migrations.refresh_planner_stats``."""
+        self.commit()
+        refresh_planner_stats(self._conn)
 
     def rollback(self) -> None:
         """Rollback the current transaction."""
@@ -4782,8 +4794,11 @@ class GraphStore:
             )
         try:
             row = self._conn.execute(
-                "SELECT COUNT(*) FROM edges "  # noqa: S608
-                "JOIN _impact_seed_names s ON s.name = edges.target_qualified "
+                # CROSS JOIN drives the count from the seed names, one index
+                # seek each. With a plain JOIN SQLite walked every CALLS and
+                # REFERENCES edge and probed the names: 13.9s on 10M edges.
+                "SELECT COUNT(*) FROM _impact_seed_names s "  # noqa: S608
+                "CROSS JOIN edges ON s.name = edges.target_qualified "
                 "WHERE edges.kind IN ('CALLS', 'REFERENCES') "
                 f"AND COALESCE(edges.target_resolution, {TARGET_RESOLUTION_EXPR}) "
                 "= 'unresolved'",
