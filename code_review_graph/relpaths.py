@@ -13,10 +13,18 @@ Values outside the root (followed symlink targets, foreign files) are stored
 absolute. A raw value that would read as relative (``./missing``, an
 unresolved import specifier) is stored with a leading ``!`` and read back as
 written.
+
+JSON text (``extra``, and a JSON-quoted parameter such as ``instr(extra, ?)``
+takes) gets the same treatment string by string: a JSON string that starts
+with the root is stored ``"./..."``, one that would read as relative is
+escaped, and nothing else in the text changes, so ``LIKE`` and ``json_extract``
+on it keep working. Graphs whose ``extra`` predates this carry no
+``relpath_extra`` mark and are converted once (see relpath_migration.py).
 """
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import sqlite3
@@ -35,6 +43,21 @@ REL_PREFIX = "./"
 # Escapes a raw value that would read as relative, such as the unresolved
 # import specifier ``./missing``: stored ``!./missing``, read back unchanged.
 ESCAPE = "!"
+
+# First characters of a value that is JSON text, translated string by string.
+_JSON_FIRST = frozenset('{["')
+# A JSON string opens after one of these (``json.dumps`` output) or at the
+# start of the value; a quote anywhere else is inside a string.
+_JSON_STRING_START = r'(?:^|(?<=[{\[,:\s]))"'
+# A JSON string whose text would read as relative: ``./x``, ``../x``, ``.``.
+_JSON_RELATIVE = r'\.\.?/|\."'
+# Leaves restore this, a JSON string that may hold a stored relative value.
+_JSON_STORED = re.compile(
+    _JSON_STRING_START + rf'(?:(?P<esc>!+)(?={_JSON_RELATIVE})|\.(?P<end>[/"]))',
+)
+
+# First characters of a stored value that :meth:`PathCodec.restore` may change.
+_RESTORED_FIRST = frozenset({".", ESCAPE}) | _JSON_FIRST
 
 # Metadata columns: metadata statements are not translated on the way in.
 _UNTRANSLATED_COLUMNS = frozenset({"key", "value"})
@@ -87,8 +110,11 @@ ROOT_SPELLING_KEY = "relpath_root"
 #: Metadata key: the root of the checkout a copied graph was built in, set when
 #: a writer re-anchors it to another directory and cleared by a full build.
 #: ``extra`` JSON is not translated and still names that root, so the next
-#: update rebuilds instead of trusting it.
+#: update rebuilds instead of trusting it, unless ``extra`` is relative too.
 MOVED_FROM_KEY = "relpath_moved_from"
+#: Metadata key: ``relative`` once every ``extra`` value is stored relative,
+#: so a copied graph no longer names the checkout it was built in.
+EXTRA_MODE_KEY = "relpath_extra"
 
 
 def names_another_directory(recorded: Optional[str], root: str) -> bool:
@@ -128,6 +154,16 @@ class PathCodec:
         self.root = absolute_root(root)
         self._roots = root_variants(self.root)
         self._prefixes = tuple(v + "/" for v in self._roots)
+        # Each root as written in JSON text, raw and as ``json.dumps`` escapes it.
+        self._json_roots = tuple(sorted(
+            {form for v in self._roots for form in (v, json.dumps(v)[1:-1])},
+            key=len, reverse=True,
+        ))
+        self._json_root_out = json.dumps(self.root)[1:-1]
+        self._json_inbound = re.compile(
+            _JSON_STRING_START + rf"(?:(?P<rel>!*(?:{_JSON_RELATIVE}))|(?P<root>"
+            + "|".join(re.escape(v) for v in self._json_roots) + r')(?P<end>[/"]))',
+        )
         self._lock = threading.Lock()
         self._specs: dict[int, tuple[Any, tuple[int, ...]]] = {}
 
@@ -142,8 +178,23 @@ class PathCodec:
             return ROOT_TOKEN
         return value
 
+    def _strip_json_match(self, match: re.Match) -> str:
+        if match.group("rel") is not None:
+            return '"' + ESCAPE + match.group("rel")
+        return '"./' if match.group("end") == "/" else '"."'
+
+    def strip_json(self, value: str) -> str:
+        """JSON text with each in-repo string stored relative (see module docstring)."""
+        if '".' not in value and '"!' not in value and not any(
+            root in value for root in self._json_roots
+        ):
+            return value
+        return self._json_inbound.sub(self._strip_json_match, value)
+
     def strip(self, value: str) -> str:
         """The stored form of *value*: root stripped, or escaped if it needs it."""
+        if value[:1] in _JSON_FIRST:
+            return self.strip_json(value)
         stripped = self.strip_root(value)
         if stripped is value and _looks_relative(value):
             return ESCAPE + value
@@ -158,6 +209,18 @@ class PathCodec:
 
     # -- outbound ------------------------------------------------------------
 
+    def _restore_json_match(self, match: re.Match) -> str:
+        escape = match.group("esc")
+        if escape is not None:
+            return '"' + escape[1:]
+        return '"' + self._json_root_out + match.group("end")
+
+    def restore_json(self, value: str) -> str:
+        """JSON text with each stored relative string made absolute again."""
+        if '".' not in value and '"!' not in value:
+            return value
+        return _JSON_STORED.sub(self._restore_json_match, value)
+
     def restore(self, value: Any) -> Any:
         """The value a caller sees for a stored path or qualified name."""
         if not isinstance(value, str) or not value:
@@ -170,6 +233,8 @@ class PathCodec:
                 return self.root + value[1:]
         elif first == ESCAPE and _looks_relative(value):
             return value[1:]
+        elif first in _JSON_FIRST:
+            return self.restore_json(value)
         return value
 
     # Kept as names for callers that pick by column kind.
@@ -201,7 +266,7 @@ class PathCodec:
             values = None
             for index in spec:
                 value = row[index]
-                if isinstance(value, str) and value[:1] in (".", ESCAPE):
+                if isinstance(value, str) and value[:1] in _RESTORED_FIRST:
                     if values is None:
                         values = list(row)
                     values[index] = self.restore(value)

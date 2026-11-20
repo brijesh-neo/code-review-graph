@@ -705,6 +705,16 @@ def _migrate_v16(conn: sqlite3.Connection) -> None:
     _progress("Migration v16: repo-relative paths are converted on open")
 
 
+def _migrate_v17(conn: sqlite3.Connection) -> None:
+    """v17: ``extra`` JSON stores in-repo paths relative too (``relpath_extra``).
+
+    No table changes. The version moves so a release that reads ``extra`` as
+    absolute refuses the graph. The rewrite needs the root, so ``GraphStore``
+    runs it on open (see ``convert_extra_to_relative`` in relpath_migration.py).
+    """
+    _progress("Migration v17: repo-relative extra paths are converted on open")
+
+
 # ---------------------------------------------------------------------------
 # Migration registry
 # ---------------------------------------------------------------------------
@@ -725,6 +735,7 @@ MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {
     14: _migrate_v14,
     15: _migrate_v15,
     16: _migrate_v16,
+    17: _migrate_v17,
 }
 
 LATEST_VERSION = max(MIGRATIONS.keys())

@@ -39,7 +39,7 @@ from .csharp_resolver import restore_csharp_references
 from .errors import ChangeDiscoveryError, GraphRootMismatchError, GraphStoreError
 from .graph import GraphStore
 from .locking import WriteLock, write_lock_path
-from .relpaths import MOVED_FROM_KEY
+from .relpaths import EXTRA_MODE_KEY, MOVED_FROM_KEY, PATH_MODE_RELATIVE
 
 if TYPE_CHECKING:
     from .parser import CodeParser
@@ -3100,6 +3100,9 @@ def full_build(
     store.set_metadata("last_build_type", "full")
     if store.get_metadata(MOVED_FROM_KEY):
         store.set_metadata(MOVED_FROM_KEY, "")
+    if store.path_root is not None:
+        # Every row was just written through the codec, ``extra`` included.
+        store.set_metadata(EXTRA_MODE_KEY, PATH_MODE_RELATIVE)
     store.set_metadata("intentionally_incomplete", "0")
     store.set_metadata(
         VERIFIED_FILE_COUNT_KEY, "0" if errors else str(len(store.get_all_files()))
