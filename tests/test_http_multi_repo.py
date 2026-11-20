@@ -16,7 +16,6 @@ from __future__ import annotations
 
 import asyncio
 import inspect
-import json
 import os
 import shutil
 import socket
@@ -34,6 +33,7 @@ from fastmcp.exceptions import ToolError
 from code_review_graph import cli
 from code_review_graph import main as crg_main
 from code_review_graph.registry import Registry
+from code_review_graph.toon import decode, restore_repeated_fields
 
 REPO_SOURCE_ROOT = Path(__file__).resolve().parents[1]
 CALL_TIMEOUT = 120.0
@@ -434,7 +434,7 @@ def _is_error(result: Any) -> bool:
 
 def _payload(result: Any) -> dict:
     assert not _is_error(result), _text(result)
-    return json.loads(result.content[0].text)
+    return restore_repeated_fields(decode(result.content[0].text))
 
 
 def _names(payload: dict) -> set[str]:

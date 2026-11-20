@@ -123,7 +123,7 @@ def test_mcp_exposes_compact_file_context(impact_repo):
 def test_cli_exposes_compact_file_context(impact_repo, monkeypatch, capsys):
     monkeypatch.setattr(sys, "argv", [
         "code-review-graph", "impact", "--repo", str(impact_repo),
-        "--files", "src/core.py", "--detail-level", "compact", "--max-files", "1",
+        "--files", "src/core.py", "--detail-level", "compact", "--max-files", "1", "--json",
     ])
     cli.main()
     result = json.loads(capsys.readouterr().out)

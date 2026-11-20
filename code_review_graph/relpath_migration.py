@@ -22,13 +22,16 @@ import time
 from typing import Any, Optional
 
 from .errors import GraphStoreError
-from .relpaths import PATH_MODE_KEY, PATH_MODE_RELATIVE, PathCodec
+from .relpaths import EXTRA_MODE_KEY, PATH_MODE_KEY, PATH_MODE_RELATIVE, PathCodec
 
 logger = logging.getLogger(__name__)
 
 MIGRATION_KEY = "relpath_migration"
 MIGRATION_ROOT_KEY = "relpath_migration_root"
 BATCH_ROWS = 50_000
+#: Metadata key prefix: highest ``<table>.id`` whose ``extra`` is converted.
+EXTRA_CURSOR_KEY = "relpath_extra_cursor"
+_EXTRA_TABLES = ("nodes", "edges")
 
 #: Columns rewritten per table. Everything else is copied as is.
 _PATH_COLUMNS: dict[str, tuple[str, ...]] = {
@@ -294,4 +297,73 @@ def convert_to_relative(
         raise
     logger.info(
         "Converted the graph to repo-relative paths in %.1fs", time.monotonic() - started,
+    )
+
+
+def convert_extra_to_relative(
+    conn: sqlite3.Connection, root: str, *, batch: int = BATCH_ROWS,
+) -> None:
+    """Store ``extra`` JSON of a relative graph relative to *root*, in place.
+
+    For graphs written before ``extra`` was translated (schema v16). Each batch
+    commits with its cursor, so a killed run resumes where it stopped and no
+    row is converted twice. *conn* must be untranslated (no root bound).
+    """
+    codec = PathCodec(root)
+    _claim(conn, codec.root)
+    started = time.monotonic()
+    changed = 0
+    try:
+        for table in _EXTRA_TABLES:
+            key = f"{EXTRA_CURSOR_KEY}:{table}"
+            last = int(_meta(conn, key) or 0)
+            while True:
+                conn.execute("BEGIN IMMEDIATE")
+                try:
+                    rows = conn.execute(
+                        f"SELECT id, extra FROM {table} WHERE id > ? "  # nosec B608
+                        "ORDER BY id LIMIT ?", (last, batch),
+                    ).fetchall()
+                    updates = []
+                    for row_id, extra in rows:
+                        if isinstance(extra, str) and extra:
+                            stored = codec.strip_json(extra)
+                            if stored != extra:
+                                updates.append((stored, row_id))
+                    conn.executemany(
+                        f"UPDATE {table} SET extra = ? WHERE id = ?", updates,  # nosec B608
+                    )
+                    if rows:
+                        last = rows[-1][0]
+                        _set_meta(conn, key, str(last))
+                except BaseException:
+                    conn.rollback()
+                    raise
+                conn.commit()
+                changed += len(updates)
+                if len(rows) < batch:
+                    break
+                logger.info("Relative extra: %s up to id %d", table, last)
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            _set_meta(conn, EXTRA_MODE_KEY, PATH_MODE_RELATIVE)
+            conn.execute(
+                "DELETE FROM metadata WHERE key IN (?, ?, ?, ?)",
+                (MIGRATION_KEY, MIGRATION_ROOT_KEY,
+                 *(f"{EXTRA_CURSOR_KEY}:{t}" for t in _EXTRA_TABLES)),
+            )
+        except BaseException:
+            conn.rollback()
+            raise
+        conn.commit()
+    except BaseException:
+        try:
+            conn.execute("DELETE FROM metadata WHERE key = ?", (MIGRATION_KEY,))
+            conn.commit()
+        except sqlite3.Error as exc:
+            logger.warning("Could not release the relative-extra conversion claim: %s", exc)
+        raise
+    logger.info(
+        "Converted %d extra value(s) to repo-relative paths in %.1fs",
+        changed, time.monotonic() - started,
     )

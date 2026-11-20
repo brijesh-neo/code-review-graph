@@ -23,6 +23,9 @@ import anyio.to_thread
 from fastmcp import FastMCP
 from fastmcp.exceptions import ToolError
 from fastmcp.prompts import Message
+from fastmcp.server.middleware import Middleware
+from fastmcp.tools import ToolResult
+from mcp.types import TextContent
 
 from . import __version__
 from . import incremental as _incremental
@@ -380,10 +383,36 @@ MULTI_REPO_INSTRUCTIONS = (
     "path of a registered repository, on every call. list_repos_tool lists them."
 )
 
+
+
+class ToonResults(Middleware):
+    """Return every tool result as TOON text instead of JSON.
+
+    TOON writes a list of records as one header and a row per record, which
+    is what most results are, so the same answer takes far fewer tokens. The
+    result is sent as text only: no structured copy, and so no output schema
+    for a client to check it against.
+    """
+
+    async def on_list_tools(self, context, call_next):
+        tools = await call_next(context)
+        return [tool.model_copy(update={"output_schema": None}) for tool in tools]
+
+    async def on_call_tool(self, context, call_next):
+        result = await call_next(context)
+        if result.structured_content is None:
+            return result
+        from .toon import drop_repeated_fields, encode
+
+        text = encode(drop_repeated_fields(result.structured_content))
+        return ToolResult(content=[TextContent(type="text", text=text)])
+
+
 mcp = FastMCP(
     "code-review-graph",
     version=__version__,
     instructions=SERVER_INSTRUCTIONS,
+    middleware=[ToonResults()],
 )
 
 
@@ -644,7 +673,9 @@ async def query_graph_tool(
         pattern: Query pattern name (see above).
         target: Node name, qualified name, or file path to query. A full name
             that one non-test symbol has resolves to it; otherwise the answer
-            is "ambiguous" and lists qualified names to choose from.
+            is "ambiguous" and lists qualified names to choose from. A row
+            printed without ``qualified_name`` is addressed as
+            ``file_path::name``, or ``file_path::Parent.name`` for a method.
         repo_root: Repository root path. Auto-detected if omitted.
         detail_level: "standard" for full output, "minimal" for compact summary. Default: standard.
         max_results: Maximum results to return. Default: 100.

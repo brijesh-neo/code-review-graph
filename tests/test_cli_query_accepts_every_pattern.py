@@ -44,7 +44,9 @@ def test_each_pattern_reaches_the_tool(pattern, tmp_path, monkeypatch, capsys):
     (data_dir / "graph.db").touch()
     monkeypatch.setenv("CRG_DATA_DIR", str(data_dir))
     extra = ["--to", "other"] if pattern == "path_to" else []
-    argv = ["code-review-graph", "query", pattern, "target", *extra, "--repo", str(repo)]
+    argv = [
+        "code-review-graph", "query", pattern, "target", *extra, "--repo", str(repo), "--json",
+    ]
     result = {"status": "ok", "pattern": pattern}
 
     with patch.object(sys, "argv", argv):
@@ -54,7 +56,7 @@ def test_each_pattern_reaches_the_tool(pattern, tmp_path, monkeypatch, capsys):
     assert json.loads(capsys.readouterr().out) == result
     expected = {"to": "other"} if pattern == "path_to" else {}
     tool.assert_called_once_with(
-        pattern=pattern, target="target", repo_root=str(repo), **expected
+        pattern=pattern, target="target", repo_root=str(repo), max_results=100, **expected
     )
 
 

@@ -62,8 +62,14 @@ from .migrations import (
     run_migrations,
     target_resolution_expr,
 )
-from .relpath_migration import GraphMigratingError, convert_to_relative, migration_holder
+from .relpath_migration import (
+    GraphMigratingError,
+    convert_extra_to_relative,
+    convert_to_relative,
+    migration_holder,
+)
 from .relpaths import (
+    EXTRA_MODE_KEY,
     MOVED_FROM_KEY,
     PATH_MODE_KEY,
     PATH_MODE_RELATIVE,
@@ -1015,6 +1021,10 @@ def discard_corrupt_database(db_path: str | Path) -> bool:
     return removed
 
 
+# Page cache for builds and updates, in KiB (see GraphStore.build_cache).
+BUILD_CACHE_KIB = 100 * 1024
+
+
 class GraphStore:
     """SQLite-backed code knowledge graph."""
 
@@ -1193,6 +1203,23 @@ class GraphStore:
             self._cache_epoch += 1
             self._nxg_cache = None
             self._bare_endpoint_context_cache = None
+
+    @contextmanager
+    def build_cache(self) -> Iterator[None]:
+        """Give a build or update a 100 MB page cache, then put the old size back.
+
+        Each edge insert also updates indexes keyed on the target name, so on a
+        large graph the default 2 MB cache misses on nearly every row. The store
+        can stay open afterwards (watch mode, the MCP server), so the pages are
+        released when the build ends.
+        """
+        previous = int(self._conn.execute("PRAGMA cache_size").fetchone()[0])
+        self._conn.execute(f"PRAGMA cache_size=-{BUILD_CACHE_KIB}")
+        try:
+            yield
+        finally:
+            self._conn.execute(f"PRAGMA cache_size={previous}")
+            self._conn.execute("PRAGMA shrink_memory")
 
     def shrink_memory(self, clear_nx_cache: bool = True) -> None:
         """Release cached in-memory structures and shrink SQLite page cache."""
@@ -2178,21 +2205,53 @@ class GraphStore:
         conn = self._conn
         assert isinstance(conn, TranslatingConnection)
         root = preferred_root(root, self.get_metadata(ROOT_SPELLING_KEY))
+        self._convert_extra(root)
         conn.bind_root(root)
         if not self.read_only and self.get_metadata(ROOT_SPELLING_KEY) != root:
             self._record_root_spelling(root)
         self._nxg_cache = None
         self._bare_endpoint_context_cache = None
 
+    def _convert_extra(self, root: str) -> None:
+        """Store a v16 graph's ``extra`` relative to *root*, once, if it is its root."""
+        if self.read_only or self.get_metadata(EXTRA_MODE_KEY) == PATH_MODE_RELATIVE:
+            return
+        if self.get_metadata(MOVED_FROM_KEY) or names_another_directory(
+            self.get_metadata(ROOT_SPELLING_KEY), root,
+        ):
+            # Built in another checkout: ``extra`` names that one, so the next
+            # update rebuilds instead (see MOVED_FROM_KEY).
+            return
+        conn = self._conn
+        assert isinstance(conn, TranslatingConnection)
+        bound = conn.codec
+        conn.bind_root(None)
+        try:
+            if self.has_nodes():
+                convert_extra_to_relative(conn, root)
+            else:
+                self.set_metadata(EXTRA_MODE_KEY, PATH_MODE_RELATIVE)
+        except GraphMigratingError:
+            raise
+        except sqlite3.Error as exc:
+            if is_lock_error(exc):
+                raise
+            # Unconverted rows keep their absolute paths, which still read back.
+            logger.error("Could not convert %s extra to relative paths: %s", self.db_path, exc)
+        finally:
+            conn.bind_root(bound.root if bound else None)
+
     def _record_root_spelling(self, root: str) -> None:
         # Only a preference for later openers, so a busy graph is not an error.
         try:
             recorded = self.get_metadata(ROOT_SPELLING_KEY)
-            if names_another_directory(recorded, root) and not self.get_metadata(
-                MOVED_FROM_KEY,
+            if (
+                names_another_directory(recorded, root)
+                and not self.get_metadata(MOVED_FROM_KEY)
+                and self.get_metadata(EXTRA_MODE_KEY) != PATH_MODE_RELATIVE
             ):
-                # A graph copied from another checkout: remember where from, so
-                # the next update rebuilds (see MOVED_FROM_KEY).
+                # A graph copied from another checkout before ``extra`` was
+                # relative: remember where from, so the next update rebuilds.
                 assert recorded is not None
                 self.set_metadata(MOVED_FROM_KEY, recorded)
             self.set_metadata(ROOT_SPELLING_KEY, root)

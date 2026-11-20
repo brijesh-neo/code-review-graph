@@ -561,6 +561,7 @@ class TestDetectChangesCommand:
             "--repo",
             str(repo),
             "--churn",
+            "--json",
         ]
 
         with patch.object(sys, "argv", argv):
@@ -595,6 +596,7 @@ class TestDetectChangesCommand:
             str(repo),
             "--base",
             "origin/main",
+            "--json",
         ]
 
         with patch.object(sys, "argv", argv):
@@ -693,6 +695,7 @@ class TestDetectChangesCommand:
             "detect-changes",
             "--repo",
             str(repo),
+            "--json",
         ]
 
         with patch.object(sys, "argv", argv):
@@ -794,7 +797,7 @@ class TestDetectChangesEndToEnd:
         finally:
             store.close()
 
-        argv = ["code-review-graph", "detect-changes", "--repo", str(repo)]
+        argv = ["code-review-graph", "detect-changes", "--repo", str(repo), "--json"]
         with patch.object(sys, "argv", argv):
             cli.main()
 
@@ -870,6 +873,7 @@ def test_explicit_monorepo_subproject_runs_a_real_graph_search(
         "raw_stream_lookup",
         "--repo",
         str(nested),
+        "--json",
     ]
 
     with patch.object(sys, "argv", argv):
