@@ -6,6 +6,8 @@
 - _extract_value_references names the caller only for the nodes it acts on.
 - Python walks skip statements that cannot hold a declaration or method scope.
 - full_build and incremental_update run with a larger page cache, put back afterwards.
+
+From PR #4.
 """
 
 import sqlite3
