@@ -96,7 +96,7 @@ code-review-graph visualize --seed-symbol login --max-nodes 300  # hard cap
 code-review-graph visualize --seed-symbol login --sidecar   # payload in graph.data.js
 
 # Analysis
-code-review-graph detect-changes               # Risk-scored change analysis (read-only): the last commit
+code-review-graph detect-changes               # Risk-scored change analysis (read-only, TOON; --json for JSON): the last commit
                                                 #   (HEAD~1) plus uncommitted and new files
 code-review-graph detect-changes --base HEAD~3 # Custom base revision (one Git does not know: exit 1)
 code-review-graph detect-changes --base origin/main # Branch refs use their merge base with HEAD
@@ -109,7 +109,7 @@ code-review-graph detect-changes --churn       # Add opt-in change-frequency ris
                                                 #   recorded as unavailable for the life of the process, so the timeout is
                                                 #   paid once, and the response says so: `churn_status` is "unavailable"
                                                 #   and the summary carries a "Degraded" line.
-code-review-graph detect-changes --details all # Add bounded graph context under "details" (JSON only):
+code-review-graph detect-changes --details all # Add bounded graph context under "details" (not with --brief):
                                                 #   risk, communities, hubs, coupling, impact, gaps, graph.
                                                 #   Off by default; the GitHub Action's `details` input uses it.
 code-review-graph dead-code                    # Functions/classes with no callers or test references
@@ -117,6 +117,13 @@ code-review-graph dead-code --kind Function --file-pattern src/ --json
 code-review-graph dead-code --limit 20         # 0, the default, means no limit
 
 # Read-only graph queries (CLI mirrors of the MCP tools)
+# They print TOON: JSON's data with lists of records as tables (a header, then one
+# comma-separated row each), and paths relative to the repository when you run them
+# inside it. Add --json to any of them for the full JSON with absolute paths.
+# TOON leaves out only what the other fields give back exactly: an edge that repeats
+# a row (kept as the row's edge id), a language every file extension gives, and a
+# qualified_name that is file_path::name (or file_path::Parent.name), which is also
+# how to pass that row back as a target. toon.restore_repeated_fields rebuilds them.
 code-review-graph query callers_of <target>    # Takes every query_graph_tool pattern: callers_of,
                                                 #   references_to, callees_of, imports_of, importers_of,
                                                 #   children_of, tests_for, inheritors_of, triggers_of,
@@ -124,6 +131,7 @@ code-review-graph query callers_of <target>    # Takes every query_graph_tool pa
                                                 #   advised_by, handlers_of, endpoints_for, consumers_of,
                                                 #   file_summary, path_to
 code-review-graph query path_to <a> --to <b>  # How a reaches b, hop by hop
+code-review-graph query tests_for <target> --max-results 500  # Show more than the default 100
 code-review-graph impact [--files F ...] [--depth N] [--max-results N] [--base REF] [--detail-level compact] [--max-files N]
 code-review-graph search <query> [--kind Function] [--limit N]
 code-review-graph flows [--sort criticality] [--limit N] [--kind KIND]
@@ -132,9 +140,21 @@ code-review-graph communities [--sort size] [--min-size N]
 code-review-graph community --id ID | --name NAME [--members]
 code-review-graph architecture [--detail-level minimal|standard]
 code-review-graph large-functions [--min-lines N] [--kind Function] [--path SUBSTR] [--limit N]
-code-review-graph refactor rename --old-name A --new-name B
+code-review-graph refactor rename --old-name A --new-name B [--apply]  # --apply writes the edits
 code-review-graph refactor dead_code [--kind Function] [--path SUBSTR]
 code-review-graph refactor suggest
+code-review-graph context ["task"] [--files F ...] [--base REF]  # Short overview to start a task
+code-review-graph review-context [--files F ...] [--base REF] [--no-source] [--max-lines N] [--detail-level minimal]
+code-review-graph affected-flows [--files F ...] [--base REF] [--limit N]
+code-review-graph traverse <query> [--mode bfs|dfs] [--depth N] [--token-budget N]
+code-review-graph hubs [--limit N]             # Most connected nodes
+code-review-graph bridges [--limit N]          # Nodes that join parts of the code
+code-review-graph gaps [--limit N]             # Untested hotspots, isolated nodes, thin communities, import cycles
+code-review-graph surprises [--limit N]        # Unexpected links between parts of the code
+code-review-graph questions                    # Review questions drawn from the graph
+code-review-graph wiki-page <community> [--max-chars N]
+code-review-graph cross-search <query> [--kind KIND] [--repos A B]  # Every registered repository
+code-review-graph docs <section>               # One section of the LLM reference
 
 # Wiki
 code-review-graph wiki                         # Markdown wiki in .code-review-graph/wiki/ (needs an existing graph)

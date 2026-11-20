@@ -171,7 +171,7 @@ _BANNER_GROUPS: tuple[tuple[str, tuple[tuple[str, str], ...]], ...] = (
         ("detect-changes", "Score the risk of your changes (read-only)"),
         ("impact", "Show what a change can reach"),
         ("dead-code", "Find code that nothing calls or tests"),
-        ("refactor", "Preview a rename, dead code or suggestions"),
+        ("refactor", "Preview or apply a rename, find dead code, suggest"),
     )),
     ("Explore", (
         ("query", "Callers, callees, imports, tests and more"),
@@ -182,6 +182,18 @@ _BANNER_GROUPS: tuple[tuple[str, tuple[tuple[str, str], ...]], ...] = (
         ("communities", "List groups of related code"),
         ("community", "Show one group"),
         ("large-functions", "Find very long functions and classes"),
+        ("context", "Short overview of the graph for a task"),
+        ("review-context", "Changed code, its neighbours and source"),
+        ("affected-flows", "Execution flows a change touches"),
+        ("traverse", "Walk the graph out from a symbol"),
+        ("hubs", "Most connected nodes"),
+        ("bridges", "Nodes that join parts of the code"),
+        ("gaps", "Untested hotspots, isolated and thin code"),
+        ("surprises", "Unexpected links between parts of the code"),
+        ("questions", "Review questions drawn from the graph"),
+        ("cross-search", "Search every registered repository"),
+        ("wiki-page", "Show one page of the generated wiki"),
+        ("docs", "Show one section of the reference docs"),
         ("visualize", "Draw the graph as an interactive page"),
         ("wiki", "Write a Markdown wiki from the graph"),
         ("context-history", "Show the saved-context log"),
@@ -984,7 +996,20 @@ _GRAPH_TOOL_COMMANDS = {
     "architecture",
     "large-functions",
     "refactor",
+    "context",
+    "review-context",
+    "affected-flows",
+    "traverse",
+    "hubs",
+    "bridges",
+    "gaps",
+    "surprises",
+    "questions",
+    "wiki-page",
 }
+
+#: Tool commands that answer without this repository's graph.
+_STANDALONE_TOOL_COMMANDS = frozenset({"cross-search", "docs"})
 
 
 _PATH_REPO_COMMANDS = frozenset({
@@ -1006,6 +1031,7 @@ _PATH_REPO_COMMANDS = frozenset({
     "dead-code",
     "serve",
     "mcp",
+    "docs",
     *_GRAPH_TOOL_COMMANDS,
 })
 
@@ -1135,8 +1161,45 @@ def _handle_context_history(args) -> None:
         print(f"\nRecording is off. Set {ch.HISTORY_ENV}=1 to add new calls.")
 
 
+def _print_tool_result(args, result, repo_root: "Path | None") -> None:
+    """Print a tool result as TOON, or as indented JSON with ``--json``.
+
+    TOON output shows paths relative to the repository when the working
+    directory is inside it, as the MCP tools do, and leaves out the fields a
+    reader can tell from the rest (``toon.drop_repeated_fields``); ``--json``
+    prints everything, with absolute paths.
+    """
+    if getattr(args, "json", False):
+        print(json.dumps(result, indent=2, default=str))
+        return
+    from .tools._common import relative_to_cwd
+    from .toon import drop_repeated_fields, encode
+
+    if repo_root is not None:
+        result = relative_to_cwd(result, str(repo_root), os.getcwd())
+    print(encode(drop_repeated_fields(result)))
+
+
+def _run_standalone_tool_command(args) -> None:
+    """Run a tool command that needs no graph of the current repository."""
+    from . import tools
+
+    if args.command == "cross-search":
+        result = tools.cross_repo_search_func(
+            query=args.query,
+            kind=args.kind,
+            limit=args.limit,
+            max_results=args.max_results,
+            repos=args.repos,
+        )
+        _print_tool_result(args, result, None)
+    else:
+        result = tools.get_docs_section(section_name=args.section, repo_root=args.repo)
+        _print_tool_result(args, result, Path(args.repo) if args.repo else None)
+
+
 def _run_graph_tool_command(args, repo_root: Path) -> None:
-    """Run one graph-tool CLI wrapper and emit exactly one JSON value."""
+    """Run one graph-tool CLI wrapper and print its result once."""
     from . import tools
 
     root = str(repo_root)
@@ -1145,6 +1208,7 @@ def _run_graph_tool_command(args, repo_root: Path) -> None:
             pattern=args.pattern,
             target=args.target,
             repo_root=root,
+            max_results=args.max_results,
             **({"to": args.to} if args.to else {}),
         )
     elif args.command == "impact":
@@ -1204,6 +1268,65 @@ def _run_graph_tool_command(args, repo_root: Path) -> None:
             limit=args.limit,
             repo_root=root,
         )
+    elif args.command == "context":
+        result = tools.get_minimal_context(
+            task=args.task,
+            changed_files=args.files,
+            repo_root=root,
+            base=args.base,
+        )
+    elif args.command == "review-context":
+        result = tools.get_review_context(
+            changed_files=args.files,
+            max_depth=args.depth,
+            include_source=not args.no_source,
+            max_lines_per_file=args.max_lines,
+            repo_root=root,
+            base=args.base,
+            detail_level=args.detail_level,
+            max_results=args.max_results,
+            max_files=args.max_files,
+        )
+    elif args.command == "affected-flows":
+        result = tools.get_affected_flows_func(
+            changed_files=args.files,
+            base=args.base,
+            repo_root=root,
+            detail_level=args.detail_level,
+            max_flows=args.limit,
+        )
+    elif args.command == "traverse":
+        result = tools.traverse_graph_func(
+            query=args.query,
+            mode=args.mode,
+            depth=args.depth,
+            token_budget=args.token_budget,
+            repo_root=root,
+        )
+    elif args.command == "hubs":
+        result = tools.get_hub_nodes_func(
+            repo_root=root, top_n=args.limit, detail_level=args.detail_level,
+        )
+    elif args.command == "bridges":
+        result = tools.get_bridge_nodes_func(
+            repo_root=root, top_n=args.limit, detail_level=args.detail_level,
+        )
+    elif args.command == "gaps":
+        result = tools.get_knowledge_gaps_func(
+            repo_root=root,
+            max_per_category=args.limit,
+            detail_level=args.detail_level,
+        )
+    elif args.command == "surprises":
+        result = tools.get_surprising_connections_func(
+            repo_root=root, top_n=args.limit, detail_level=args.detail_level,
+        )
+    elif args.command == "questions":
+        result = tools.get_suggested_questions_func(repo_root=root)
+    elif args.command == "wiki-page":
+        result = tools.get_wiki_page_func(
+            community_name=args.name, repo_root=root, max_chars=args.max_chars,
+        )
     else:
         result = tools.refactor_func(
             mode=args.mode,
@@ -1213,7 +1336,20 @@ def _run_graph_tool_command(args, repo_root: Path) -> None:
             file_pattern=args.path,
             repo_root=root,
         )
-    print(json.dumps(result, indent=2, default=str))
+        if args.apply and result.get("refactor_id"):
+            # A preview lives in this process only, so --apply writes it
+            # before the process exits instead of handing back an ID.
+            applied = tools.apply_refactor_func(
+                refactor_id=result["refactor_id"], repo_root=root,
+            )
+            result = applied
+            if applied.get("status") == "ok":
+                result["summary"] = (
+                    f"Renamed {args.old_name} -> {args.new_name}: "
+                    f"{applied.get('edits_applied', 0)} edit(s) in "
+                    f"{len(applied.get('files_modified', []))} file(s)."
+                )
+    _print_tool_result(args, result, repo_root)
 
 
 #: Exit code for "another writer holds the lock; nothing was done".
@@ -2333,7 +2469,10 @@ def build_parser() -> argparse.ArgumentParser:
         "--brief",
         action="store_true",
         help="Show the risk summary + Token Savings panel instead of the "
-             "full JSON. Read-only against the existing graph.",
+             "full report. Read-only against the existing graph.",
+    )
+    detect_cmd.add_argument(
+        "--json", action="store_true", help="Print the full report as JSON instead of TOON",
     )
     detect_cmd.add_argument("--repo", default=None, help="Repository root (auto-detected)")
     detect_cmd.add_argument(
@@ -2356,7 +2495,7 @@ def build_parser() -> argparse.ArgumentParser:
         type=_detail_sections_arg,
         default=(),
         metavar="SECTIONS",
-        help="Add bounded graph context to the JSON under 'details': a "
+        help="Add bounded graph context to the report under 'details': a "
              "comma-separated list of risk, communities, hubs, coupling, "
              "impact, gaps, graph, or all. Not used with --brief.",
     )
@@ -2435,6 +2574,9 @@ def build_parser() -> argparse.ArgumentParser:
     query_cmd.add_argument("target", help="Node name, qualified name, or file path")
     query_cmd.add_argument(
         "--to", default=None, help="For path_to: the node or file to reach",
+    )
+    query_cmd.add_argument(
+        "--max-results", type=_positive_int, default=100, help="Results to show",
     )
     query_cmd.add_argument("--repo", default=None, help="Repository root (auto-detected)")
 
@@ -2523,7 +2665,7 @@ def build_parser() -> argparse.ArgumentParser:
     large_cmd.add_argument("--limit", type=_positive_int, default=50)
     large_cmd.add_argument("--repo", default=None, help="Repository root (auto-detected)")
 
-    refactor_cmd = sub.add_parser("refactor", help="Preview graph-backed refactors")
+    refactor_cmd = sub.add_parser("refactor", help="Preview or apply graph-backed refactors")
     refactor_cmd.add_argument("mode", choices=["rename", "dead_code", "suggest"])
     refactor_cmd.add_argument("--old-name", default=None)
     refactor_cmd.add_argument("--new-name", default=None)
@@ -2533,7 +2675,87 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
     )
     refactor_cmd.add_argument("--path", default=None, help="File-path substring filter")
+    refactor_cmd.add_argument(
+        "--apply", action="store_true",
+        help="rename only: write the previewed edits to the files in the same run",
+    )
     refactor_cmd.add_argument("--repo", default=None, help="Repository root (auto-detected)")
+
+    def _changes_args(cmd: argparse.ArgumentParser) -> None:
+        cmd.add_argument(
+            "--files", nargs="+", default=None,
+            help="Changed files (auto-detected when omitted)",
+        )
+        cmd.add_argument("--base", default="HEAD~1")
+
+    context_cmd = sub.add_parser("context", help="Short overview of the graph for a task")
+    context_cmd.add_argument("task", nargs="?", default="", help="What you are working on")
+    _changes_args(context_cmd)
+
+    review_cmd = sub.add_parser("review-context", help="Changed code, its neighbours and source")
+    _changes_args(review_cmd)
+    review_cmd.add_argument("--depth", type=_non_negative_int, default=2)
+    review_cmd.add_argument("--no-source", action="store_true", help="Leave out source snippets")
+    review_cmd.add_argument("--max-lines", type=_positive_int, default=200,
+                            help="Source lines per file")
+    review_cmd.add_argument("--detail-level", choices=["standard", "minimal"], default="standard")
+    review_cmd.add_argument("--max-results", type=_positive_int, default=50)
+    review_cmd.add_argument("--max-files", type=_positive_int, default=25)
+
+    affected_cmd = sub.add_parser("affected-flows", help="Execution flows a change touches")
+    _changes_args(affected_cmd)
+    affected_cmd.add_argument("--detail-level", choices=["standard", "minimal"],
+                              default="standard")
+    affected_cmd.add_argument("--limit", type=_positive_int, default=50)
+
+    traverse_cmd = sub.add_parser("traverse", help="Walk the graph out from a symbol")
+    traverse_cmd.add_argument("query", help="Node name, qualified name, or search text")
+    traverse_cmd.add_argument("--mode", choices=["bfs", "dfs"], default="bfs")
+    traverse_cmd.add_argument("--depth", type=_positive_int, default=3)
+    traverse_cmd.add_argument("--token-budget", type=_positive_int, default=2000)
+
+    analysis_cmds = {}
+    for name, help_text, default_limit in (
+        ("hubs", "Most connected nodes", 10),
+        ("bridges", "Nodes that join parts of the code", 10),
+        ("gaps", "Untested hotspots, isolated and thin code", 15),
+        ("surprises", "Unexpected links between parts of the code", 15),
+    ):
+        cmd = sub.add_parser(name, help=help_text)
+        cmd.add_argument("--limit", type=_positive_int, default=default_limit)
+        cmd.add_argument("--detail-level", choices=["standard", "minimal"],
+                         default="standard")
+        analysis_cmds[name] = cmd
+    analysis_cmds["questions"] = sub.add_parser(
+        "questions", help="Review questions drawn from the graph",
+    )
+
+    wiki_page_cmd = sub.add_parser("wiki-page", help="Show one page of the generated wiki")
+    wiki_page_cmd.add_argument("name", help="Community name")
+    wiki_page_cmd.add_argument("--max-chars", type=_positive_int, default=20000)
+
+    cross_cmd = sub.add_parser("cross-search", help="Search every registered repository")
+    cross_cmd.add_argument("query", help="Search string")
+    cross_cmd.add_argument("--kind", default=None, help="Node kind, e.g. Function or Class")
+    cross_cmd.add_argument("--limit", type=_positive_int, default=20, help="Results per repo")
+    cross_cmd.add_argument("--max-results", type=_positive_int, default=50)
+    cross_cmd.add_argument("--repos", nargs="+", default=None,
+                           help="Registered repository paths or aliases (default: all)")
+
+    docs_cmd = sub.add_parser("docs", help="Show one section of the reference docs")
+    docs_cmd.add_argument(
+        "section",
+        help="usage, review-delta, review-pr, commands, legal, watch, embeddings, "
+             "languages or troubleshooting",
+    )
+
+    for cmd in (context_cmd, review_cmd, affected_cmd, traverse_cmd,
+                *analysis_cmds.values(), wiki_page_cmd, docs_cmd):
+        cmd.add_argument("--repo", default=None, help="Repository root (auto-detected)")
+    for name in (*_GRAPH_TOOL_COMMANDS, *_STANDALONE_TOOL_COMMANDS):
+        sub.choices[name].add_argument(
+            "--json", action="store_true", help="Print the full result as JSON instead of TOON",
+        )
 
     # serve / mcp
     serve_cmd = sub.add_parser(
@@ -2741,12 +2963,14 @@ def _dispatch() -> None:
         and (not args.old_name or not args.new_name)
     ):
         _SUBCOMMANDS["refactor"].error("rename requires --old-name and --new-name")
+    if args.command == "refactor" and args.apply and args.mode != "rename":
+        _SUBCOMMANDS["refactor"].error("--apply works with rename only")
 
     if args.command == "detect-changes" and args.details and args.brief:
-        # The extra sections are JSON for a renderer; the panel has no room
+        # The extra sections are for a renderer; the panel has no room
         # for them, and dropping them without a word would look like a bug.
         _SUBCOMMANDS["detect-changes"].error(
-            "--details adds to the JSON output; it cannot be used with --brief"
+            "--details adds to the full report; it cannot be used with --brief"
         )
 
     if args.command == "visualize":
@@ -2767,6 +2991,10 @@ def _dispatch() -> None:
             hook_update.run_update_hook(existing_only=args.existing_only)
         else:
             hook_update.run_status_hook()
+        return
+
+    if args.command in _STANDALONE_TOOL_COMMANDS:
+        _run_standalone_tool_command(args)
         return
 
     if args.command in _GRAPH_TOOL_COMMANDS:
@@ -3563,7 +3791,7 @@ def _dispatch() -> None:
                     print(format_brief(store, result, repo_root))
                     _print_savings_panel(args, repo_root, changed, result, original_tokens)
                 else:
-                    print(json.dumps(result, indent=2, default=str))
+                    _print_tool_result(args, result, repo_root)
 
     finally:
         store.close()

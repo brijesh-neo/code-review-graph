@@ -116,7 +116,7 @@ runs:
         if [ -n "${REPORT_DETAILS}" ]; then
           details=(--details "${REPORT_DETAILS}")
         fi
-        code-review-graph detect-changes --base "${CRG_BASE}" \
+        code-review-graph detect-changes --base "${CRG_BASE}" --json \
           ${details[@]+"${details[@]}"} > "${RUNNER_TEMP}/crg-report.json"
 
     # Renders on exit 0 (an analysis, or a genuinely unchanged tree) and on

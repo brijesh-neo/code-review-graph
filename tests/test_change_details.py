@@ -477,7 +477,7 @@ def cli_repo(tmp_path, monkeypatch):
 
 
 def _detect(repo: Path, capsys, *extra: str) -> dict:
-    argv = ["code-review-graph", "detect-changes", "--repo", str(repo), *extra]
+    argv = ["code-review-graph", "detect-changes", "--repo", str(repo), "--json", *extra]
     with patch.object(sys, "argv", argv):
         cli.main()
     out = capsys.readouterr().out

@@ -374,7 +374,9 @@ def test_auto_detected_mixed_change_keeps_measured_risk(built_repo, tool, detail
 
 
 def test_cli_impact_reports_unknown_for_a_missing_path(built_repo, monkeypatch, capsys):
-    argv = ['code-review-graph', 'impact', '--files', 'src/ap.py', '--repo', str(built_repo)]
+    argv = [
+        'code-review-graph', 'impact', '--files', 'src/ap.py', '--repo', str(built_repo), '--json',
+    ]
     monkeypatch.setattr(sys, 'argv', argv)
     cli.main()
     result = json.loads(capsys.readouterr().out)
