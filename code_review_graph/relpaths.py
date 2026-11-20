@@ -128,6 +128,9 @@ class PathCodec:
         self.root = absolute_root(root)
         self._roots = root_variants(self.root)
         self._prefixes = tuple(v + "/" for v in self._roots)
+        # First characters a value must start with for strip() to change it:
+        # a root spelling's, or "." / "!" (what _looks_relative needs).
+        self._leads = frozenset({v[:1] for v in self._roots} | {".", ESCAPE})
         self._lock = threading.Lock()
         self._specs: dict[int, tuple[Any, tuple[int, ...]]] = {}
 
@@ -144,6 +147,8 @@ class PathCodec:
 
     def strip(self, value: str) -> str:
         """The stored form of *value*: root stripped, or escaped if it needs it."""
+        if value[:1] not in self._leads:
+            return value
         stripped = self.strip_root(value)
         if stripped is value and _looks_relative(value):
             return ESCAPE + value
@@ -153,7 +158,8 @@ class PathCodec:
         if isinstance(params, dict):
             return {k: self.strip(v) if isinstance(v, str) else v for k, v in params.items()}
         if isinstance(params, (tuple, list)):
-            return tuple(self.strip(v) if isinstance(v, str) else v for v in params)
+            strip = self.strip
+            return tuple([strip(v) if isinstance(v, str) else v for v in params])
         return params
 
     # -- outbound ------------------------------------------------------------
