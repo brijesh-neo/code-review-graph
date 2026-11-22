@@ -6,11 +6,9 @@ hop labels is worthless if the renderer draws every ring at once, if clicking
 a frontier node reveals nothing, or if adding the neighbourhood layer broke
 the search box.  These tests drive the real page in headless Chromium.
 
-The page is served over ``http://127.0.0.1`` rather than opened as
-``file://`` for the reason documented at the top of
-``tests/test_visualization_browser.py``: the vendored D3 carries an
-``integrity`` attribute, and a ``file://`` document is an opaque origin, so
-the same-origin script would be blocked and the page would reach for the CDN.
+The page is served over ``http://127.0.0.1``, as in
+``tests/test_visualization_browser.py``, so the tests stay offline and
+deterministic.
 
 Run them with::
 

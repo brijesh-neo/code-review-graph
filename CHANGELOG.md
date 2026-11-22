@@ -4,6 +4,16 @@
 
 ### Added
 
+- `code-review-graph conflicts`: compares this worktree's changes with every other worktree of the repository, measured from where the two branches split, and lists the symbols both change and the changed symbols that call, reference, inherit or test one the other side changes. Git merges these without a conflict. Read-only; `--json` and `--exit-code` for scripts.
+- `code-review-graph structural-diff BASE`: compares this checkout's graph with another checkout's (or a `graph.db` file): edges added and removed by kind, functions that lost every test, new file-to-file imports, and flows whose criticality moved by 0.05 or more. Read-only; `--json` and `--limit`.
+- `code-review-graph affected-tests [--base REF]`: lists the test files the graph links to the change (callers, importers and tests of the changed files). Any doubt prints "run every test" with the reason: a changed file the graph lacks or that was deleted, a stale graph, changed test configuration, or a capped impact walk. `pytest -p code_review_graph.pytest_plugin --crg-affected` runs only those files; the plugin is not registered as an entry point, so it changes no test run unless loaded.
+- `code-review-graph check-rules`: checks architecture rules in `.code-review-graph/rules.toml` against the graph. `[[forbid]]` rules name `from` and `to` path globs and optional edge kinds; `[no_cycles] between = "communities"` flags communities that import each other in a ring. `--changed-only` limits it to edges that start in changed files. Exits 1 on a violation, 2 when the rules or the graph cannot be read.
+- `code-review-graph history record` and `history show`: `record` stores the edges added and removed since the previous record, tagged with `HEAD`, in `.code-review-graph/history.db`, and marks symbols that lost their last test; the first run stores a baseline. Run it after each commit (a `post-commit` hook line is enough; `install` does not add one). `show --from a.py --to b.py --kind IMPORTS_FROM` says when a dependency appeared; `show --lost-tests` lists when functions lost their last test.
+- `code-review-graph unchecked`: for each symbol changed since `HEAD`, the callers in files the session never read and the tests it never ran. The opt-in enrich hook logs reads and test commands to `.code-review-graph/activity.jsonl`; once that log exists (`unchecked --start` creates it) the edit hook logs edits and tells the agent what it has not checked. Without the log nothing changes.
+- `visualize --live`: keeps `.code-review-graph/live.html`, next to the untouched `graph.html`, drawing the graph around the files changed since `HEAD` (or `--live-base`) and the files the session edited, redrawing whenever the graph or the activity log changes; the open page reloads itself, and `--serve` works with it. Edited files are red, files read green, callers never read and tests never run amber. `--session`, `--interval`, `--depth` (default 1) and `--once` tune it.
+- VS Code extension: a CodeLens above each function and class with its callers, how many of them have no test, and its tests and flows. Clicking it lists the callers. On by default; `codeReviewGraph.codeLens.enabled` turns it off.
+- `code-review-graph seed SOURCE`: starts this checkout's graph from another worktree's, fork's or clone's graph (or a `graph.db` file, such as one a CI run built), then parses only the files whose contents differ. The result equals a full build. On a 182-file repository: 0.74 s against 3.01 s for `build`. Refuses to replace an existing graph without `--force`.
+- `code-review-graph export-absolute OUT`: writes a copy of the graph with absolute paths, marked schema v15, which releases before schema v16 open without a rebuild (checked with 2.4.0). The graph itself is not changed.
 - Graph answers come as TOON instead of JSON, from the CLI and from every
   MCP tool. TOON keeps JSON's data but writes a list of records as a table:
   the field names once, then one comma-separated row per record. A nested
@@ -28,7 +38,6 @@
   `review-context`, `affected-flows`, `traverse`, `hubs`, `bridges`, `gaps`,
   `surprises`, `questions`, `cross-search`, `wiki-page` and `docs`. `query`
   takes `--max-results`.
-
 - The graph stores paths relative to the repository (schema v16), so a
   `graph.db` copied into a linked worktree, fork or clone answers with that
   checkout's paths. Its first `update` there runs a full build, because some
@@ -73,6 +82,8 @@
 
 ### Fixed
 
+- The `visualize` page draws when opened from disk in Chrome. Chrome blocks a `file://` script that carries an `integrity` attribute, and the `d3js.org` fallback no longer matches the pinned hash, so the page stayed on "Laying out graph...". The page now carries the bundled D3 inline, after checking it against the pinned hash; without a match it loads D3 by `src` as before.
+- When the Claude Code edit hook fails to update the graph, it now also prints PostToolUse `additionalContext` telling the agent the graph was not updated and why. The installed hook ignores the exit code and the agent never saw stderr, so it went on answering from a stale graph. Other events and the Codex hook print nothing new.
 - A `tests_for` summary counted the guessed matches among every result, so
   it could name guesses that were not among the rows shown. It now counts
   the shown rows, and says how many more are among the omitted results.

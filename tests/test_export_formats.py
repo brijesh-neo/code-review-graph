@@ -1426,24 +1426,19 @@ def test_html_ships_the_vendored_d3_with_its_integrity_hash(
     page = corpus.run_a / "graph.html"
     reader = _read_page(page)
     external = [
-        (a.get("src"), a.get("integrity"))
-        for tag, a in reader.tags if tag == "script" and a.get("src")
+        a.get("src") for tag, a in reader.tags if tag == "script" and a.get("src")
     ]
-    assert (D3_LOCAL_FILENAME, D3_SRI_HASH) in external, external
+    assert external == [], external
     asset = corpus.run_a / D3_LOCAL_FILENAME
     assert asset.is_file(), "the vendored D3 build was not written"
-    digest = base64.b64encode(hashlib.sha384(asset.read_bytes()).digest())
+    data = asset.read_bytes()
+    digest = base64.b64encode(hashlib.sha384(data).digest())
     assert f"sha384-{digest.decode()}" == D3_SRI_HASH
-    # The CDN fallback lives inside an inline document.write and must carry
-    # the same pin.
+    # The verified build is what the page carries inline.
     text = page.read_text(encoding="utf-8")
-    assert D3_CDN_URL in text
-    fallback = re.search(
-        rf'src=\\?"{re.escape(D3_CDN_URL)}\\?" integrity=\\?"([^"\\]+)',
-        text,
-    )
-    assert fallback and fallback.group(1) == D3_SRI_HASH, "CDN pin missing"
-    _record("html", "d3_pins_verified", 2)
+    assert "<script>" + data.decode("utf-8") + "</script>" in text
+    assert D3_CDN_URL not in text.replace(data.decode("utf-8"), "")
+    _record("html", "d3_pins_verified", 1)
 
 
 def test_html_hostile_names_cannot_escape_the_script_block(corpus: Corpus):

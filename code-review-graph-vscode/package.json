@@ -2,7 +2,7 @@
   "name": "code-review-graph",
   "displayName": "Code Review Graph",
   "description": "Visualize code dependencies, blast radius, and review context from your code-review-graph database directly in VS Code.",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "publisher": "tirth8205",
   "license": "MIT",
   "icon": "media/icons/icon.png",
@@ -184,6 +184,11 @@
           "minimum": 1,
           "maximum": 10,
           "description": "Maximum depth for blast radius traversal."
+        },
+        "codeReviewGraph.codeLens.enabled": {
+          "type": "boolean",
+          "default": true,
+          "description": "Show callers, untested callers, tests and flows above each function and class."
         },
         "codeReviewGraph.graph.maxNodes": {
           "type": "number",

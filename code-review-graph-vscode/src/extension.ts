@@ -15,6 +15,7 @@ import { Installer } from "./onboarding/installer";
 import { registerWalkthroughCommands, showWelcomeIfNeeded } from "./onboarding/welcome";
 import { StatusBar } from "./views/statusBar";
 import { ScmDecorationProvider } from "./features/scmDecorations";
+import { GraphCodeLensProvider, SHOW_CALLERS_COMMAND, showCallers } from "./features/codeLens";
 
 let sqliteReader: SqliteReader | undefined;
 let autoUpdateTimer: ReturnType<typeof setTimeout> | undefined;
@@ -949,6 +950,17 @@ export async function activate(
       scmDecorationProvider = new ScmDecorationProvider();
       context.subscriptions.push(
         vscode.window.registerFileDecorationProvider(scmDecorationProvider)
+      );
+
+      // CodeLens: callers, untested callers, tests and flows per function
+      const codeLensProvider = new GraphCodeLensProvider(() => sqliteReader);
+      context.subscriptions.push(
+        vscode.languages.registerCodeLensProvider({ scheme: "file" }, codeLensProvider),
+        vscode.commands.registerCommand(SHOW_CALLERS_COMMAND, showCallers),
+        vscode.workspace.onDidChangeConfiguration((e) => {
+          if (e.affectsConfiguration("codeReviewGraph.codeLens")) { codeLensProvider.refresh(); }
+        }),
+        vscode.workspace.onDidSaveTextDocument(() => codeLensProvider.refresh()),
       );
     } else {
       // No graph database found - show welcome
