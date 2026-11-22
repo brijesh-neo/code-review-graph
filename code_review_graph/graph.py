@@ -55,6 +55,8 @@ from .constants import (
 from .errors import GraphStoreError, is_lock_error
 from .inheritance import InheritanceIndex
 from .migrations import (
+    EDGES_COMPOSITE_INDEX_SQL,
+    EDGES_TARGET_RESOLUTION_INDEX_SQL,
     LATEST_VERSION,
     TARGET_RESOLUTION_EXPR,
     TARGET_RESOLUTION_KINDS,
@@ -1113,6 +1115,7 @@ class GraphStore:
                     )
                     self._conn.commit()
                 run_migrations(self._conn)
+                self._restore_edge_indexes()
         except (sqlite3.Error, OSError, GraphStoreError) as exc:
             # A corrupt file, a foreign SQLite file, or a data directory this
             # process cannot write to used to escape as a raw traceback from
@@ -1176,6 +1179,8 @@ class GraphStore:
             dict[str, dict[str, str]],
         ] | None = None
         self._cache_lock = threading.Lock()
+        # Files whose edges a running bulk_edge_load() has written, else None.
+        self._bulk_edge_files: set[str] | None = None
         self._cache_epoch = 0
         # Identifies the read transaction currently open on this connection,
         # so a reader cannot roll back a transaction a writer took from it.
@@ -1203,6 +1208,32 @@ class GraphStore:
     def _init_schema(self) -> None:
         self._conn.executescript(_SCHEMA_SQL)
         self._conn.commit()
+
+    def _restore_edge_indexes(self) -> None:
+        """Recreate a migration's edge index that a bulk load left dropped.
+
+        :meth:`bulk_edge_load` drops the edge indexes while a full build
+        writes its rows. A build killed before it put them back would leave
+        them missing, and the migrations that made them have already run.
+        ``_init_schema`` restores the base schema's indexes on every open;
+        this restores the two the migrations add.
+        """
+        present = {
+            row[0] for row in self._conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = 'edges'"
+            )
+        }
+        restored = False
+        for name, sql in (
+            ("idx_edges_composite", EDGES_COMPOSITE_INDEX_SQL),
+            ("idx_edges_kind_target_resolution", EDGES_TARGET_RESOLUTION_INDEX_SQL),
+        ):
+            if name not in present:
+                self._conn.execute(sql)
+                restored = True
+        if restored:
+            self._conn.commit()
+            logger.warning("Restored edge indexes an interrupted build left out")
 
     def _invalidate_cache(self) -> None:
         """Invalidate the cached NetworkX graph after write operations."""
@@ -1872,6 +1903,45 @@ class GraphStore:
             raise
         self._invalidate_cache()
 
+    @contextmanager
+    def bulk_edge_load(self) -> Iterator[bool]:
+        """Write a full build's edges with the edge indexes dropped, then rebuild them.
+
+        Applies only while the edges table is empty; yields whether it did.
+        Building an index once over all the rows is cheaper than updating six
+        of them on every insert. The indexes are recreated from their stored
+        statements in their original order, so the schema reads as before. A
+        process killed before that is repaired on the next open, through
+        ``_init_schema`` and :meth:`_restore_edge_indexes`.
+        """
+        if self._conn.execute("SELECT 1 FROM edges LIMIT 1").fetchone() is not None:
+            yield False
+            return
+        indexes = self._conn.execute(
+            "SELECT name, sql FROM sqlite_master WHERE type = 'index' "
+            "AND tbl_name = 'edges' AND sql IS NOT NULL ORDER BY rowid"
+        ).fetchall()
+        for name, _sql in indexes:
+            self._conn.execute(f'DROP INDEX IF EXISTS "{name}"')  # nosec B608
+        self._conn.commit()
+        self._bulk_edge_files = set()
+        try:
+            yield True
+        finally:
+            self._bulk_edge_files = None
+            if self._conn.in_transaction:
+                self._conn.rollback()
+            present = {
+                row[0] for row in self._conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'index' "
+                    "AND tbl_name = 'edges'"
+                )
+            }
+            for name, sql in indexes:
+                if name not in present:
+                    self._conn.execute(sql)
+            self._conn.commit()
+
     def store_file_batch(
         self, batch: list[tuple[str, list[NodeInfo], list[EdgeInfo], str]]
     ) -> None:
@@ -1971,7 +2041,11 @@ class GraphStore:
         # own rows (#585). Plan identities before the old rows are deleted.
         identities = self._plan_file_identities(normalized, nodes)
         self._conn.execute("DELETE FROM nodes WHERE file_path = ?", (normalized,))
-        self._conn.execute("DELETE FROM edges WHERE file_path = ?", (normalized,))
+        bulk_files = self._bulk_edge_files
+        if bulk_files is None or normalized in bulk_files:
+            # Without the edge indexes this is a full scan, so a bulk load
+            # runs it only for a file whose edges it already wrote.
+            self._conn.execute("DELETE FROM edges WHERE file_path = ?", (normalized,))
 
         now = time.time()
         if nodes:
@@ -2015,7 +2089,15 @@ class GraphStore:
             (self._make_qualified(node), node.line_start, node.line_end, qualified)
             for node, qualified in zip(nodes, identities)
         )
-        self._insert_edges(self._aligned_edges(normalized, edges, collisions), now)
+        aligned = self._aligned_edges(normalized, edges, collisions)
+        if bulk_files is not None:
+            if all(edge.file_path == normalized for edge in aligned):
+                bulk_files.add(normalized)
+            else:
+                # Rows filed under another path: the skipped DELETE above can
+                # no longer be known to be a no-op, so stop skipping it.
+                self._bulk_edge_files = None
+        self._insert_edges(aligned, now)
         self._invalidate_cache()
 
     def _insert_edges(self, edges: list[EdgeInfo], now: float) -> None:

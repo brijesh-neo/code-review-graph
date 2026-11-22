@@ -391,6 +391,19 @@ def _migrate_v7(conn: sqlite3.Connection) -> None:
     _progress("Migration v7: added compound edge indexes")
 
 
+# The edge indexes the migrations add. GraphStore recreates any that are
+# missing when it opens a graph, so their text lives here once: SQLite keeps
+# the statement as written, and a recreated index must read the same.
+EDGES_COMPOSITE_INDEX_SQL = """
+        CREATE INDEX IF NOT EXISTS idx_edges_composite
+        ON edges(kind, source_qualified, target_qualified, file_path, line)
+    """
+EDGES_TARGET_RESOLUTION_INDEX_SQL = (
+    "CREATE INDEX IF NOT EXISTS idx_edges_kind_target_resolution "
+    "ON edges(kind, target_resolution)"
+)
+
+
 def _migrate_v8(conn: sqlite3.Connection) -> None:
     """v8: Add composite index on edges for upsert_edge performance.
 
@@ -403,10 +416,7 @@ def _migrate_v8(conn: sqlite3.Connection) -> None:
     if not _has_column(conn, "edges", "line"):
         _progress("Migration v8: skipped, edges.line is not present")
         return
-    conn.execute("""
-        CREATE INDEX IF NOT EXISTS idx_edges_composite
-        ON edges(kind, source_qualified, target_qualified, file_path, line)
-    """)
+    conn.execute(EDGES_COMPOSITE_INDEX_SQL)
     _progress("Migration v8: created composite edge index")
 
 
@@ -507,10 +517,7 @@ def _migrate_v11(conn: sqlite3.Connection) -> None:
         f"WHERE kind IN ({placeholders})",
         TARGET_RESOLUTION_KINDS,
     )
-    conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_edges_kind_target_resolution "
-        "ON edges(kind, target_resolution)"
-    )
+    conn.execute(EDGES_TARGET_RESOLUTION_INDEX_SQL)
     _progress("Migration v11: added indexed edges.target_resolution column")
 
 

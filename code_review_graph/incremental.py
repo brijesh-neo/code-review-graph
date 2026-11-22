@@ -21,6 +21,7 @@ import time
 import unicodedata
 import uuid
 from collections import deque
+from contextlib import nullcontext
 from functools import partial, wraps
 from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING, Any, Callable, Iterable, NamedTuple, Optional
@@ -3062,72 +3063,77 @@ def full_build(
             store.store_file_batch(pending)
             pending.clear()
 
-    if use_serial or file_count < 8:
-        # Serial fallback (for debugging or tiny repos)
-        for i, rel_path in enumerate(files, 1):
-            full_path = repo_root / rel_path
-            parsed: tuple[list, list, str] | None = None
-            try:
-                source = full_path.read_bytes()
-                fhash = hashlib.sha256(source).hexdigest()
-                nodes, edges = parser.parse_bytes(full_path, source)
-                _relink_edges(edges, repo_root, followed_dirs)
-                parsed = (nodes, edges, fhash)
-            except (OSError, PermissionError) as e:
-                errors.append({"file": rel_path, "error": str(e)})
-                if parser.detect_language(full_path) == "cpp":
-                    cpp_errors.add(str(rel_path))
-            except Exception as e:
-                logger.warning("Error parsing %s: %s", rel_path, e)
-                errors.append({"file": rel_path, "error": str(e)})
-                if parser.detect_language(full_path) == "cpp":
-                    cpp_errors.add(str(rel_path))
-            if parsed is not None:
-                # Deliberately outside the handlers above. A file this loop
-                # could not *parse* is reported and keeps no rows; a file it
-                # could not *write* is a different thing entirely — the usual
-                # cause is another process holding the SQLite write lock — and
-                # filing that as a parse error let the build carry on, write
-                # the VCS anchor and exit 0 while those files were missing
-                # from the graph for good. The build stops instead, so no
-                # anchor is written and the next run rebuilds.
-                pending.append((str(full_path), *parsed))
-                if len(pending) >= STORE_BATCH_FILES:
-                    flush()
-                total_nodes += len(parsed[0])
-                total_edges += len(parsed[1])
-            if i % 50 == 0 or i == file_count:
-                logger.info("Progress: %d/%d files parsed", i, file_count)
-    else:
-        # Parallel parsing — store calls remain serial (SQLite single-writer).
-        # Executor kind auto-selected: process for normal CLI/automation;
-        # thread for MCP stdio to avoid pipe-handle inheritance deadlocks and
-        # orphan workers (issues #46, #136, PR #615). Override via
-        # CRG_PARSE_EXECUTOR env.
-        _prewarm_parser_probes(parser, files)
-        args_list = [(rel_path, str(repo_root)) for rel_path in files]
-        with _make_executor(_MAX_PARSE_WORKERS) as executor:
-            for i, (rel_path, nodes, edges, error, fhash) in enumerate(
-                executor.map(_parse_single_file, args_list, chunksize=4),
-                1,
-            ):
-                if error:
-                    logger.warning("Error parsing %s: %s", rel_path, error)
-                    errors.append({"file": rel_path, "error": error})
-                    if parser.detect_language(repo_root / rel_path) == "cpp":
-                        cpp_errors.add(str(rel_path))
-                    continue
-                full_path = repo_root / rel_path
-                _relink_edges(edges, repo_root, followed_dirs)
-                pending.append((str(full_path), nodes, edges, fhash))
-                if len(pending) >= STORE_BATCH_FILES:
-                    flush()
-                total_nodes += len(nodes)
-                total_edges += len(edges)
-                if i % 200 == 0 or i == file_count:
-                    logger.info("Progress: %d/%d files parsed", i, file_count)
+    # With the native engine on, a build into an empty graph writes its edges
+    # with the edge indexes dropped and rebuilds them once at the end.
+    from .parser import fast_engine_enabled
 
-    flush()
+    with store.bulk_edge_load() if fast_engine_enabled() else nullcontext():
+        if use_serial or file_count < 8:
+            # Serial fallback (for debugging or tiny repos)
+            for i, rel_path in enumerate(files, 1):
+                full_path = repo_root / rel_path
+                parsed: tuple[list, list, str] | None = None
+                try:
+                    source = full_path.read_bytes()
+                    fhash = hashlib.sha256(source).hexdigest()
+                    nodes, edges = parser.parse_bytes(full_path, source)
+                    _relink_edges(edges, repo_root, followed_dirs)
+                    parsed = (nodes, edges, fhash)
+                except (OSError, PermissionError) as e:
+                    errors.append({"file": rel_path, "error": str(e)})
+                    if parser.detect_language(full_path) == "cpp":
+                        cpp_errors.add(str(rel_path))
+                except Exception as e:
+                    logger.warning("Error parsing %s: %s", rel_path, e)
+                    errors.append({"file": rel_path, "error": str(e)})
+                    if parser.detect_language(full_path) == "cpp":
+                        cpp_errors.add(str(rel_path))
+                if parsed is not None:
+                    # Deliberately outside the handlers above. A file this loop
+                    # could not *parse* is reported and keeps no rows; a file it
+                    # could not *write* is a different thing entirely — the usual
+                    # cause is another process holding the SQLite write lock — and
+                    # filing that as a parse error let the build carry on, write
+                    # the VCS anchor and exit 0 while those files were missing
+                    # from the graph for good. The build stops instead, so no
+                    # anchor is written and the next run rebuilds.
+                    pending.append((str(full_path), *parsed))
+                    if len(pending) >= STORE_BATCH_FILES:
+                        flush()
+                    total_nodes += len(parsed[0])
+                    total_edges += len(parsed[1])
+                if i % 50 == 0 or i == file_count:
+                    logger.info("Progress: %d/%d files parsed", i, file_count)
+        else:
+            # Parallel parsing — store calls remain serial (SQLite single-writer).
+            # Executor kind auto-selected: process for normal CLI/automation;
+            # thread for MCP stdio to avoid pipe-handle inheritance deadlocks and
+            # orphan workers (issues #46, #136, PR #615). Override via
+            # CRG_PARSE_EXECUTOR env.
+            _prewarm_parser_probes(parser, files)
+            args_list = [(rel_path, str(repo_root)) for rel_path in files]
+            with _make_executor(_MAX_PARSE_WORKERS) as executor:
+                for i, (rel_path, nodes, edges, error, fhash) in enumerate(
+                    executor.map(_parse_single_file, args_list, chunksize=4),
+                    1,
+                ):
+                    if error:
+                        logger.warning("Error parsing %s: %s", rel_path, error)
+                        errors.append({"file": rel_path, "error": error})
+                        if parser.detect_language(repo_root / rel_path) == "cpp":
+                            cpp_errors.add(str(rel_path))
+                        continue
+                    full_path = repo_root / rel_path
+                    _relink_edges(edges, repo_root, followed_dirs)
+                    pending.append((str(full_path), nodes, edges, fhash))
+                    if len(pending) >= STORE_BATCH_FILES:
+                        flush()
+                    total_nodes += len(nodes)
+                    total_edges += len(edges)
+                    if i % 200 == 0 or i == file_count:
+                        logger.info("Progress: %d/%d files parsed", i, file_count)
+
+        flush()
     store.set_metadata("last_updated", time.strftime("%Y-%m-%dT%H:%M:%S"))
     store.set_metadata("last_build_type", "full")
     if store.get_metadata(MOVED_FROM_KEY):
