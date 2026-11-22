@@ -1115,7 +1115,10 @@ class GraphStore:
                     )
                     self._conn.commit()
                 run_migrations(self._conn)
-                self._restore_edge_indexes()
+                from .parser import fast_engine_enabled
+
+                if fast_engine_enabled():
+                    self._restore_edge_indexes()
         except (sqlite3.Error, OSError, GraphStoreError) as exc:
             # A corrupt file, a foreign SQLite file, or a data directory this
             # process cannot write to used to escape as a raw traceback from

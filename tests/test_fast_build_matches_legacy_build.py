@@ -204,6 +204,7 @@ def test_build_stopped_during_the_bulk_load_gets_its_indexes_back(repo, monkeypa
     subprocess.run([sys.executable, "-c", script, str(db)], check=True)
     assert _edge_indexes(db) == []
 
+    monkeypatch.setenv("CRG_FAST_ENGINE", "1")
     GraphStore(db).close()
     assert _edge_indexes(db) == expected
 
