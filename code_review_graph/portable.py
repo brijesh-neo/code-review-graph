@@ -10,8 +10,9 @@ Both are rewritten, then only the files whose bytes differ from what the
 graph recorded are parsed again.
 
 ``export_absolute``: a copy of the graph in the absolute-path layout, marked
-schema v15, which releases before v16 open. v16 added no tables or columns,
-so the paths are the only difference.
+schema v15, which releases before v16 open. v16 and v17 added no tables or
+columns, so the paths (and, since v17, the paths inside ``extra``) are the
+only difference.
 """
 from __future__ import annotations
 
@@ -23,6 +24,7 @@ from pathlib import Path
 from typing import Optional
 
 from .relpaths import (
+    EXTRA_MODE_KEY,
     MOVED_FROM_KEY,
     PATH_MODE_KEY,
     PATH_MODE_RELATIVE,
@@ -214,11 +216,14 @@ def export_absolute(repo_root: Path, out: Path) -> dict:
     try:
         mode = _meta(conn, PATH_MODE_KEY)
         root = _meta(conn, ROOT_SPELLING_KEY) or absolute_root(str(repo_root))
+        # Since v17 the paths inside ``extra`` JSON are relative too.
+        extra = ("extra",) if _meta(conn, EXTRA_MODE_KEY) == PATH_MODE_RELATIVE else ()
         rows = 0
         with conn:
             if mode == PATH_MODE_RELATIVE:
                 codec = PathCodec(root)
-                for table, columns in _PATH_COLUMNS.items():
+                for table, path_columns in _PATH_COLUMNS.items():
+                    columns = path_columns + extra
                     select = ", ".join(columns)
                     data = conn.execute(
                         f"SELECT id, {select} FROM {table}"  # nosec B608
@@ -249,8 +254,8 @@ def export_absolute(repo_root: Path, out: Path) -> dict:
                 (str(ABSOLUTE_SCHEMA_VERSION),),
             )
             conn.execute(
-                "DELETE FROM metadata WHERE key IN (?, ?, ?)",
-                (PATH_MODE_KEY, ROOT_SPELLING_KEY, MOVED_FROM_KEY),
+                "DELETE FROM metadata WHERE key IN (?, ?, ?, ?)",
+                (PATH_MODE_KEY, ROOT_SPELLING_KEY, MOVED_FROM_KEY, EXTRA_MODE_KEY),
             )
         conn.execute("VACUUM")
     finally:

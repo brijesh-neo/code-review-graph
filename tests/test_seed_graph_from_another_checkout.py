@@ -7,6 +7,7 @@ same edges, and no hint left pointing at the source checkout.
 
 from __future__ import annotations
 
+import json
 import os
 import sqlite3
 import subprocess
@@ -162,6 +163,34 @@ def test_absolute_export_is_schema_15_with_absolute_paths(tmp_path: Path) -> Non
     assert _snapshot(repo) == before
     with pytest.raises(PortableGraphError, match="exists"):
         export_absolute(repo, out)
+
+
+def test_absolute_export_restores_paths_inside_extra(tmp_path: Path) -> None:
+    repo, _ = _two_worktrees(tmp_path)
+    conn = sqlite3.connect(str(get_db_path(repo)))
+    try:
+        with conn:
+            # Since v17 a build stores the paths inside extra JSON relative too.
+            conn.execute(
+                "UPDATE edges SET extra = ? WHERE id = (SELECT MIN(id) FROM edges)",
+                ('{"receiver_module": "./pkg/mod.py"}',),
+            )
+    finally:
+        conn.close()
+    out = tmp_path / "old.db"
+    export_absolute(repo, out)
+
+    conn = sqlite3.connect(str(out))
+    try:
+        meta = dict(conn.execute("SELECT key, value FROM metadata"))
+        extras = [
+            r[0]
+            for r in conn.execute("SELECT extra FROM edges WHERE extra LIKE '%receiver_module%'")
+        ]
+    finally:
+        conn.close()
+    assert "relpath_extra" not in meta
+    assert extras == [json.dumps({"receiver_module": f"{repo}/pkg/mod.py"})]
 
 
 def test_current_release_reads_an_absolute_export_back(tmp_path: Path) -> None:
