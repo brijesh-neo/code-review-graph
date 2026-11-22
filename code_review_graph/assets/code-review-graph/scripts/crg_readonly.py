@@ -111,6 +111,8 @@ def _build_parser() -> argparse.ArgumentParser:
     query.add_argument("pattern", choices=QUERY_PATTERNS)
     query.add_argument("target")
     query.add_argument("--to", default=None, help="For path_to: the node or file to reach")
+    query.add_argument("--max-results", type=int, default=None)
+    query.add_argument("--json", action="store_true", help="Print JSON instead of TOON")
     _add_common(query)
     impact = sub.add_parser("impact", help="Analyze change blast radius")
     impact.add_argument("--files", nargs="+", default=None)
@@ -188,6 +190,10 @@ def _command_args(args: argparse.Namespace, root: Path) -> list[str]:
         result.extend((args.pattern, args.target))
         if args.to:
             result.extend(("--to", args.to))
+        if args.max_results:
+            result.extend(("--max-results", str(args.max_results)))
+        if args.json:
+            result.append("--json")
     elif command == "impact":
         if args.files:
             result.extend(("--files", *args.files))

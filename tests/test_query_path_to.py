@@ -752,7 +752,7 @@ class TestEndToEnd:
             "sys.argv",
             [
                 "code-review-graph", "query", "path_to", "start", "--to", "finish",
-                "--repo", str(root),
+                "--repo", str(root), "--json",
             ],
         )
 

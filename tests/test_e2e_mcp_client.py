@@ -23,7 +23,6 @@ Portability notes (these run on Linux, macOS and Windows in CI):
 from __future__ import annotations
 
 import asyncio
-import json
 import os
 import shutil
 import subprocess
@@ -32,6 +31,8 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+
+from code_review_graph.toon import decode, restore_repeated_fields
 
 try:
     from mcp import ClientSession
@@ -209,8 +210,8 @@ def _payload(result: Any) -> dict[str, Any]:
     assert not wire(result, "isError"), f"tool call failed: {_text_blocks(result)}"
     blocks = _text_blocks(result)
     assert blocks, f"tool returned no text content: {result!r}"
-    payload = json.loads(blocks[0])
-    assert isinstance(payload, dict), f"expected a JSON object, got {type(payload)!r}"
+    payload = restore_repeated_fields(decode(blocks[0]))
+    assert isinstance(payload, dict), f"expected an object, got {type(payload)!r}"
     return payload
 
 

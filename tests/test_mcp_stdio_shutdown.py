@@ -12,6 +12,8 @@ from pathlib import Path
 
 import pytest
 
+from code_review_graph.toon import decode
+
 
 def _send(proc: subprocess.Popen[str], message: dict) -> None:
     assert proc.stdin is not None
@@ -123,7 +125,7 @@ def test_stdio_server_parallel_build_then_eof_exits_cleanly(tmp_path):
         )
         build_response = _read_response(proc, 2)
         assert "error" not in build_response
-        build_payload = json.loads(build_response["result"]["content"][0]["text"])
+        build_payload = decode(build_response["result"]["content"][0]["text"])
         assert build_payload["status"] == "ok"
         assert build_payload["build_type"] == "full"
         assert build_payload["files_parsed"] == 10

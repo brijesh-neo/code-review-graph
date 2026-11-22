@@ -190,7 +190,7 @@ def test_default_base_in_a_shallow_clone_says_it_is_shallow(
 def test_cli_one_commit_repo_prints_a_plain_note(one_commit: Path) -> None:
     assert _cli(one_commit, "build", "-q").returncode == 0
 
-    result = _cli(one_commit, "detect-changes")
+    result = _cli(one_commit, "detect-changes", "--json")
 
     assert result.returncode == 0, result
     assert (

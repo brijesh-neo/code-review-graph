@@ -80,8 +80,13 @@ class TestMigrations:
         assert rows["src/app.py::Handler.process"] == "Handler.process"
         assert rows["loose"] == "loose"
 
+        # The upgrade also writes sqlite_stat1, and with true statistics for
+        # two rows SQLite rightly scans them. INDEXED BY raises unless the
+        # index can serve the lookup, which is what is under test.
         plan = conn.execute(
-            "EXPLAIN QUERY PLAN SELECT * FROM nodes WHERE symbol = ?", ("x",)
+            "EXPLAIN QUERY PLAN SELECT * FROM nodes INDEXED BY idx_nodes_symbol "
+            "WHERE symbol = ?",
+            ("x",),
         ).fetchall()
         assert any("idx_nodes_symbol" in str(step[-1]) for step in plan)
 

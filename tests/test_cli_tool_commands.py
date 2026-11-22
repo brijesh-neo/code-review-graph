@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 import sys
 from unittest.mock import patch
 
@@ -12,6 +11,7 @@ import code_review_graph.tools  # noqa: F401 - exposes lazy patch targets
 from code_review_graph import cli
 from code_review_graph.graph import GraphStore
 from code_review_graph.parser import NodeInfo
+from code_review_graph.toon import decode
 
 _LEGACY_GRAPH_COMMANDS = [
     ["query", "file_summary", "app.py"],
@@ -27,7 +27,12 @@ _LEGACY_GRAPH_COMMANDS = [
         (
             ["query", "callers_of", "target"],
             "query_graph",
-            {"pattern": "callers_of", "target": "target"},
+            {"pattern": "callers_of", "target": "target", "max_results": 100},
+        ),
+        (
+            ["query", "tests_for", "target", "--max-results", "500"],
+            "query_graph",
+            {"pattern": "tests_for", "target": "target", "max_results": 500},
         ),
         (
             ["impact", "--files", "a.py", "b.py", "--depth", "3", "--max-results", "20"],
@@ -96,9 +101,69 @@ _LEGACY_GRAPH_COMMANDS = [
                 "file_pattern": "src/",
             },
         ),
+        (
+            ["context", "review auth", "--files", "a.py", "--base", "main"],
+            "get_minimal_context",
+            {"task": "review auth", "changed_files": ["a.py"], "base": "main"},
+        ),
+        (
+            ["review-context", "--no-source", "--max-lines", "9", "--detail-level", "minimal"],
+            "get_review_context",
+            {
+                "changed_files": None,
+                "max_depth": 2,
+                "include_source": False,
+                "max_lines_per_file": 9,
+                "base": "HEAD~1",
+                "detail_level": "minimal",
+                "max_results": 50,
+                "max_files": 25,
+            },
+        ),
+        (
+            ["affected-flows", "--files", "a.py", "--limit", "3"],
+            "get_affected_flows_func",
+            {
+                "changed_files": ["a.py"],
+                "base": "HEAD~1",
+                "detail_level": "standard",
+                "max_flows": 3,
+            },
+        ),
+        (
+            ["traverse", "login", "--mode", "dfs", "--depth", "2", "--token-budget", "500"],
+            "traverse_graph_func",
+            {"query": "login", "mode": "dfs", "depth": 2, "token_budget": 500},
+        ),
+        (
+            ["hubs", "--limit", "4"],
+            "get_hub_nodes_func",
+            {"top_n": 4, "detail_level": "standard"},
+        ),
+        (
+            ["bridges", "--detail-level", "minimal"],
+            "get_bridge_nodes_func",
+            {"top_n": 10, "detail_level": "minimal"},
+        ),
+        (
+            ["gaps", "--limit", "5"],
+            "get_knowledge_gaps_func",
+            {"max_per_category": 5, "detail_level": "standard"},
+        ),
+        (
+            ["surprises"],
+            "get_surprising_connections_func",
+            {"top_n": 15, "detail_level": "standard"},
+        ),
+        (["questions"], "get_suggested_questions_func", {}),
+        (
+            ["wiki-page", "parser", "--max-chars", "100"],
+            "get_wiki_page_func",
+            {"community_name": "parser", "max_chars": 100},
+        ),
     ],
 )
-def test_tool_command_forwards_typed_arguments_as_json(
+def test_tool_command_forwards_typed_arguments(
     arguments, tool_name, expected, tmp_path, monkeypatch, capsys,
 ):
     repo = tmp_path / "repo"
@@ -116,7 +181,7 @@ def test_tool_command_forwards_typed_arguments_as_json(
         with patch(f"code_review_graph.tools.{tool_name}", return_value=result) as tool:
             cli.main()
 
-    assert json.loads(capsys.readouterr().out) == result
+    assert decode(capsys.readouterr().out) == result
     tool.assert_called_once_with(repo_root=str(repo), **expected)
 
 
@@ -176,7 +241,7 @@ def test_tool_commands_migrate_and_read_legacy_graph(
 
     cli.main()
 
-    result = json.loads(capsys.readouterr().out)
+    result = decode(capsys.readouterr().out)
     assert result["status"] == "ok", result
     assert not legacy_db.exists()
     with GraphStore(repo / ".code-review-graph" / "graph.db") as store:

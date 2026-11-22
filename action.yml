@@ -60,16 +60,16 @@ runs:
       shell: bash
       run: python -m pip install --quiet code-review-graph
 
-    # Cache the SQLite knowledge graph between runs. The "schema16" segment
+    # Cache the SQLite knowledge graph between runs. The "schema17" segment
     # tracks LATEST_VERSION in code_review_graph/migrations.py — bump it when
     # the database schema changes so stale caches are not restored.
     - name: Cache knowledge graph
       uses: actions/cache@v6
       with:
         path: .code-review-graph
-        key: code-review-graph-schema16-${{ runner.os }}-${{ hashFiles('**/uv.lock', '**/poetry.lock', '**/requirements*.txt', '**/Pipfile.lock', '**/package-lock.json', '**/pnpm-lock.yaml', '**/yarn.lock', '**/go.sum', '**/Cargo.lock', '**/Gemfile.lock', '**/composer.lock') }}
+        key: code-review-graph-schema17-${{ runner.os }}-${{ hashFiles('**/uv.lock', '**/poetry.lock', '**/requirements*.txt', '**/Pipfile.lock', '**/package-lock.json', '**/pnpm-lock.yaml', '**/yarn.lock', '**/go.sum', '**/Cargo.lock', '**/Gemfile.lock', '**/composer.lock') }}
         restore-keys: |
-          code-review-graph-schema16-${{ runner.os }}-
+          code-review-graph-schema17-${{ runner.os }}-
 
     - name: Resolve diff base
       shell: bash
@@ -116,7 +116,7 @@ runs:
         if [ -n "${REPORT_DETAILS}" ]; then
           details=(--details "${REPORT_DETAILS}")
         fi
-        code-review-graph detect-changes --base "${CRG_BASE}" \
+        code-review-graph detect-changes --base "${CRG_BASE}" --json \
           ${details[@]+"${details[@]}"} > "${RUNNER_TEMP}/crg-report.json"
 
     # Renders on exit 0 (an analysis, or a genuinely unchanged tree) and on

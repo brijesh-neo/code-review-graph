@@ -21,7 +21,7 @@ import time
 import unicodedata
 import uuid
 from collections import deque
-from functools import partial
+from functools import partial, wraps
 from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING, Any, Callable, Iterable, NamedTuple, Optional
 
@@ -39,7 +39,7 @@ from .csharp_resolver import restore_csharp_references
 from .errors import ChangeDiscoveryError, GraphRootMismatchError, GraphStoreError
 from .graph import GraphStore
 from .locking import WriteLock, write_lock_path
-from .relpaths import MOVED_FROM_KEY
+from .relpaths import EXTRA_MODE_KEY, MOVED_FROM_KEY, PATH_MODE_RELATIVE
 
 if TYPE_CHECKING:
     from .parser import CodeParser
@@ -62,6 +62,7 @@ def __getattr__(name: str):
         return CodeParser
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
+STORE_BATCH_FILES = 50
 _MAX_PARSE_WORKERS = env_int("CRG_PARSE_WORKERS", min(os.cpu_count() or 4, 8))
 
 # Set only while the in-process FastMCP server is using stdio transport.
@@ -2986,6 +2987,17 @@ def _canonical_repo_root(repo_root: Path) -> Path:
     return Path(repo_root).expanduser().resolve()
 
 
+def _with_build_cache(build: Callable[..., dict]) -> Callable[..., dict]:
+    """Run *build* with the store's larger build-time page cache."""
+    @wraps(build)
+    def run(*args: Any, **kwargs: Any) -> dict:
+        store = kwargs["store"] if "store" in kwargs else args[1]
+        with store.build_cache():
+            return build(*args, **kwargs)
+    return run
+
+
+@_with_build_cache
 def full_build(
     repo_root: Path,
     store: GraphStore,
@@ -3029,6 +3041,15 @@ def full_build(
     file_count = len(files)
 
     use_serial = os.environ.get("CRG_SERIAL_PARSE", "") == "1"
+    # Parsed files are written STORE_BATCH_FILES at a time in one transaction:
+    # a commit per file was a quarter of the build's write time. A write that
+    # fails still stops the build before the VCS anchor is written.
+    pending: list[tuple[str, list, list, str]] = []
+
+    def flush() -> None:
+        if pending:
+            store.store_file_batch(pending)
+            pending.clear()
 
     if use_serial or file_count < 8:
         # Serial fallback (for debugging or tiny repos)
@@ -3059,7 +3080,9 @@ def full_build(
                 # the VCS anchor and exit 0 while those files were missing
                 # from the graph for good. The build stops instead, so no
                 # anchor is written and the next run rebuilds.
-                store.store_file_nodes_edges(str(full_path), *parsed)
+                pending.append((str(full_path), *parsed))
+                if len(pending) >= STORE_BATCH_FILES:
+                    flush()
                 total_nodes += len(parsed[0])
                 total_edges += len(parsed[1])
             if i % 50 == 0 or i == file_count:
@@ -3074,7 +3097,7 @@ def full_build(
         args_list = [(rel_path, str(repo_root)) for rel_path in files]
         with _make_executor(_MAX_PARSE_WORKERS) as executor:
             for i, (rel_path, nodes, edges, error, fhash) in enumerate(
-                executor.map(_parse_single_file, args_list, chunksize=20),
+                executor.map(_parse_single_file, args_list, chunksize=4),
                 1,
             ):
                 if error:
@@ -3085,21 +3108,22 @@ def full_build(
                     continue
                 full_path = repo_root / rel_path
                 _relink_edges(edges, repo_root, followed_dirs)
-                store.store_file_nodes_edges(
-                    str(full_path),
-                    nodes,
-                    edges,
-                    fhash,
-                )
+                pending.append((str(full_path), nodes, edges, fhash))
+                if len(pending) >= STORE_BATCH_FILES:
+                    flush()
                 total_nodes += len(nodes)
                 total_edges += len(edges)
                 if i % 200 == 0 or i == file_count:
                     logger.info("Progress: %d/%d files parsed", i, file_count)
 
+    flush()
     store.set_metadata("last_updated", time.strftime("%Y-%m-%dT%H:%M:%S"))
     store.set_metadata("last_build_type", "full")
     if store.get_metadata(MOVED_FROM_KEY):
         store.set_metadata(MOVED_FROM_KEY, "")
+    if store.path_root is not None:
+        # Every row was just written through the codec, ``extra`` included.
+        store.set_metadata(EXTRA_MODE_KEY, PATH_MODE_RELATIVE)
     store.set_metadata("intentionally_incomplete", "0")
     store.set_metadata(
         VERIFIED_FILE_COUNT_KEY, "0" if errors else str(len(store.get_all_files()))
@@ -3137,6 +3161,9 @@ def full_build(
     # anchor still describes the commit the stored files were parsed at.
     _store_vcs_metadata(repo_root, store)
     store.commit()
+    # A full build rewrites most rows; an incremental update does not move the
+    # table sizes enough to need this.
+    store.refresh_planner_stats()
 
     return {
         "files_parsed": len(files),
@@ -3174,6 +3201,7 @@ def _relative_update_input(repo_root: Path, path: str) -> str:
         return path
 
 
+@_with_build_cache
 def incremental_update(
     repo_root: Path,
     store: GraphStore,

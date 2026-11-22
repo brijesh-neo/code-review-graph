@@ -1084,18 +1084,21 @@ def query_graph(
         total_results = 0
         # Results matched by a name or an unpinned call, not a traced edge.
         inferred_results = 0
+        inferred_shown = 0
         # (dedupe key, row, edge) for the call-site patterns, collected before
         # emission so repeats can be interleaved behind first sightings.
         call_sites: list[tuple[str, dict[str, Any], GraphEdge]] = []
 
         def add_result(result: dict[str, Any], edge: Any | None = None) -> None:
             """Count every logical result but retain only the bounded prefix."""
-            nonlocal total_results, inferred_results
+            nonlocal total_results, inferred_results, inferred_shown
             total_results += 1
             if result.get("inferred_by"):
                 inferred_results += 1
             if len(results) >= response_limit:
                 return
+            if result.get("inferred_by"):
+                inferred_shown += 1
             results.append(result)
             if edge is not None:
                 edges_out.append(edge_to_dict(edge))
@@ -1735,7 +1738,14 @@ def query_graph(
         if pattern == "tests_for" and inferred_results:
             # Say it where it is read first: a guessed test link is not a
             # traced one, and an agent should not report it as coverage.
-            summary += f"; {inferred_results} of them guesses (see inferred_by)"
+            # Count only the rows shown, so ``inferred_by`` is there to see.
+            if inferred_shown:
+                summary += f"; {inferred_shown} of them guesses (see inferred_by)"
+            if inferred_results > inferred_shown:
+                summary += (
+                    f"; {inferred_results - inferred_shown} more guesses among the "
+                    "omitted results (raise max_results to see them)"
+                )
 
         # A zero here is the dangerous direction: agents read it as "none
         # exist" and either conclude wrongly or fall back to grepping the

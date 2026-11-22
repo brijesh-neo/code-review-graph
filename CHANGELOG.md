@@ -14,6 +14,30 @@
 - VS Code extension: a CodeLens above each function and class with its callers, how many of them have no test, and its tests and flows. Clicking it lists the callers. On by default; `codeReviewGraph.codeLens.enabled` turns it off.
 - `code-review-graph seed SOURCE`: starts this checkout's graph from another worktree's, fork's or clone's graph (or a `graph.db` file, such as one a CI run built), then parses only the files whose contents differ. The result equals a full build. On a 182-file repository: 0.74 s against 3.01 s for `build`. Refuses to replace an existing graph without `--force`.
 - `code-review-graph export-absolute OUT`: writes a copy of the graph with absolute paths, marked schema v15, which releases before schema v16 open without a rebuild (checked with 2.4.0). The graph itself is not changed.
+- Graph answers come as TOON instead of JSON, from the CLI and from every
+  MCP tool. TOON keeps JSON's data but writes a list of records as a table:
+  the field names once, then one comma-separated row per record. A nested
+  record of plain values becomes dotted columns (`call_site.line`), and a
+  field a row lacks is `null`. MCP tools no longer send a structured copy or
+  an output schema. On the CLI, `--json` prints the full JSON as before.
+  `detect-changes` prints TOON too; the GitHub Action passes `--json`.
+- TOON answers leave out only the fields the rest give back exactly, and
+  `toon.restore_repeated_fields` puts them back, so nothing is lost: an edge
+  that repeats its result row is folded into the row as its id (plus its tier
+  and confidence when it is not a plain extracted one), with the edge kind
+  and the other end written once under `edges_in_rows`; `is_test` is written
+  into `kind` (`Function (test)`); `qualified_name` is left out where it is
+  `file_path::name` or `file_path::Parent.name`; and `language` is left out
+  of a list only when every node's file extension gives it. Ids stay. A test
+  turns TOON back into JSON for every query pattern and requires it to match
+  field for field. On three sample query answers (callers, callees and tests
+  of one function, 100 rows each) this took TOON from 98,351 to 39,906 bytes
+  (compact JSON: 223,924).
+- `refactor rename --apply` previews and writes the rename in one run.
+- CLI mirrors for the rest of the read-only MCP tools: `context`,
+  `review-context`, `affected-flows`, `traverse`, `hubs`, `bridges`, `gaps`,
+  `surprises`, `questions`, `cross-search`, `wiki-page` and `docs`. `query`
+  takes `--max-results`.
 - The graph stores paths relative to the repository (schema v16), so a
   `graph.db` copied into a linked worktree, fork or clone answers with that
   checkout's paths. Its first `update` there runs a full build, because some
@@ -60,6 +84,9 @@
 
 - The `visualize` page draws when opened from disk in Chrome. Chrome blocks a `file://` script that carries an `integrity` attribute, and the `d3js.org` fallback no longer matches the pinned hash, so the page stayed on "Laying out graph...". The page now carries the bundled D3 inline, after checking it against the pinned hash; without a match it loads D3 by `src` as before.
 - When the Claude Code edit hook fails to update the graph, it now also prints PostToolUse `additionalContext` telling the agent the graph was not updated and why. The installed hook ignores the exit code and the agent never saw stderr, so it went on answering from a stale graph. Other events and the Codex hook print nothing new.
+- A `tests_for` summary counted the guessed matches among every result, so
+  it could name guesses that were not among the rows shown. It now counts
+  the shown rows, and says how many more are among the omitted results.
 - The MCP entry and every hook `install` writes now run the copy of
   code-review-graph that ran `install`. The MCP entry used `uvx` whenever it
   was on PATH, and hooks ran the first copy on PATH, so an older copy could
