@@ -631,6 +631,7 @@ def trace_flows(
     store: GraphStore,
     max_depth: int = 15,
     include_tests: bool = False,
+    adjacency: FlowAdjacency | None = None,
 ) -> list[dict]:
     """Trace execution flows from every entry point via forward BFS.
 
@@ -644,12 +645,15 @@ def trace_flows(
       - file_count: number of distinct files touched
       - files: list of distinct file paths
       - criticality: computed criticality score (0.0-1.0)
+
+    *adjacency* is a :meth:`GraphStore.load_flow_adjacency` result the caller
+    already holds, which saves loading it again.
     """
     entry_points = detect_entry_points(store, include_tests=include_tests)
     if not entry_points:
         return []
 
-    adj = store.load_flow_adjacency()
+    adj = adjacency if adjacency is not None else store.load_flow_adjacency()
     flows: list[dict] = []
 
     for ep in entry_points:

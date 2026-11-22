@@ -6,7 +6,7 @@ import logging
 import sqlite3
 import time
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from ..build_state import (
     BUILD_COMPLETE,
@@ -32,6 +32,9 @@ from ..incremental import (
 )
 from ..locking import WriteLock, write_lock_path
 from ._common import _get_store, _resolve_root
+
+if TYPE_CHECKING:
+    from ..graph import FlowAdjacency
 
 logger = logging.getLogger(__name__)
 
@@ -399,6 +402,7 @@ def _run_postprocess(
         )
     )
 
+    shared_adjacency: FlowAdjacency | None = None
     stage_started = time.perf_counter()
     try:
         if noop_incremental:
@@ -415,8 +419,13 @@ def _run_postprocess(
         else:
             from code_review_graph.flows import store_flows as _store_flows
             from code_review_graph.flows import trace_flows as _trace_flows
+            from code_review_graph.parser import fast_engine_enabled
 
-            flows = _trace_flows(store)
+            if fast_engine_enabled():
+                # Community detection reads the same node rows, in the
+                # same order, so the adjacency is loaded once for both.
+                shared_adjacency = store.load_flow_adjacency()
+            flows = _trace_flows(store, adjacency=shared_adjacency)
             count = _store_flows(store, flows)
         build_result["flows_detected"] = count
     except (sqlite3.OperationalError, ImportError) as e:
@@ -451,7 +460,13 @@ def _run_postprocess(
                 store_communities as _store_communities,
             )
 
-            comms = _detect_communities(store)
+            comms = _detect_communities(
+                store,
+                nodes=None if shared_adjacency is None else [
+                    node for node in shared_adjacency.nodes_by_id.values()
+                    if node.kind != "File"
+                ],
+            )
             count = _store_communities(store, comms)
         build_result["communities_detected"] = count
     except (sqlite3.OperationalError, ImportError) as e:
@@ -800,6 +815,11 @@ def build_or_update_graph(
                 POSTPROCESS_PENDING if rows_changed else (previous_state or ""),
             )
         build_result["repaired_interrupted_build"] = interrupted
+        if full_rebuild:
+            from code_review_graph.parser import fast_engine_enabled
+
+            if fast_engine_enabled():
+                store.truncate_wal()
         return build_result
     finally:
         try:

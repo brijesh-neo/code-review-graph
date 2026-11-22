@@ -1269,6 +1269,31 @@ class GraphStore:
             pass
         release_os_memory()
 
+    def truncate_wal(self) -> bool:
+        """Checkpoint the whole WAL into the database and truncate it, without waiting.
+
+        A full build writes the graph's every page through the WAL. A store
+        left open (watch mode, the MCP server) would otherwise keep that file
+        at its peak size. A reader holding an older snapshot makes SQLite
+        report busy; the checkpoint is then left for later rather than waited
+        for. Returns whether it completed.
+        """
+        if self._conn.in_transaction:
+            self._conn.commit()
+        previous = int(self._conn.execute("PRAGMA busy_timeout").fetchone()[0])
+        self._conn.execute("PRAGMA busy_timeout=0")
+        try:
+            row = self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+        except sqlite3.OperationalError as exc:
+            logger.debug("WAL checkpoint skipped: %s", exc)
+            return False
+        finally:
+            self._conn.execute(f"PRAGMA busy_timeout={previous}")
+        if row is None or row[0]:
+            logger.debug("WAL checkpoint skipped: a reader holds the WAL")
+            return False
+        return True
+
     def close(self) -> None:
         # No gc.collect() here: every MCP tool call opens and closes a store,
         # and a full collection costs ~10 ms or more per call. Builds release
