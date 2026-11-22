@@ -150,7 +150,15 @@ def _make_executor(max_workers: int):
     """Construct the parallel-parse executor selected by [_select_executor_kind]."""
     if _select_executor_kind() == "thread":
         return concurrent.futures.ThreadPoolExecutor(max_workers=max_workers)
-    return concurrent.futures.ProcessPoolExecutor(max_workers=max_workers)
+    # The parent probed the grammars this run needs (``_prewarm_parser_probes``);
+    # a spawned worker would probe each of them again in a subprocess.
+    from .parser import parser_probe_results, seed_parser_probe_results
+
+    return concurrent.futures.ProcessPoolExecutor(
+        max_workers=max_workers,
+        initializer=seed_parser_probe_results,
+        initargs=(parser_probe_results(),),
+    )
 
 logger = logging.getLogger(__name__)
 
@@ -2826,6 +2834,9 @@ def assert_graph_serves_root(repo_root: Path, store: GraphStore) -> None:
 
 _MAX_DEPENDENT_HOPS = env_int("CRG_DEPENDENT_HOPS", 2)
 _MAX_DEPENDENT_FILES = 500
+# Dependents whose edges are re-saved per transaction. Each commit holds the
+# write lock only for its own batch, so other writers still get turns.
+_EDGE_WRITE_BATCH = 64
 
 
 def _single_hop_dependents(store: GraphStore, file_path: str) -> set[str]:
@@ -3447,7 +3458,9 @@ def incremental_update(
     to_parse: list[str] = []
     # Importers re-parsed with unchanged bytes, and the hash that was checked.
     edges_only: dict[str, str] = {}
-    for rel_path in all_files:
+    # Sorted, so the rows (and the community ids read from them) come out the
+    # same on every run: set order follows per-process string hashes.
+    for rel_path in sorted(all_files):
         if _should_ignore(rel_path, ignore_patterns):
             if rel_path in remaining_identity:
                 ignored_path = repo_root / rel_path
@@ -3544,14 +3557,29 @@ def incremental_update(
     # edges, so these are the only files the Jedi step needs to scan again.
     reparsed_paths: list[str] = []
 
+    # Dependents whose bytes did not change only get their edges re-saved,
+    # which is most of an update's writes: save them a batch per transaction.
+    pending_edges: list[tuple[str, list]] = []
+
+    def flush_edges() -> None:
+        store.store_files_edges(pending_edges)
+        pending_edges.clear()
+
     def store_parsed(rel_path: str, nodes: list, edges: list, fhash: str) -> None:
         reparsed_paths.append(str(repo_root / rel_path))
         _relink_edges(edges, repo_root, followed_dirs)
         # Same bytes, same symbols: keep the node ids that flows and communities
         # refer to. Only what the file's edges resolve to can have moved.
         if edges_only.get(rel_path) == fhash:
-            store.store_file_edges(str(repo_root / rel_path), edges)
+            pending_edges.append((str(repo_root / rel_path), edges))
+            if len(pending_edges) >= _EDGE_WRITE_BATCH:
+                flush_edges()
             return
+        # Earlier files' edges go first, so rows keep the order an unbatched
+        # write gives them (community detection reads edges in row order) and
+        # the flow capture below reads them.
+        if pending_edges:
+            flush_edges()
         file_paths = expand_changed_file_paths(store, [rel_path], repo_root=repo_root)
         cleared_entry_qns.update(capture_affected_flow_entry_points(store, file_paths))
         flow_node_ids.update(capture_flow_node_ids(store, file_paths))
@@ -3603,6 +3631,8 @@ def incremental_update(
                 parsed_files += 1
                 total_nodes += len(nodes)
                 total_edges += len(edges)
+
+    flush_edges()
 
     failed_dependents = dependent_files & {error["file"] for error in errors}
     if failed_dependents != dependents_pending:

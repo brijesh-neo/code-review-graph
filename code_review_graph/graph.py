@@ -1892,32 +1892,46 @@ class GraphStore:
         For a file whose bytes did not change. Its symbols are the same, and
         flows and communities point at their node ids, so those ids must stay.
         """
-        normalized = normalize_file_path(file_path)
+        self.store_files_edges([(file_path, edges)])
+
+    def store_files_edges(self, batch: list[tuple[str, list[EdgeInfo]]]) -> None:
+        """:meth:`store_file_edges` for several files in one transaction.
+
+        An update re-saves the edges of every dependent of a changed file;
+        one commit per file was most of the cost of writing them.
+        """
+        if not batch:
+            return
         self._begin_immediate()
         try:
-            # The edges come from a fresh parse and name base identities; align
-            # them with the collision identities this file's rows already hold.
-            stored = self._conn.execute(
-                "SELECT qualified_name, line_start, line_end FROM nodes "
-                "WHERE file_path = ?",
-                (normalized,),
-            ).fetchall()
-            collisions = self._collision_map(
-                (
-                    self._collision_base(row["qualified_name"]),
-                    row["line_start"], row["line_end"], row["qualified_name"],
-                )
-                for row in stored
-            )
-            self._conn.execute("DELETE FROM edges WHERE file_path = ?", (normalized,))
-            self._insert_edges(
-                self._aligned_edges(normalized, edges, collisions), time.time(),
-            )
+            for file_path, edges in batch:
+                self._replace_file_edges(normalize_file_path(file_path), edges)
             self._conn.commit()
         except BaseException:
             self._conn.rollback()
             raise
         self._invalidate_cache()
+
+    def _replace_file_edges(self, normalized: str, edges: list[EdgeInfo]) -> None:
+        """Replace one file's edges. Must be called inside an open transaction."""
+        # The edges come from a fresh parse and name base identities; align
+        # them with the collision identities this file's rows already hold.
+        stored = self._conn.execute(
+            "SELECT qualified_name, line_start, line_end FROM nodes "
+            "WHERE file_path = ?",
+            (normalized,),
+        ).fetchall()
+        collisions = self._collision_map(
+            (
+                self._collision_base(row["qualified_name"]),
+                row["line_start"], row["line_end"], row["qualified_name"],
+            )
+            for row in stored
+        )
+        self._conn.execute("DELETE FROM edges WHERE file_path = ?", (normalized,))
+        self._insert_edges(
+            self._aligned_edges(normalized, edges, collisions), time.time(),
+        )
 
     def relocate_edge_targets(self, old_prefix: str, new_prefix: str) -> int:
         """Rewrite edge targets that start with *old_prefix* to *new_prefix*.
@@ -2019,7 +2033,8 @@ class GraphStore:
             extra_dict = edge.extra if edge.extra else {}
             confidence = float(extra_dict.get("confidence", 1.0))
             confidence_tier = str(extra_dict.get("confidence_tier", "EXTRACTED"))
-            extra = json.dumps(extra_dict)
+            # ``json.dumps({})`` is ``"{}"``; most edges carry no extra.
+            extra = json.dumps(extra_dict) if extra_dict else "{}"
             site = (
                 edge.kind, edge.source, edge.target, edge.file_path, edge.line,
                 extra_dict.get("source_offset"),

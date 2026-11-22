@@ -46,6 +46,8 @@ ESCAPE = "!"
 
 # First characters of a value that is JSON text, translated string by string.
 _JSON_FIRST = frozenset('{["')
+# Entries kept by PathCodec.strip_params before the cache starts over.
+_STRIP_CACHE_LIMIT = 200_000
 # A JSON string opens after one of these (``json.dumps`` output) or at the
 # start of the value; a quote anywhere else is inside a string.
 _JSON_STRING_START = r'(?:^|(?<=[{\[,:\s]))"'
@@ -167,8 +169,14 @@ class PathCodec:
         # Besides JSON text, the first characters a value must start with for strip() to change it:
         # a root spelling's, or "." / "!" (what _looks_relative needs).
         self._leads = frozenset({v[:1] for v in self._roots} | {".", ESCAPE})
+        # Any value strip() can change starts with one of these.
+        self._strip_leads = self._leads | _JSON_FIRST
         self._lock = threading.Lock()
         self._specs: dict[int, tuple[Any, tuple[int, ...]]] = {}
+        # The last cursor description and its spec, read once per row.
+        self._last_spec: tuple[Any, tuple[int, ...]] = (None, ())
+        # Stored form of each recently stripped non-JSON value (see strip_params).
+        self._strip_cache: dict[str, str] = {}
 
     # -- inbound -------------------------------------------------------------
 
@@ -206,11 +214,30 @@ class PathCodec:
         return stripped
 
     def strip_params(self, params: Any) -> Any:
+        strip, leads = self.strip, self._strip_leads
         if isinstance(params, dict):
-            return {k: self.strip(v) if isinstance(v, str) else v for k, v in params.items()}
+            return {
+                k: strip(v) if isinstance(v, str) and v[:1] in leads else v
+                for k, v in params.items()
+            }
         if isinstance(params, (tuple, list)):
-            strip = self.strip
-            return tuple([strip(v) if isinstance(v, str) else v for v in params])
+            # A batch repeats the same paths and names row after row, so each
+            # stored form is worked out once. JSON text is rarely repeated and
+            # is left out of the cache.
+            cache = self._strip_cache
+            if len(cache) > _STRIP_CACHE_LIMIT:
+                cache.clear()
+            out = []
+            for v in params:
+                if isinstance(v, str) and v[:1] in leads:
+                    stored = cache.get(v)
+                    if stored is None:
+                        stored = strip(v)
+                        if v[:1] not in _JSON_FIRST:
+                            cache[v] = stored
+                    v = stored
+                out.append(v)
+            return tuple(out)
         return params
 
     # -- outbound ------------------------------------------------------------
@@ -267,7 +294,11 @@ class PathCodec:
         return result
 
     def row_factory(self, cursor: sqlite3.Cursor, row: tuple) -> sqlite3.Row:
-        spec = self._spec(cursor)
+        last_desc, spec = self._last_spec
+        desc = cursor.description
+        if desc is not last_desc or desc is None:
+            spec = self._spec(cursor)
+            self._last_spec = (desc, spec)
         if spec:
             values = None
             for index in spec:
@@ -275,7 +306,12 @@ class PathCodec:
                 if isinstance(value, str) and value[:1] in _RESTORED_FIRST:
                     if values is None:
                         values = list(row)
-                    values[index] = self.restore(value)
+                    # ``./x`` is by far the commonest stored form; restore() says the same.
+                    values[index] = (
+                        self.root + value[1:]
+                        if value.startswith(REL_PREFIX)
+                        else self.restore(value)
+                    )
             if values is not None:
                 row = tuple(values)
         return sqlite3.Row(cursor, row)
