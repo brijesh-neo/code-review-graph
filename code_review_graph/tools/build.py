@@ -359,12 +359,17 @@ def _run_postprocess(
             build_result["fts_indexed"] = rebuild_fts_index(store)
             build_result["fts_rebuilt"] = True
         else:
+            from code_review_graph.parser import fast_engine_enabled
+
             # An update knows which files it re-parsed, so the index only has
             # to rewrite those rows instead of being dropped and repopulated.
+            # With CRG_FAST_ENGINE no hint is passed: the delta then rewrites
+            # just the rows whose node was added, removed or changed, which
+            # for a one-file edit is far fewer than every dependent's rows.
             mode: list[str] = []
             build_result["fts_indexed"] = update_fts_index(
                 store,
-                _fts_file_hint(repo_root, changed_files),
+                None if fast_engine_enabled() else _fts_file_hint(repo_root, changed_files),
                 _out_mode=mode,
             )
             build_result["fts_rebuilt"] = mode == ["rebuild"]

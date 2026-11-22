@@ -46,6 +46,9 @@ def _edges(store):
 
 def _update(tmp_path, monkeypatch, name, batch):
     monkeypatch.setenv("CRG_SERIAL_PARSE", "1")
+    # CRG_FAST_ENGINE leaves these dependents' rows alone (a body change names
+    # nothing they use), so the batching is pinned on the default path.
+    monkeypatch.delenv("CRG_FAST_ENGINE", raising=False)
     monkeypatch.setattr(incremental, "_EDGE_WRITE_BATCH", batch)
     repo = _repo(tmp_path / name).resolve()
     store = GraphStore(repo / ".code-review-graph" / "graph.db")

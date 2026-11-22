@@ -9905,6 +9905,24 @@ class CodeParser:
             _PYTHON_PROPERTY_RETURN_ANNOTATION_CACHE[cache_key] = properties
             return properties
 
+    def python_importer_view(self, module_path: Path, source: bytes) -> tuple:
+        """What parsing another module reads from this Python module's *source*.
+
+        An importer's parse reads these summaries of the modules it imports
+        (class identities, property and return annotations, star exports and a
+        ``sys.modules`` swap), and nothing else of their bytes. Two versions
+        of a module with equal views parse every importer the same way.
+        """
+        resolved_path = module_path.resolve()
+        resolved = normalize_file_path(resolved_path)
+        return (
+            self._read_python_module_class_identities(resolved, source),
+            self._read_python_property_return_annotations(resolved_path, source),
+            self._read_python_return_annotations(resolved_path, source),
+            self._read_python_star_exports(resolved_path, frozenset(), source),
+            self._read_python_module_alias(resolved_path, source),
+        )
+
     def _python_module_class_identities(
         self, module_file: str,
     ) -> dict[str, tuple[str, str]]:
@@ -9924,13 +9942,37 @@ class CodeParser:
             if cached is not None:
                 return cached
 
+        identities = self._read_python_module_class_identities(resolved, source)
+        if identities is None:
+            return {}
+        with _PYTHON_MODULE_CLASS_IDENTITY_CACHE_LOCK:
+            for stale in [
+                key for key in _PYTHON_MODULE_CLASS_IDENTITY_CACHE
+                if key[0] == resolved and key != cache_key
+            ]:
+                _PYTHON_MODULE_CLASS_IDENTITY_CACHE.pop(stale, None)
+            if len(_PYTHON_MODULE_CLASS_IDENTITY_CACHE) >= _PYTHON_STAR_CACHE_MAX:
+                for oldest in list(_PYTHON_MODULE_CLASS_IDENTITY_CACHE)[
+                    : _PYTHON_STAR_CACHE_MAX // 2
+                ]:
+                    _PYTHON_MODULE_CLASS_IDENTITY_CACHE.pop(oldest, None)
+            _PYTHON_MODULE_CLASS_IDENTITY_CACHE[cache_key] = identities
+        return identities
+
+    def _read_python_module_class_identities(
+        self, resolved: str, source: bytes,
+    ) -> Optional[dict[str, tuple[str, str]]]:
+        """Class identities of the module stored at *resolved*, read from *source*.
+
+        None when the module cannot be parsed.
+        """
         parser = self._get_parser("python")
         if not parser:
-            return {}
+            return None
         try:
             tree = parser.parse(source)  # type: ignore[union-attr]
         except (RecursionError, ValueError):  # pragma: no cover
-            return {}
+            return None
 
         class_counts: dict[str, int] = {}
         imported_names: set[str] = set()
@@ -9974,29 +10016,20 @@ class CodeParser:
         for name, bindings in symbol_bindings.items():
             if len(bindings) == 1 and name not in class_counts:
                 identities[name] = next(iter(bindings))
-
-        with _PYTHON_MODULE_CLASS_IDENTITY_CACHE_LOCK:
-            for stale in [
-                key for key in _PYTHON_MODULE_CLASS_IDENTITY_CACHE
-                if key[0] == resolved and key != cache_key
-            ]:
-                _PYTHON_MODULE_CLASS_IDENTITY_CACHE.pop(stale, None)
-            if len(_PYTHON_MODULE_CLASS_IDENTITY_CACHE) >= _PYTHON_STAR_CACHE_MAX:
-                for oldest in list(_PYTHON_MODULE_CLASS_IDENTITY_CACHE)[
-                    : _PYTHON_STAR_CACHE_MAX // 2
-                ]:
-                    _PYTHON_MODULE_CLASS_IDENTITY_CACHE.pop(oldest, None)
-            _PYTHON_MODULE_CLASS_IDENTITY_CACHE[cache_key] = identities
         return identities
 
     def _read_python_property_return_annotations(
-        self, module_path: Path,
+        self, module_path: Path, source: bytes | None = None,
     ) -> dict[tuple[str, str], str]:
-        """Parse class property declarations without evaluating their bodies."""
-        try:
-            source = module_path.read_bytes()
-        except (OSError, PermissionError):
-            return {}
+        """Parse class property declarations without evaluating their bodies.
+
+        *source* stands in for the file's bytes when given.
+        """
+        if source is None:
+            try:
+                source = module_path.read_bytes()
+            except (OSError, PermissionError):
+                return {}
         parser = self._get_parser("python")
         if not parser:
             return {}
@@ -10557,13 +10590,17 @@ class CodeParser:
             return annotations
 
     def _read_python_return_annotations(
-        self, module_path: Path,
+        self, module_path: Path, source: bytes | None = None,
     ) -> dict[str, str]:
-        """Parse one module for the return annotations of its top-level defs."""
-        try:
-            source = module_path.read_bytes()
-        except (OSError, PermissionError):
-            return {}
+        """Parse one module for the return annotations of its top-level defs.
+
+        *source* stands in for the file's bytes when given.
+        """
+        if source is None:
+            try:
+                source = module_path.read_bytes()
+            except (OSError, PermissionError):
+                return {}
         parser = self._get_parser("python")
         if not parser:
             return {}
@@ -20392,13 +20429,18 @@ class CodeParser:
         self,
         module_path: Path,
         resolving: frozenset[str],
+        source: bytes | None = None,
     ) -> dict[str, str]:
-        """Read and parse one Python module for star-export discovery."""
+        """Read and parse one Python module for star-export discovery.
+
+        *source* stands in for the file's bytes when given.
+        """
         resolved_module = normalize_file_path(module_path)
-        try:
-            source = module_path.read_bytes()
-        except (OSError, PermissionError):
-            return {}
+        if source is None:
+            try:
+                source = module_path.read_bytes()
+            except (OSError, PermissionError):
+                return {}
         try:
             parser = self._get_parser("python")
             if not parser:
@@ -20763,7 +20805,9 @@ class CodeParser:
             return module_name
 
     @staticmethod
-    def _read_python_module_alias(module_path: Path) -> Optional[str]:
+    def _read_python_module_alias(
+        module_path: Path, source: bytes | None = None,
+    ) -> Optional[str]:
         """Dotted module a file installs as ``sys.modules[__name__]``, if any.
 
         Only the literal, module-level form counts:
@@ -20772,12 +20816,14 @@ class CodeParser:
         relative module name, a swap inside a function or ``if`` block, or a
         later write that replaces the literal swap is not something static
         analysis can follow, so the file stays the module. Of several
-        module-level swaps the last one is what importers get.
+        module-level swaps the last one is what importers get. *source*
+        stands in for the file's bytes when given.
         """
-        try:
-            source = module_path.read_bytes()
-        except OSError:
-            return None
+        if source is None:
+            try:
+                source = module_path.read_bytes()
+            except OSError:
+                return None
         if b"sys.modules" not in source or b"import_module" not in source:
             return None
         try:

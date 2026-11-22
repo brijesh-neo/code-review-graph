@@ -3218,6 +3218,196 @@ def _relative_update_input(repo_root: Path, path: str) -> str:
         return path
 
 
+# Edge kinds a module's importers can read through the graph: what it imports
+# and re-exports, and what its classes inherit. Calls, references, tests and
+# containment are its own business, and containment follows its nodes.
+_IMPORTER_VISIBLE_EDGE_KINDS = frozenset({
+    "IMPORTS_FROM", "INHERITS", "IMPLEMENTS", "DEPENDS_ON",
+})
+# Past this many changed symbol names, matching them against the importers'
+# edges stops paying off; every importer is re-parsed instead.
+_MAX_CHANGED_SYMBOL_NAMES = 64
+# A wildcard import anywhere in the text, comments included: such a file reads
+# every public name of the module it imports from.
+_WILDCARD_IMPORT_RE = re.compile(rb"\bimport\s*\*")
+
+
+def _committed_bytes(repo_root: Path, rel_path: str, file_hash: str) -> bytes | None:
+    """The bytes the graph holds for *rel_path*, read back from Git.
+
+    HEAD first, then the index. Only a blob whose sha256 equals the stored
+    *file_hash* counts, so a graph built from bytes Git does not have gets
+    None.
+    """
+    for spec in (f"HEAD:./{rel_path}", f":./{rel_path}"):
+        try:
+            result = subprocess.run(
+                ["git", "cat-file", "blob", spec],
+                cwd=str(repo_root), capture_output=True, timeout=_GIT_TIMEOUT,
+                check=False,
+            )
+        except (OSError, subprocess.SubprocessError) as exc:
+            logger.debug("Reading %s from Git failed: %s", spec, exc)
+            return None
+        if (
+            result.returncode == 0
+            and hashlib.sha256(result.stdout).hexdigest() == file_hash
+        ):
+            return result.stdout
+    return None
+
+
+def _node_shape(node: Any) -> tuple:
+    """A parsed node without its position, which nothing in another file reads."""
+    return (
+        node.kind, node.name, node.parent_name or "", node.language, node.params,
+        node.return_type, node.modifiers, node.is_test, node.identity_name,
+        json.dumps(node.extra, sort_keys=True, default=str),
+    )
+
+
+def _edge_shape(edge: Any) -> tuple:
+    return (
+        edge.kind, edge.source, edge.target,
+        json.dumps(edge.extra, sort_keys=True, default=str),
+    )
+
+
+def _changed_symbol_names(
+    repo_root: Path, rel_path: str, file_hash: str, parser: Any, parsed: dict,
+) -> tuple[set[str], bool] | None:
+    """Names whose definitions in *rel_path* changed since the graph stored it.
+
+    The flag says whether the module's public names changed, which only a
+    wildcard import reads. None when an importer's parse could have changed
+    too, or when that cannot be told: the file is not an indexed Python module
+    whose stored bytes Git still has, a summary importers read from it
+    differs, or an edge kind importers read through the graph (imports,
+    inheritance) changed. The new bytes are parsed with the update's own
+    *parser*, and that result goes into *parsed* for the update to store.
+    """
+    if not rel_path.endswith(".py"):
+        return None
+    abs_path = repo_root / rel_path
+    if abs_path.is_symlink() or not abs_path.is_file():
+        return None
+    try:
+        new_source = abs_path.read_bytes()
+    except OSError:
+        return None
+    old_source = _committed_bytes(repo_root, rel_path, file_hash)
+    if old_source is None:
+        return None
+    # A parser of its own for the old bytes: they must not reach a cache the
+    # update's parser shares with the files it parses next.
+    old_parser = _get_code_parser_cls()(repo_root)
+    own = normalize_file_path(abs_path.resolve())
+
+    def split_view(view: tuple) -> tuple[tuple, dict, set]:
+        # Names the module defines itself resolve to the module whether or
+        # not it exports them, so outside a wildcard import only the names it
+        # re-exports from elsewhere count.
+        exports = view[3] or {}
+        foreign = {name: origin for name, origin in exports.items() if origin != own}
+        local = {name for name, origin in exports.items() if origin == own}
+        return view[:3] + view[4:], foreign, local
+
+    try:
+        old_view = split_view(old_parser.python_importer_view(abs_path, old_source))
+        new_view = split_view(parser.python_importer_view(abs_path, new_source))
+        if old_view[:2] != new_view[:2]:
+            return None
+        old_nodes, old_edges = old_parser.parse_bytes(abs_path, old_source)
+        new_nodes, new_edges = parser.parse_bytes(abs_path, new_source)
+        parsed[rel_path] = (new_source, new_nodes, new_edges)
+    except Exception as exc:  # noqa: BLE001 - any failure means "re-parse all"
+        logger.debug("Comparing versions of %s failed: %s", rel_path, exc)
+        return None
+
+    def visible(edges: list) -> list[tuple]:
+        return sorted(
+            _edge_shape(edge) for edge in edges
+            if edge.kind in _IMPORTER_VISIBLE_EDGE_KINDS
+        )
+
+    if visible(old_edges) != visible(new_edges):
+        return None
+    old_shapes = sorted(_node_shape(node) for node in old_nodes)
+    new_shapes = sorted(_node_shape(node) for node in new_nodes)
+    names: set[str] = set()
+    for shape in set(old_shapes) ^ set(new_shapes):
+        names.add(shape[1])
+        names.add(shape[2])
+    # Same-named definitions share one name and take collision identities by
+    # position, so their names count as changed whenever anything moved.
+    for shapes in (old_shapes, new_shapes):
+        counts: dict[tuple, int] = {}
+        for shape in shapes:
+            key = (shape[0], shape[1], shape[2])
+            counts[key] = counts.get(key, 0) + 1
+        for (_kind, name, parent), count in counts.items():
+            if count > 1:
+                names.add(name)
+                names.add(parent)
+    names.discard("")
+    exports_changed = old_view[2] != new_view[2]
+    names |= old_view[2] ^ new_view[2]
+    return names, exports_changed
+
+
+def _importers_to_reparse(
+    repo_root: Path,
+    store: GraphStore,
+    changed: dict[str, str],
+    importers: set[str],
+    parser: Any,
+    parsed: dict,
+) -> set[str] | None:
+    """The importers of *changed* (path to stored hash) a re-parse could alter.
+
+    Used with ``CRG_FAST_ENGINE``. An importer with unchanged bytes parses as
+    before when every changed module shows its importers the same summaries
+    and imports (see :func:`_changed_symbol_names`). Its stored edges then only
+    go stale where they name a changed definition, so the importers whose edges
+    mention no changed name keep their rows, and the resolvers settle those
+    as they settle every other file. None means re-parse every importer.
+    """
+    names: set[str] = set()
+    exports_changed = False
+    for rel_path, file_hash in changed.items():
+        found = _changed_symbol_names(repo_root, rel_path, file_hash, parser, parsed)
+        if found is None:
+            return None
+        names |= found[0]
+        exports_changed = exports_changed or found[1]
+        if len(names) > _MAX_CHANGED_SYMBOL_NAMES:
+            return None
+    if exports_changed:
+        # A wildcard importer, or one that imports through it, reads the
+        # public names themselves rather than an edge that names them.
+        for rel_path in importers:
+            try:
+                if _WILDCARD_IMPORT_RE.search((repo_root / rel_path).read_bytes()):
+                    return None
+            except OSError:
+                return None
+    by_stored = {
+        normalize_file_path(repo_root / rel_path): rel_path for rel_path in importers
+    }
+    selected: set[str] = set()
+    conn = store._conn
+    for name in sorted(names):
+        for row in conn.execute(
+            "SELECT DISTINCT file_path FROM edges WHERE instr(source_qualified, ?) > 0 "
+            "OR instr(target_qualified, ?) > 0 OR instr(COALESCE(extra, ''), ?) > 0",
+            (name, name, name),
+        ).fetchall():
+            rel_path = by_stored.get(row[0])
+            if rel_path is not None:
+                selected.add(rel_path)
+    return selected
+
+
 @_with_build_cache
 def incremental_update(
     repo_root: Path,
@@ -3423,6 +3613,9 @@ def incremental_update(
     # Find dependent files (files that import from changed files)
     dependents_pending = _load_dependents_pending(store)
     dependent_files: set[str] = set(dependents_pending)
+    # Changed files whose bytes differ from the stored ones, with the stored
+    # hash, or None once one of them cannot take the fast path below.
+    content_changed: dict[str, str] | None = {}
     for rel_path in changed_files:
         full_path = normalize_file_path(repo_root / rel_path)
         # Duplicate watch notifications do not invalidate dependents. A real
@@ -3443,6 +3636,11 @@ def incremental_update(
                     continue
             except (OSError, PermissionError):
                 pass
+        if content_changed is not None:
+            if existing and rel_path not in pending_nested and existing[0].file_hash:
+                content_changed[rel_path] = existing[0].file_hash
+            else:
+                content_changed = None
         deps = find_dependents(store, full_path)
         for d in deps:
             # Convert back to relative path if needed
@@ -3450,6 +3648,29 @@ def incremental_update(
                 dependent_files.add(str(Path(d).relative_to(repo_root)))
             except ValueError:
                 dependent_files.add(d)
+
+    # With the native engine, importers whose bytes did not change are
+    # re-parsed only where the change can reach them (``None``: all of them).
+    from .parser import fast_engine_enabled
+
+    importers_to_reparse: set[str] | None = None
+    # Changed files the check above already parsed: path to (bytes, nodes, edges).
+    preparsed: dict[str, tuple[bytes, list, list]] = {}
+    if (
+        fast_engine_enabled()
+        and content_changed
+        and dependent_files
+        and not identity_pending
+        and not pending_csharp
+        and not pending_nested
+        and _enrichment_skip_reason(enrich) is not None
+    ):
+        importers_to_reparse = _importers_to_reparse(
+            repo_root, store, content_changed, dependent_files - dependents_pending,
+            parser, preparsed,
+        )
+        if importers_to_reparse is not None:
+            importers_to_reparse |= dependents_pending
 
     # Combine changed + dependent
     all_files = set(changed_files) | dependent_files | (identity_pending or set())
@@ -3464,6 +3685,8 @@ def incremental_update(
     to_parse: list[str] = []
     # Importers re-parsed with unchanged bytes, and the hash that was checked.
     edges_only: dict[str, str] = {}
+    # Importers left as stored (see ``importers_to_reparse``).
+    kept_importers: list[str] = []
     # Sorted, so the rows (and the community ids read from them) come out the
     # same on every run: set order follows per-process string hashes.
     for rel_path in sorted(all_files):
@@ -3519,6 +3742,13 @@ def incremental_update(
             ):
                 if rel_path not in dependent_files:
                     continue
+                if (
+                    importers_to_reparse is not None
+                    and rel_path not in importers_to_reparse
+                ):
+                    # Its stored rows stand; the resolvers below settle them.
+                    kept_importers.append(rel_path)
+                    continue
                 edges_only[rel_path] = fhash
         except (OSError, PermissionError):
             pass
@@ -3549,6 +3779,7 @@ def incremental_update(
     # variant generation so we do not expand twice per update.
     lifecycle_inputs = [
         *[rel_path.replace("\\", "/") for rel_path in to_parse],
+        *[rel_path.replace("\\", "/") for rel_path in kept_importers],
         *missing_paths,
         *stale_files,
     ]
@@ -3600,7 +3831,11 @@ def incremental_update(
             try:
                 source = abs_path.read_bytes()
                 fhash = hashlib.sha256(source).hexdigest()
-                nodes, edges = parser.parse_bytes(abs_path, source)
+                ready = preparsed.pop(rel_path, None)
+                if ready is not None and ready[0] == source:
+                    nodes, edges = ready[1], ready[2]
+                else:
+                    nodes, edges = parser.parse_bytes(abs_path, source)
             except (OSError, PermissionError) as e:
                 errors.append({"file": rel_path, "error": str(e)})
                 continue
