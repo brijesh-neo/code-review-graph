@@ -274,6 +274,21 @@ class PathCodec:
 
     # -- outbound ------------------------------------------------------------
 
+    def fast_row_factory(self) -> Any:
+        """:meth:`row_factory`, from ``crg_fast`` under ``CRG_FAST_ENGINE``."""
+        from .parser import fast_engine_enabled
+
+        if not fast_engine_enabled():
+            return self.row_factory
+        try:
+            import crg_fast
+        except ImportError:
+            return self.row_factory
+        restorer = getattr(crg_fast, "RowRestorer", None)
+        if restorer is None:
+            return self.row_factory
+        return restorer(self.root, self.restore, self._spec, sqlite3.Row)
+
     def _restore_json_match(self, match: re.Match) -> str:
         escape = match.group("esc")
         if escape is not None:
@@ -372,7 +387,7 @@ class TranslatingConnection(sqlite3.Connection):
         """Turn translation on for *root*, or off with ``None``."""
         if root:
             self.codec = PathCodec(root)
-            self.row_factory = self.codec.row_factory
+            self.row_factory = self.codec.fast_row_factory()
         else:
             self.codec = None
             self.row_factory = sqlite3.Row
