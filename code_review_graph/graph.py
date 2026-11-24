@@ -255,6 +255,19 @@ def _native_edge_rows() -> Any:
     return getattr(crg_fast, "edge_rows", None)
 
 
+def _native_settle_edges() -> Any:
+    """``crg_fast.settle_edges`` under ``CRG_FAST_ENGINE``, else None."""
+    from .parser import fast_engine_enabled
+
+    if not fast_engine_enabled():
+        return None
+    try:
+        import crg_fast
+    except ImportError:
+        return None
+    return getattr(crg_fast, "settle_edges", None)
+
+
 def _load_native_sql(conn: sqlite3.Connection) -> bool:
     """Load ``crg_fast`` into *conn* as a SQLite extension (``CRG_FAST_ENGINE``).
 
@@ -2284,6 +2297,17 @@ class GraphStore:
         """
         local_prefix = f"{file_path}::"
         cache: dict[str, list[str]] = {}
+        native = _native_settle_edges()
+        if native is not None:
+            # Alignment reads only *collisions*, so it can run first; the
+            # native pass returns each edge whose endpoints all stay as they
+            # are and hands every other one to the same Python call.
+            if collisions:
+                edges = [self._align_edge_with_collisions(edge, collisions) for edge in edges]
+            return native(
+                edges if type(edges) is list else list(edges), local_prefix, cache,
+                self._stored_identity_candidates, self._resolve_edge_identities,
+            )
         return [
             self._resolve_edge_identities(
                 self._align_edge_with_collisions(edge, collisions)
