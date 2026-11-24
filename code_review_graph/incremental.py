@@ -24,7 +24,7 @@ from collections import deque
 from contextlib import nullcontext
 from functools import partial, wraps
 from pathlib import Path, PurePosixPath
-from typing import TYPE_CHECKING, Any, Callable, Iterable, NamedTuple, Optional
+from typing import TYPE_CHECKING, Any, Callable, Iterable, Iterator, NamedTuple, Optional
 
 from . import install_plan
 from .build_state import advance_to_postprocess_pending
@@ -77,6 +77,10 @@ _MCP_STDIO_ACTIVE = False
 # both cases and avoids rebuilding CodeParser (including its grammar probes and
 # parser caches) for every file in a parallel build.
 _PARSE_WORKER_STATE = threading.local()
+# Chunks in flight per worker when parse workers share module caches. One
+# keeps each chunk's cache entries as fresh as possible; a feeder thread sends
+# the next chunk the moment one returns, so workers do not wait for it.
+_SHARED_PARSE_WINDOW = 1
 
 
 def _windows_console_handle(fileno: int) -> bool:
@@ -2989,6 +2993,161 @@ def _parse_single_file(
         return (rel_path, [], [], str(e), "")
 
 
+
+def _parse_chunk_sharing_caches(
+    args_chunk: list[tuple[str, str]],
+    seed: list,
+) -> tuple[list, int, list]:
+    """Parse *args_chunk* in a process worker that shares its module caches.
+
+    *seed* holds Python module-cache entries other workers computed; they are
+    installed first. Returns the parse results, this worker's pid and the
+    cache entries it computed that no other worker has been sent by it yet.
+    """
+    from .parser import python_module_cache_entries, seed_python_module_caches
+
+    shared = getattr(_PARSE_WORKER_STATE, "shared_cache_keys", None)
+    if shared is None:
+        shared = _PARSE_WORKER_STATE.shared_cache_keys = set()
+    seed_python_module_caches(seed, shared)
+    results = [_parse_single_file(args) for args in args_chunk]
+    return results, os.getpid(), python_module_cache_entries(shared)
+
+
+
+def _shared_parse_chunks(
+    args_list: list[tuple[str, str]],
+    chunksize: int,
+    workers: int,
+) -> tuple[list[list[tuple[str, str]]], list[int]]:
+    """Split *args_list* into ordered chunks; a very large file gets its own.
+
+    Returns the chunks and the indexes of the single-file chunks whose file
+    holds more than a ``workers * 4``-th of all the bytes.
+    """
+    sizes = []
+    for rel_path, repo_root_str in args_list:
+        try:
+            sizes.append((Path(repo_root_str) / rel_path).stat().st_size)
+        except OSError:
+            sizes.append(0)
+    limit = max(1, sum(sizes) // (workers * 4))
+    chunks: list[list[tuple[str, str]]] = []
+    heavy: list[int] = []
+    current: list[tuple[str, str]] = []
+    for args, size in zip(args_list, sizes):
+        if size > limit:
+            if current:
+                chunks.append(current)
+                current = []
+            heavy.append(len(chunks))
+            chunks.append([args])
+            continue
+        current.append(args)
+        if len(current) == chunksize:
+            chunks.append(current)
+            current = []
+    if current:
+        chunks.append(current)
+    return chunks, heavy
+
+
+def _parse_sharing_caches(
+    executor: concurrent.futures.Executor,
+    args_list: list[tuple[str, str]],
+    chunksize: int,
+    workers: int,
+) -> Iterator[tuple[str, list, list, str | None, str]]:
+    """``executor.map(_parse_single_file, args_list)`` that shares module caches.
+
+    Each process worker would otherwise read and summarise the same imported
+    Python modules again (star exports, return annotations, ``sys.modules``
+    swaps). Entries a worker computes come back with its results and go out
+    with later chunks to the other workers. Every shared entry is a function
+    of its module file alone, so a parse reads the same answer either way.
+    Results are yielded in the order of *args_list*.
+    """
+    chunks, heavy = _shared_parse_chunks(args_list, chunksize, workers)
+    # A file far larger than the rest goes out first, alone: the caller takes
+    # results in order, so a late one holds up storing everything after it.
+    order = heavy + [index for index in range(len(chunks)) if index not in set(heavy)]
+    window = workers * _SHARED_PARSE_WINDOW
+    log: list = []
+    seen: dict[int, int] = {}
+    futures: dict[int, concurrent.futures.Future] = {}
+    cond = threading.Condition()
+    state: dict[str, Any] = {"stop": False, "error": None}
+
+    def feed() -> None:
+        # Its own thread, so a chunk goes out as soon as one comes back even
+        # while the caller is busy storing results.
+        in_flight: dict[concurrent.futures.Future, int] = {}
+        next_chunk = 0
+        try:
+            while True:
+                with cond:
+                    while (
+                        not state["stop"] and next_chunk < len(chunks)
+                        and len(in_flight) < window
+                    ):
+                        start = min(seen.values()) if len(seen) >= workers else 0
+                        chunk_index = order[next_chunk]
+                        future = executor.submit(
+                            _parse_chunk_sharing_caches, chunks[chunk_index], log[start:],
+                        )
+                        in_flight[future] = len(log)
+                        futures[chunk_index] = future
+                        next_chunk += 1
+                        cond.notify_all()
+                if not in_flight:
+                    return
+                done, _ = concurrent.futures.wait(
+                    in_flight, return_when=concurrent.futures.FIRST_COMPLETED,
+                )
+                with cond:
+                    for future in done:
+                        sent = in_flight.pop(future)
+                        if future.exception() is None:
+                            _, pid, entries = future.result()
+                            log.extend(entries)
+                            seen[pid] = max(seen.get(pid, 0), sent)
+        except BaseException as exc:  # handed to the caller, which re-raises it
+            with cond:
+                state["error"] = exc
+                cond.notify_all()
+
+    feeder = threading.Thread(target=feed, name="crg-parse-feeder", daemon=True)
+    feeder.start()
+    try:
+        for index in range(len(chunks)):
+            with cond:
+                while index not in futures and state["error"] is None:
+                    cond.wait()
+                if index not in futures:
+                    raise state["error"]
+                head = futures.pop(index)
+            results, _, _ = head.result()
+            yield from results
+    finally:
+        with cond:
+            state["stop"] = True
+            cond.notify_all()
+        feeder.join()
+
+
+def _parse_results(
+    executor: concurrent.futures.Executor,
+    args_list: list[tuple[str, str]],
+    chunksize: int,
+) -> Iterator[tuple[str, list, list, str | None, str]]:
+    """Parse *args_list* on *executor*, sharing module caches under the fast engine."""
+    from .parser import fast_engine_enabled
+
+    if fast_engine_enabled() and isinstance(executor, concurrent.futures.ProcessPoolExecutor):
+        return _parse_sharing_caches(executor, args_list, chunksize, _MAX_PARSE_WORKERS)
+    return executor.map(_parse_single_file, args_list, chunksize=chunksize)
+
+
 def _canonical_repo_root(repo_root: Path) -> Path:
     """Return one stable identity for a repository root.
 
@@ -3114,7 +3273,7 @@ def full_build(
             args_list = [(rel_path, str(repo_root)) for rel_path in files]
             with _make_executor(_MAX_PARSE_WORKERS) as executor:
                 for i, (rel_path, nodes, edges, error, fhash) in enumerate(
-                    executor.map(_parse_single_file, args_list, chunksize=4),
+                    _parse_results(executor, args_list, 4),
                     1,
                 ):
                     if error:
@@ -3858,10 +4017,8 @@ def incremental_update(
         _prewarm_parser_probes(parser, to_parse)
         args_list = [(rel_path, str(repo_root)) for rel_path in to_parse]
         with _make_executor(_MAX_PARSE_WORKERS) as executor:
-            for rel_path, nodes, edges, error, fhash in executor.map(
-                _parse_single_file,
-                args_list,
-                chunksize=20,
+            for rel_path, nodes, edges, error, fhash in _parse_results(
+                executor, args_list, 20,
             ):
                 if error:
                     logger.warning("Error parsing %s: %s", rel_path, error)

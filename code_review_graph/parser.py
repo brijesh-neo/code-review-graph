@@ -90,6 +90,11 @@ _DBT_REF_RE = re.compile(
 _PYTHON_STAR_CACHE_MAX = 15_000
 _PYTHON_STAR_EXPORT_CACHE: dict[tuple[str, int, int], dict[str, str]] = {}
 _PYTHON_STAR_EXPORT_CACHE_LOCK = threading.RLock()
+# Star-export cache keys whose exports were computed across an import cycle.
+# Such an answer depends on which module of the cycle was read first, so
+# :func:`python_module_cache_entries` never hands it to another process.
+_PYTHON_STAR_EXPORT_CYCLE_KEYS: set[tuple[str, int, int]] = set()
+_PYTHON_STAR_EXPORT_CYCLE_CUTS = [0]
 
 # ``{(module file, mtime, size): dotted module it installs as
 # sys.modules[__name__], or None}``. Process-wide like the star-export cache,
@@ -994,6 +999,62 @@ def seed_parser_probe_results(results: dict[str, bool]) -> None:
     with _PARSER_PROBE_LOCK:
         for grammar, result in results.items():
             _PARSER_PROBE_RESULTS.setdefault(grammar, result)
+
+
+
+def _python_module_caches() -> tuple[tuple[str, dict, Any], ...]:
+    return (
+        ("star", _PYTHON_STAR_EXPORT_CACHE, _PYTHON_STAR_EXPORT_CACHE_LOCK),
+        ("alias", _PYTHON_MODULE_ALIAS_CACHE, _PYTHON_MODULE_ALIAS_CACHE_LOCK),
+        ("returns", _PYTHON_RETURN_ANNOTATION_CACHE, _PYTHON_RETURN_ANNOTATION_CACHE_LOCK),
+        (
+            "properties", _PYTHON_PROPERTY_RETURN_ANNOTATION_CACHE,
+            _PYTHON_RETURN_ANNOTATION_CACHE_LOCK,
+        ),
+        (
+            "classes", _PYTHON_MODULE_CLASS_IDENTITY_CACHE,
+            _PYTHON_MODULE_CLASS_IDENTITY_CACHE_LOCK,
+        ),
+    )
+
+
+def python_module_cache_entries(skip: set) -> list[tuple[str, tuple, Any]]:
+    """Entries of the process-wide Python module caches not named in *skip*.
+
+    Each entry is ``(cache name, key, value)`` and is added to *skip*. Every
+    entry is a function of the module file it is keyed by, so another parse
+    process can install it with :func:`seed_python_module_caches` and read
+    the same answer it would have computed. Star exports computed across an
+    import cycle are left out: they depend on the order the cycle was read.
+    """
+    entries: list[tuple[str, tuple, Any]] = []
+    for name, cache, lock in _python_module_caches():
+        with lock:
+            for key, value in cache.items():
+                if (name, key) in skip:
+                    continue
+                if name == "star" and key in _PYTHON_STAR_EXPORT_CYCLE_KEYS:
+                    continue
+                skip.add((name, key))
+                entries.append((name, key, value))
+    return entries
+
+
+def seed_python_module_caches(entries: list[tuple[str, tuple, Any]], skip: set) -> None:
+    """Install entries from :func:`python_module_cache_entries` of another process.
+
+    A key this process already holds keeps its own value. Installed keys are
+    added to *skip* so they are not sent back.
+    """
+    if not entries:
+        return
+    caches = {name: (cache, lock) for name, cache, lock in _python_module_caches()}
+    for name, key, value in entries:
+        skip.add((name, key))
+        cache, lock = caches[name]
+        with lock:
+            if key not in cache and len(cache) < _PYTHON_STAR_CACHE_MAX:
+                cache[key] = value
 
 
 def _clear_parser_probe_cache() -> None:
@@ -4073,6 +4134,7 @@ class CodeParser:
             self._parsers.clear()
         with _PYTHON_STAR_EXPORT_CACHE_LOCK:
             _PYTHON_STAR_EXPORT_CACHE.clear()
+            _PYTHON_STAR_EXPORT_CYCLE_KEYS.clear()
         with _PYTHON_RETURN_ANNOTATION_CACHE_LOCK:
             _PYTHON_RETURN_ANNOTATION_CACHE.clear()
         for _cached_fn in (
@@ -20374,7 +20436,10 @@ class CodeParser:
             # `_python_import_origin` sees through sys.modules shims, so
             # `from shim import *` enumerates the real module's exports.
             resolved = self._python_import_origin(module, file_path)
-            if resolved is None or resolved in resolving:
+            if resolved is None:
+                continue
+            if resolved in resolving:
+                _PYTHON_STAR_EXPORT_CYCLE_CUTS[0] += 1
                 continue
             for name, origin in self._get_python_star_exports(
                 resolved, resolving,
@@ -20394,6 +20459,7 @@ class CodeParser:
             return {}
         resolved_module = normalize_file_path(module_path)
         if resolved_module in resolving:
+            _PYTHON_STAR_EXPORT_CYCLE_CUTS[0] += 1
             return {}
         if self._excluded_files:
             # Origins are resolved with the exclusions in force, so a cache
@@ -20407,11 +20473,18 @@ class CodeParser:
         with _PYTHON_STAR_EXPORT_CACHE_LOCK:
             cached = _PYTHON_STAR_EXPORT_CACHE.get(cache_key)
             if cached is not None:
+                if cache_key in _PYTHON_STAR_EXPORT_CYCLE_KEYS:
+                    _PYTHON_STAR_EXPORT_CYCLE_CUTS[0] += 1
                 return dict(cached)
 
+            cuts_before = _PYTHON_STAR_EXPORT_CYCLE_CUTS[0]
             exports = self._read_python_star_exports(
                 module_path, resolving,
             )
+            if _PYTHON_STAR_EXPORT_CYCLE_CUTS[0] != cuts_before:
+                _PYTHON_STAR_EXPORT_CYCLE_KEYS.add(cache_key)
+            else:
+                _PYTHON_STAR_EXPORT_CYCLE_KEYS.discard(cache_key)
             stale_keys = [
                 key for key in _PYTHON_STAR_EXPORT_CACHE
                 if key[0] == resolved_module and key != cache_key
