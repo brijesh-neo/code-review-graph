@@ -115,7 +115,7 @@ impl PathStripper {
         Ok(stored)
     }
 
-    fn stored_row<'py>(&self, py: Python<'py>, row: &Bound<'py, PyTuple>) -> PyResult<Bound<'py, PyTuple>> {
+    pub(crate) fn stored_row<'py>(&self, py: Python<'py>, row: &Bound<'py, PyTuple>) -> PyResult<Bound<'py, PyTuple>> {
         let mut out: Option<Vec<Bound<'py, PyAny>>> = None;
         for (index, value) in row.iter().enumerate() {
             let stored = self.stored(py, value.clone())?;

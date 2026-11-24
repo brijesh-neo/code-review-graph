@@ -8,6 +8,7 @@ Supports impact-radius queries and subgraph extraction.
 
 from __future__ import annotations
 
+import functools
 import hashlib
 import json
 import logging
@@ -266,6 +267,19 @@ def _native_settle_edges() -> Any:
     except ImportError:
         return None
     return getattr(crg_fast, "settle_edges", None)
+
+
+def _native_node_rows() -> Any:
+    """``crg_fast.node_rows`` under ``CRG_FAST_ENGINE``, else None."""
+    from .parser import fast_engine_enabled
+
+    if not fast_engine_enabled():
+        return None
+    try:
+        import crg_fast
+    except ImportError:
+        return None
+    return getattr(crg_fast, "node_rows", None)
 
 
 def _load_native_sql(conn: sqlite3.Connection) -> bool:
@@ -2195,10 +2209,9 @@ class GraphStore:
         if nodes:
             # Planned identities are unique within the file. ON CONFLICT keeps
             # upsert_node()'s semantics for any row another spelling left.
-            node_rows: list[tuple] = []
-            for node, qualified in zip(nodes, identities):
+            def node_row(node: NodeInfo, qualified: str) -> tuple:
                 extra = json.dumps(node.extra) if node.extra else "{}"
-                node_rows.append((
+                return (
                     node.kind, node.name, qualified, node.file_path,
                     node.line_start, node.line_end, node.language,
                     node.parent_name, node.params, node.return_type,
@@ -2207,8 +2220,30 @@ class GraphStore:
                     node_index_tokens(node.kind, node.name, node.parent_name,
                                       normalized),
                     now,
-                ))
-            self._conn.executemany(
+                )
+
+            native = _native_node_rows()
+            stripper = None
+            if native is not None:
+                codec = getattr(self._conn, "codec", None)
+                stripper = codec.native_stripper() if codec is not None else None
+                # ``node_index_tokens`` takes the stem of this same path for
+                # every node of the file.
+                node_rows = native(
+                    nodes if type(nodes) is list else list(nodes), identities, fhash, now,
+                    PurePosixPath(normalized or "").stem, json.dumps, _indexed_docstring,
+                    node_row, stripper,
+                )
+            else:
+                node_rows = [
+                    node_row(node, qualified) for node, qualified in zip(nodes, identities)
+                ]
+            # The rows are already in their stored form when a stripper made them.
+            executemany = (
+                functools.partial(sqlite3.Connection.executemany, self._conn)
+                if stripper is not None else self._conn.executemany
+            )
+            executemany(
                 """INSERT INTO nodes
                    (kind, name, qualified_name, file_path, line_start, line_end,
                     language, parent_name, params, return_type, modifiers, is_test,
