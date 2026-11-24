@@ -255,6 +255,40 @@ def _native_edge_rows() -> Any:
     return getattr(crg_fast, "edge_rows", None)
 
 
+def _load_native_sql(conn: sqlite3.Connection) -> bool:
+    """Load ``crg_fast`` into *conn* as a SQLite extension (``CRG_FAST_ENGINE``).
+
+    The extension runs every call through this connection's own SQLite, so
+    native passes work inside Python's transaction without a second SQLite in
+    the process. False when the engine is off or the extension cannot load;
+    callers then run their SQL.
+    """
+    from .parser import fast_engine_enabled
+
+    if not fast_engine_enabled():
+        return False
+    try:
+        import crg_fast
+    except ImportError:
+        return False
+    if not hasattr(crg_fast, "stage_certainty_refresh"):
+        return False
+    # The compiled module itself, not the package's ``__init__.py``.
+    library = getattr(crg_fast, "crg_fast", crg_fast).__file__
+    if not library:
+        return False
+    try:
+        conn.enable_load_extension(True)
+        try:
+            conn.load_extension(str(library))
+        finally:
+            conn.enable_load_extension(False)
+    except (AttributeError, sqlite3.Error) as exc:
+        logger.warning("Could not load the crg_fast SQLite extension: %s", exc)
+        return False
+    return True
+
+
 def _symbol_of(qualified_name: str) -> str:
     """Return the symbol portion of a qualified name (after the first "::").
 
@@ -1056,6 +1090,9 @@ BUILD_CACHE_KIB = 100 * 1024
 class GraphStore:
     """SQLite-backed code knowledge graph."""
 
+    #: Whether ``crg_fast`` is loaded into the connection as a SQLite extension.
+    _native_sql = False
+
     def __init__(
         self,
         db_path: str | Path,
@@ -1138,6 +1175,7 @@ class GraphStore:
 
                 if fast_engine_enabled():
                     self._restore_edge_indexes()
+                    self._native_sql = _load_native_sql(conn)
         except (sqlite3.Error, OSError, GraphStoreError) as exc:
             # A corrupt file, a foreign SQLite file, or a data directory this
             # process cannot write to used to escape as a raw traceback from
@@ -3621,43 +3659,70 @@ class GraphStore:
         # takes up edges an earlier pass settled.
         self._resolve_inherited_endpoints()
         self._settle_unbound_endpoints()
+        self._begin_immediate()
+        try:
+            changed = self._native_certainty_refresh() if self._native_sql else -1
+            if changed < 0:
+                changed = self._certainty_refresh_sql()
+            self._conn.commit()
+        except BaseException:
+            self._conn.rollback()
+            raise
+        self._settle_collision_endpoints()
+        return changed
+
+    def _native_certainty_refresh(self) -> int:
+        """The four UPDATEs of ``_certainty_refresh_sql`` in one native pass.
+
+        Same rows, same values, and the same count back. -1 when a row holds
+        a value the native pass does not read the way SQLite does; it has then
+        written nothing.
+        """
+        import crg_fast
+
+        token = crg_fast.stage_certainty_refresh(
+            list(_RESOLVER_BOUND_KEYS),
+            (_SCORE_UNRESOLVED, _SCORE_AMBIGUOUS, _SCORE_INFERRED, _SCORE_EXTRACTED),
+        )
+        try:
+            row = self._conn.execute("SELECT crg_run(?)", (token,)).fetchone()
+        except BaseException:
+            crg_fast.discard_job(token)
+            raise
+        return int(row[0])
+
+    def _certainty_refresh_sql(self) -> int:
+        """Rewrite each edge's resolution, tier and score; rows changed in the first."""
         placeholders = ", ".join("?" for _ in TARGET_RESOLUTION_KINDS)
         call_tier = _certainty_tier_sql(f"target_resolution = '{RESOLUTION_UNRESOLVED}'")
         tested_by_tier = _certainty_tier_sql(
             "NOT EXISTS (SELECT 1 FROM nodes crg_cert_n "
             "WHERE crg_cert_n.qualified_name = edges.source_qualified)"
         )
-        self._begin_immediate()
-        try:
-            cursor = self._conn.execute(
-                "UPDATE edges SET target_resolution = "  # noqa: S608
-                f"{TARGET_RESOLUTION_EXPR} WHERE kind IN ({placeholders}) "
-                f"AND target_resolution IS NOT ({TARGET_RESOLUTION_EXPR})",
-                TARGET_RESOLUTION_KINDS,
-            )
-            # Only rows that change are written. The stored certainty is read by
-            # nothing on the traversal paths, so this must not cost a rewrite of
-            # the whole table on every incremental update.
-            self._conn.execute(
-                f"UPDATE edges SET confidence_tier = {call_tier} "  # noqa: S608
-                f"WHERE kind IN ({placeholders}) AND confidence_tier IS NOT {call_tier}",
-                TARGET_RESOLUTION_KINDS,
-            )
-            self._conn.execute(
-                f"UPDATE edges SET confidence_tier = {tested_by_tier} "  # noqa: S608
-                f"WHERE kind = 'TESTED_BY' AND confidence_tier IS NOT {tested_by_tier}",
-            )
-            self._conn.execute(
-                f"UPDATE edges SET confidence = {_CERTAINTY_SCORE_SQL} "  # noqa: S608
-                f"WHERE kind IN ({placeholders}, 'TESTED_BY') "
-                f"AND confidence IS NOT {_CERTAINTY_SCORE_SQL}",
-                TARGET_RESOLUTION_KINDS,
-            )
-            self._conn.commit()
-        except BaseException:
-            self._conn.rollback()
-            raise
-        self._settle_collision_endpoints()
+        cursor = self._conn.execute(
+            "UPDATE edges SET target_resolution = "  # noqa: S608
+            f"{TARGET_RESOLUTION_EXPR} WHERE kind IN ({placeholders}) "
+            f"AND target_resolution IS NOT ({TARGET_RESOLUTION_EXPR})",
+            TARGET_RESOLUTION_KINDS,
+        )
+        # Only rows that change are written. The stored certainty is read by
+        # nothing on the traversal paths, so this must not cost a rewrite of
+        # the whole table on every incremental update.
+        self._conn.execute(
+            f"UPDATE edges SET confidence_tier = {call_tier} "  # noqa: S608
+            f"WHERE kind IN ({placeholders}) AND confidence_tier IS NOT {call_tier}",
+            TARGET_RESOLUTION_KINDS,
+        )
+        self._conn.execute(
+            f"UPDATE edges SET confidence_tier = {tested_by_tier} "  # noqa: S608
+            f"WHERE kind = 'TESTED_BY' AND confidence_tier IS NOT {tested_by_tier}",
+        )
+        self._conn.execute(
+            f"UPDATE edges SET confidence = {_CERTAINTY_SCORE_SQL} "  # noqa: S608
+            f"WHERE kind IN ({placeholders}, 'TESTED_BY') "
+            f"AND confidence IS NOT {_CERTAINTY_SCORE_SQL}",
+            TARGET_RESOLUTION_KINDS,
+        )
         return cursor.rowcount if cursor.rowcount and cursor.rowcount > 0 else 0
 
     def _resolve_inherited_endpoints(self) -> int:

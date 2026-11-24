@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+libsqlite3-sys = { version = "0.40.0", features = ["loadable_extension"] }
 pyo3 = { version = "0.30.1", features = ["extension-module", "abi3-py310"] }
 tree-sitter = "0.27.2"
 

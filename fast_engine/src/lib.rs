@@ -20,6 +20,8 @@ mod python_receivers;
 mod typed_calls;
 mod extract;
 mod store;
+mod sqlite_ext;
+mod certainty;
 
 const CAPSULE_NAME: &CStr = c"tree_sitter.Language";
 
@@ -327,5 +329,8 @@ fn crg_fast(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(typed_calls::type_parameter_names, module)?)?;
     module.add_function(wrap_pyfunction!(store::edge_rows, module)?)?;
     module.add_class::<store::PathStripper>()?;
+    module.add_function(wrap_pyfunction!(sqlite_ext::sqlite_extension_loaded, module)?)?;
+    module.add_function(wrap_pyfunction!(sqlite_ext::discard_job, module)?)?;
+    module.add_function(wrap_pyfunction!(certainty::stage_certainty_refresh, module)?)?;
     Ok(())
 }
