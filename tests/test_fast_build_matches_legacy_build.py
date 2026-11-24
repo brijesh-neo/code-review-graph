@@ -1,7 +1,8 @@
 """Pin the CRG_FAST_ENGINE full-build path: it must write the same graph.
 
-With ``CRG_FAST_ENGINE`` on, a full build into an empty graph writes its edges
-with the edge indexes dropped and rebuilds them once, and the postprocess
+With ``CRG_FAST_ENGINE`` on, a full build writes its edges with the edge
+indexes dropped and rebuilds them once (a rebuild over a graph that has edges
+deletes the replaced files' old rows in one pass at the end), and the postprocess
 loads the flow adjacency once for flows and communities. These tests build
 one small repository with the flag off and on and require every table, the
 schema text and each table's index list to match. They hold whether or not
@@ -230,17 +231,80 @@ def test_failing_bulk_load_puts_the_indexes_back(repo, monkeypatch):
     assert _edge_indexes(db) == expected
 
 
-def test_bulk_load_does_not_apply_to_a_graph_that_has_edges(repo, monkeypatch):
+def _rebuild_over(
+    repo: Path, monkeypatch: pytest.MonkeyPatch, seed: Path, fast: bool,
+) -> list[str]:
+    """Run a full build over a copy of the graph in *seed*; dump the result."""
+    data = repo / ".code-review-graph"
+    shutil.rmtree(data, ignore_errors=True)
+    shutil.copytree(seed, data)
+    if fast:
+        monkeypatch.setenv("CRG_FAST_ENGINE", "1")
+    else:
+        monkeypatch.delenv("CRG_FAST_ENGINE", raising=False)
+    result = build_or_update_graph(full_rebuild=True, repo_root=str(repo))
+    # "partial": the file made to fail to parse is reported.
+    assert result["status"] in {"ok", "partial"}, result
+    return _dump(data / "graph.db")
+
+
+def test_fast_rebuild_over_a_graph_writes_the_same_rows(repo, monkeypatch, tmp_path):
+    from code_review_graph.parser import CodeParser
+
+    _build(repo, monkeypatch, fast=False)
+    seed = tmp_path / "seed"
+    shutil.copytree(repo / ".code-review-graph", seed)
+    # Edit one file, delete one, add one, and make one fail to parse: the
+    # build stores no rows for it, so it keeps the edges it had.
+    with (repo / "pkg" / "util.py").open("a") as handle:
+        handle.write("\n\ndef extra():\n    return helper(3)\n")
+    (repo / "web" / "view.js").unlink()
+    (repo / "pkg" / "added.py").write_text("from .util import twice\n\n\ndef more():\n"
+                                           "    return twice(4)\n")
+    original = CodeParser.parse_bytes
+
+    def parse_bytes(self, path, source):
+        if Path(path).name == "core.py":
+            raise ValueError("simulated parse failure")
+        return original(self, path, source)
+
+    monkeypatch.setattr(CodeParser, "parse_bytes", parse_bytes)
+    applied: list[bool] = []
+    original_load = GraphStore.bulk_edge_load
+
+    @contextmanager
+    def spy(self):
+        with original_load(self) as active:
+            applied.append(active)
+            yield active
+
+    monkeypatch.setattr(GraphStore, "bulk_edge_load", spy)
+    legacy = _rebuild_over(repo, monkeypatch, seed, fast=False)
+    fast = _rebuild_over(repo, monkeypatch, seed, fast=True)
+    assert applied == [True]
+    core_edges = [
+        line for line in legacy
+        if "pkg/core.py" in line and "'CALLS'" in line
+    ]
+    assert core_edges, "the file that failed to parse should keep its old edges"
+    assert fast == legacy
+
+
+def test_bulk_load_over_a_graph_with_edges_keeps_them_and_the_indexes(repo, monkeypatch):
     _build(repo, monkeypatch, fast=False)
     db = repo / ".code-review-graph" / "graph.db"
     expected = _edge_indexes(db)
     store = GraphStore(db)
     try:
+        before = store._conn.execute("SELECT COUNT(*) FROM edges").fetchone()[0]
         with store.bulk_edge_load() as active:
-            assert active is False
-            assert _edge_indexes(db) == expected
+            assert active is True
+        # Nothing was stored, so no file's old rows were replaced.
+        assert store._conn.execute("SELECT COUNT(*) FROM edges").fetchone()[0] == before
     finally:
         store.close()
+    assert before > 0
+    assert _edge_indexes(db) == expected
 
 
 def test_fast_build_leaves_no_transaction_and_no_large_wal(repo, monkeypatch):

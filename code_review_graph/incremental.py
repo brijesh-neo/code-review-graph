@@ -3063,8 +3063,8 @@ def full_build(
             store.store_file_batch(pending)
             pending.clear()
 
-    # With the native engine on, a build into an empty graph writes its edges
-    # with the edge indexes dropped and rebuilds them once at the end.
+    # With the native engine on, a build writes its edges with the edge
+    # indexes dropped and rebuilds them once at the end.
     from .parser import fast_engine_enabled
 
     with store.bulk_edge_load() if fast_engine_enabled() else nullcontext():

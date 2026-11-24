@@ -1184,6 +1184,11 @@ class GraphStore:
         self._cache_lock = threading.Lock()
         # Files whose edges a running bulk_edge_load() has written, else None.
         self._bulk_edge_files: set[str] | None = None
+        # While a bulk load runs over a graph that already had edges: the files
+        # whose old edge rows it has replaced, committed and in the open
+        # transaction. The old rows are deleted in one pass when it ends.
+        self._bulk_replaced: set[str] | None = None
+        self._bulk_replacing: list[str] = []
         self._cache_epoch = 0
         # Identifies the read transaction currently open on this connection,
         # so a reader cannot roll back a transaction a writer took from it.
@@ -1928,23 +1933,35 @@ class GraphStore:
             self._conn.commit()
         except BaseException:
             self._conn.rollback()
+            self._bulk_replacing.clear()
             raise
+        self._bulk_committed()
         self._invalidate_cache()
+
+    def _bulk_committed(self) -> None:
+        """Count the files of a committed transaction as replaced by the bulk load."""
+        if self._bulk_replaced is not None:
+            self._bulk_replaced.update(self._bulk_replacing)
+        self._bulk_replacing.clear()
 
     @contextmanager
     def bulk_edge_load(self) -> Iterator[bool]:
         """Write a full build's edges with the edge indexes dropped, then rebuild them.
 
-        Applies only while the edges table is empty; yields whether it did.
-        Building an index once over all the rows is cheaper than updating six
-        of them on every insert. The indexes are recreated from their stored
-        statements in their original order, so the schema reads as before. A
-        process killed before that is repaired on the next open, through
-        ``_init_schema`` and :meth:`_restore_edge_indexes`.
+        Yields True. Building an index once over all the rows is cheaper than
+        updating six of them on every insert. The indexes are recreated from
+        their stored statements in their original order, so the schema reads
+        as before. A process killed before that is repaired on the next open,
+        through ``_init_schema`` and :meth:`_restore_edge_indexes`.
+
+        A rebuild over a graph that has edges keeps the old rows in place while
+        it loads (without the indexes, the per-file DELETE would scan them all
+        for every file), and when it ends deletes, in one pass, the old rows of
+        each file it stored. That leaves the rows and ids the per-file DELETE
+        would: a file the build did not store, such as one that failed to
+        parse, keeps its old edges.
         """
-        if self._conn.execute("SELECT 1 FROM edges LIMIT 1").fetchone() is not None:
-            yield False
-            return
+        old_max_id = self._conn.execute("SELECT MAX(id) FROM edges").fetchone()[0]
         indexes = self._conn.execute(
             "SELECT name, sql FROM sqlite_master WHERE type = 'index' "
             "AND tbl_name = 'edges' AND sql IS NOT NULL ORDER BY rowid"
@@ -1953,12 +1970,18 @@ class GraphStore:
             self._conn.execute(f'DROP INDEX IF EXISTS "{name}"')  # nosec B608
         self._conn.commit()
         self._bulk_edge_files = set()
+        self._bulk_replaced = set() if old_max_id is not None else None
+        self._bulk_replacing.clear()
         try:
             yield True
         finally:
             self._bulk_edge_files = None
+            replaced, self._bulk_replaced = self._bulk_replaced, None
+            self._bulk_replacing.clear()
             if self._conn.in_transaction:
                 self._conn.rollback()
+            if replaced:
+                self._delete_replaced_edges(old_max_id, replaced)
             present = {
                 row[0] for row in self._conn.execute(
                     "SELECT name FROM sqlite_master WHERE type = 'index' "
@@ -1981,8 +2004,28 @@ class GraphStore:
             self._conn.commit()
         except BaseException:
             self._conn.rollback()
+            self._bulk_replacing.clear()
             raise
+        self._bulk_committed()
         self._invalidate_cache()
+
+    def _delete_replaced_edges(self, old_max_id: int, replaced: set[str]) -> None:
+        """Delete the pre-load edge rows (id <= *old_max_id*) of the *replaced* files."""
+        self._conn.execute(
+            "CREATE TEMP TABLE IF NOT EXISTS crg_bulk_replaced (path TEXT PRIMARY KEY)"
+        )
+        self._conn.execute("DELETE FROM temp.crg_bulk_replaced")
+        self._conn.executemany(
+            "INSERT OR IGNORE INTO temp.crg_bulk_replaced (path) VALUES (?)",
+            [(path,) for path in replaced],
+        )
+        self._conn.execute(
+            "DELETE FROM edges WHERE id <= ? AND file_path IN "
+            "(SELECT path FROM temp.crg_bulk_replaced)",
+            (old_max_id,),
+        )
+        self._conn.execute("DROP TABLE temp.crg_bulk_replaced")
+        self._conn.commit()
 
     def store_file_edges(self, file_path: str, edges: list[EdgeInfo]) -> None:
         """Atomically replace a file's edges and keep its node rows.
@@ -2074,6 +2117,9 @@ class GraphStore:
             # Without the edge indexes this is a full scan, so a bulk load
             # runs it only for a file whose edges it already wrote.
             self._conn.execute("DELETE FROM edges WHERE file_path = ?", (normalized,))
+        if self._bulk_replaced is not None:
+            # Its pre-load rows go when the bulk load ends.
+            self._bulk_replacing.append(normalized)
 
         now = time.time()
         if nodes:
