@@ -179,6 +179,7 @@ class PathCodec:
         self._last_spec: tuple[Any, tuple[int, ...]] = (None, ())
         # Stored form of each recently stripped non-JSON value (see strip_params).
         self._strip_cache: dict[str, str] = {}
+        self._native_stripper: Any = None
 
     # -- inbound -------------------------------------------------------------
 
@@ -256,6 +257,20 @@ class PathCodec:
                     out[index] = stored
             return tuple(params) if out is None else tuple(out)
         return params
+
+    def native_stripper(self) -> Any:
+        """:meth:`strip_params` for row tuples in ``crg_fast``, or None without it."""
+        stripper = self._native_stripper
+        if stripper is None:
+            try:
+                import crg_fast
+            except ImportError:
+                return None
+            stripper = crg_fast.PathStripper(
+                list(self._prefixes), list(self._roots), sorted(self._leads), self.strip,
+            )
+            self._native_stripper = stripper
+        return stripper
 
     # -- outbound ------------------------------------------------------------
 

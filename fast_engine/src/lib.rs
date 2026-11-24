@@ -19,6 +19,7 @@ use tree_sitter::ffi;
 mod python_receivers;
 mod typed_calls;
 mod extract;
+mod store;
 
 const CAPSULE_NAME: &CStr = c"tree_sitter.Language";
 
@@ -324,5 +325,7 @@ fn crg_fast(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(extract::extract_walk, module)?)?;
     module.add_class::<extract::ExtractPlan>()?;
     module.add_function(wrap_pyfunction!(typed_calls::type_parameter_names, module)?)?;
+    module.add_function(wrap_pyfunction!(store::edge_rows, module)?)?;
+    module.add_class::<store::PathStripper>()?;
     Ok(())
 }

@@ -236,6 +236,25 @@ def _compatible_edge_languages(language: str) -> tuple[str, ...]:
     return (language,)
 
 
+_INSERT_EDGE_SQL = """INSERT INTO edges
+               (kind, source_qualified, target_qualified, file_path, line, extra,
+                confidence, confidence_tier, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"""
+
+
+def _native_edge_rows() -> Any:
+    """``crg_fast.edge_rows`` under ``CRG_FAST_ENGINE``, else None."""
+    from .parser import fast_engine_enabled
+
+    if not fast_engine_enabled():
+        return None
+    try:
+        import crg_fast
+    except ImportError:
+        return None
+    return getattr(crg_fast, "edge_rows", None)
+
+
 def _symbol_of(qualified_name: str) -> str:
     """Return the symbol portion of a qualified name (after the first "::").
 
@@ -2184,6 +2203,19 @@ class GraphStore:
         # plain INSERT batch is safe — the file's previous rows were
         # deleted above and an identical edge cannot come from another
         # file (file_path is part of the identity).
+        native = _native_edge_rows()
+        if native is not None:
+            conn = self._conn
+            codec = getattr(conn, "codec", None)
+            stripper = codec.native_stripper() if codec is not None else None
+            rows = native(edges if type(edges) is list else list(edges), now,
+                          json.dumps, stripper)
+            if stripper is not None:
+                # The rows are already in their stored form.
+                sqlite3.Connection.executemany(conn, _INSERT_EDGE_SQL, rows)
+            else:
+                conn.executemany(_INSERT_EDGE_SQL, rows)
+            return
         edge_by_site: dict[tuple[str, str, str, str, int, int | None], tuple] = {}
         for edge in edges:
             extra_dict = edge.extra if edge.extra else {}
@@ -2199,13 +2231,7 @@ class GraphStore:
                 edge.kind, edge.source, edge.target, edge.file_path, edge.line,
                 extra, confidence, confidence_tier, now,
             )
-        self._conn.executemany(
-            """INSERT INTO edges
-               (kind, source_qualified, target_qualified, file_path, line, extra,
-                confidence, confidence_tier, updated_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            list(edge_by_site.values()),
-        )
+        self._conn.executemany(_INSERT_EDGE_SQL, list(edge_by_site.values()))
 
     def _aligned_edges(
         self,
