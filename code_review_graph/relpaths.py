@@ -48,6 +48,8 @@ ESCAPE = "!"
 _JSON_FIRST = frozenset('{["')
 # Entries kept by PathCodec.strip_params before the cache starts over.
 _STRIP_CACHE_LIMIT = 200_000
+# JSON parameters up to this length are cached by strip_params too.
+_CACHED_JSON_MAX = 256
 # A JSON string opens after one of these (``json.dumps`` output) or at the
 # start of the value; a quote anywhere else is inside a string.
 _JSON_STRING_START = r'(?:^|(?<=[{\[,:\s]))"'
@@ -222,22 +224,37 @@ class PathCodec:
             }
         if isinstance(params, (tuple, list)):
             # A batch repeats the same paths and names row after row, so each
-            # stored form is worked out once. JSON text is rarely repeated and
-            # is left out of the cache.
+            # stored form is worked out once, and a string that needs nothing
+            # is remembered as itself. Long JSON text is rarely repeated and is
+            # left out of the cache; short metadata such as ``{}`` repeats.
             cache = self._strip_cache
             if len(cache) > _STRIP_CACHE_LIMIT:
                 cache.clear()
-            out = []
-            for v in params:
-                if isinstance(v, str) and v[:1] in leads:
-                    stored = cache.get(v)
+            get = cache.get
+            out: Optional[list] = None
+            for index, v in enumerate(params):
+                if type(v) is not str:
+                    if not isinstance(v, str):
+                        continue
+                    # A str subclass: the plain path, which never caches it.
+                    if v[:1] not in leads:
+                        continue
+                    stored = strip(v)
+                else:
+                    stored = get(v)
                     if stored is None:
-                        stored = strip(v)
-                        if v[:1] not in _JSON_FIRST:
+                        first = v[:1]
+                        if first not in leads:
+                            stored = v
+                        else:
+                            stored = strip(v)
+                        if first not in _JSON_FIRST or len(v) <= _CACHED_JSON_MAX:
                             cache[v] = stored
-                    v = stored
-                out.append(v)
-            return tuple(out)
+                if stored is not v:
+                    if out is None:
+                        out = list(params)
+                    out[index] = stored
+            return tuple(params) if out is None else tuple(out)
         return params
 
     # -- outbound ------------------------------------------------------------
