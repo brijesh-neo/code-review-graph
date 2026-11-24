@@ -102,6 +102,21 @@ _PYTHON_STAR_EXPORT_CYCLE_CUTS = [0]
 # once. See :meth:`CodeParser._python_module_alias`.
 _PYTHON_MODULE_ALIAS_CACHE: dict[tuple[str, int, int], Optional[str]] = {}
 _PYTHON_MODULE_ALIAS_CACHE_LOCK = threading.Lock()
+# Under CRG_FAST_ENGINE, a cheap test before ``ast.parse`` in
+# ``_read_python_module_alias``. Importers only follow a swap written as a
+# module-level statement, and a module-level statement starts a logical line
+# at column 0 (or follows ``;``), possibly after backslash continuations or
+# inside parentheses opened there. Spaces before it are an indent, which only
+# a nested statement has, unless ``;`` or a continuation comes first. A
+# file with no ``sys.modules`` in such a place holds no swap to follow. The
+# test only skips the parse, so a file it keeps is still decided by ``ast``.
+_LINE_CONTINUATION = rb"\\(?:\r\n|\r|\n)"
+_TOP_LEVEL_SYS_MODULES_RE = re.compile(
+    rb"(?:^(?:\xef\xbb\xbf)?\f*|(?<=\r)\f*|;[ \t\f]*)"
+    rb"(?:" + _LINE_CONTINUATION + rb"[ \t\f]*)*"
+    rb"(?:\((?:\s|" + _LINE_CONTINUATION + rb"|#[^\r\n]*)*)*sys\.modules",
+    re.MULTILINE,
+)
 
 # ``{module file: {top-level def name: return annotation text}}``, keyed by
 # the module's mtime and size the way the star-export cache is. Only the text
@@ -20898,6 +20913,8 @@ class CodeParser:
             except OSError:
                 return None
         if b"sys.modules" not in source or b"import_module" not in source:
+            return None
+        if fast_engine_enabled() and not _TOP_LEVEL_SYS_MODULES_RE.search(source):
             return None
         try:
             tree = ast.parse(source)
