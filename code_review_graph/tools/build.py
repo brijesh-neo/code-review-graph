@@ -292,6 +292,8 @@ def _run_postprocess(
     )
 
     # Resolve bare and C++ scoped call targets before derived graph steps.
+    # A capture started by the update ends here, before the writes below.
+    scoped = store.end_change_capture()
     if not skip_resolvers:
         try:
             if noop_incremental and not store.get_nodes_without_signature():
@@ -299,8 +301,11 @@ def _run_postprocess(
                 build_result["cpp_scoped_edges_resolved"] = 0
             else:
                 noop_incremental = False
-                resolved = store.resolve_bare_call_targets()
-                resolved += store.resolve_bare_tested_by_sources()
+                try:
+                    resolved = store.resolve_bare_call_targets(scoped=scoped)
+                    resolved += store.resolve_bare_tested_by_sources(scoped=scoped)
+                finally:
+                    store.drop_change_scope()
                 build_result["bare_edges_resolved"] = resolved
                 build_result["cpp_scoped_edges_resolved"] = (
                     store.resolve_cpp_scoped_call_targets()
@@ -314,6 +319,8 @@ def _run_postprocess(
             warnings.append(
                 f"Call-target resolution failed: {type(e).__name__}: {e}"
             )
+    if scoped:
+        store.drop_change_scope()
 
     # -- Signatures + FTS (fast, always run unless "none") --
     timing: dict[str, float] = {}
@@ -639,6 +646,16 @@ def build_or_update_graph(
             if recovery_reason is not None:
                 build_result["recovery_reason"] = recovery_reason
         else:
+            from code_review_graph.parser import fast_engine_enabled
+
+            if (
+                fast_engine_enabled()
+                and previous_state == BUILD_COMPLETE
+                and store.get_metadata("postprocess_level") in ("full", "minimal")
+            ):
+                # The graph is at the resolvers' fixed point, so the bare
+                # pass after this update only has to revisit what it changes.
+                store.begin_change_capture()
             try:
                 result = incremental_update(
                     root, store, base=base_resolved, enrich=enrich,

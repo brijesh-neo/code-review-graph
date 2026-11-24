@@ -3690,7 +3690,7 @@ class GraphStore:
             edge_extra, node.qualified_name, node.file_path, node.parent_name,
         )
 
-    def resolve_bare_call_targets(self) -> int:
+    def resolve_bare_call_targets(self, *, scoped: bool = False) -> int:
         """Resolve bare CALLS targets backed by same-file or import evidence.
 
         After parsing, some CALLS edges have bare targets (no ``::`` separator)
@@ -3705,7 +3705,7 @@ class GraphStore:
         # context. Fill it fresh here so a write that bypassed the store's
         # invalidation (a resolver using the raw connection) is never missed.
         self._drop_bare_endpoint_context()
-        return self._resolve_bare_endpoints("CALLS", "target_qualified")
+        return self._resolve_bare_endpoints("CALLS", "target_qualified", scoped=scoped)
 
     # -- Target-resolution certainty --------------------------------------
 
@@ -4261,7 +4261,7 @@ class GraphStore:
                 raise
         return resolved
 
-    def resolve_bare_tested_by_sources(self) -> int:
+    def resolve_bare_tested_by_sources(self, *, scoped: bool = False) -> int:
         """Resolve bare TESTED_BY sources backed by graph evidence.
 
         TESTED_BY edges copy the target of a test's CALLS edge, so unresolved
@@ -4272,7 +4272,9 @@ class GraphStore:
         Returns the number of resolved edges.
         """
         try:
-            return self._resolve_bare_endpoints("TESTED_BY", "source_qualified")
+            return self._resolve_bare_endpoints(
+                "TESTED_BY", "source_qualified", scoped=scoped,
+            )
         finally:
             # The pair is done: do not keep a copy of every node name alive
             # for the rest of the store's life (watch mode keeps one open).
@@ -4282,6 +4284,189 @@ class GraphStore:
         with self._cache_lock:
             self._cache_epoch += 1
             self._bare_endpoint_context_cache = None
+
+    # -- Change capture for a scoped bare-endpoint pass ---------------------
+    #
+    # An update that starts from a complete graph starts from a fixed point of
+    # the bare-endpoint pass: running it again writes nothing. What that pass
+    # decides for one edge depends on the edge row itself, on the Function,
+    # Test and Class nodes that share the bare name or are the caller, on
+    # Class and File nodes, and on the IMPORTS_FROM and INHERITS edges. So
+    # after an update only the edges that touch something that changed can
+    # get a different answer. The capture records those changes in TEMP
+    # tables, which live in this connection alone: nothing is stored in the
+    # graph. Any change to Class or File nodes, or to import or inheritance
+    # edges, can move answers far away, and then the pass runs in full.
+
+    _CAPTURE_TRIGGERS = (
+        "crg_cap_node_ins", "crg_cap_node_del", "crg_cap_node_upd",
+        "crg_cap_edge_del", "crg_cap_edge_upd",
+    )
+    _NODE_KINDS_SQL = "('Function', 'Test', 'Class', 'File')"
+    _SHAPE_EDGE_KINDS_SQL = "('IMPORTS_FROM', 'INHERITS')"
+
+    @staticmethod
+    def _node_log_row(ref: str, sign: int) -> str:
+        return (
+            f"INSERT INTO temp.crg_change_log SELECT 'n', {sign}, {ref}.id, "
+            f"{ref}.kind, {ref}.name, {ref}.qualified_name, {ref}.file_path, "
+            f"{ref}.parent_name, {ref}.language, CASE WHEN {ref}.kind IN "
+            f"('Class', 'File') THEN {ref}.extra END "
+        )
+
+    @staticmethod
+    def _edge_log_row(ref: str, sign: int) -> str:
+        return (
+            f"INSERT INTO temp.crg_change_log SELECT 'e', {sign}, {ref}.id, "
+            f"{ref}.kind, {ref}.source_qualified, {ref}.target_qualified, "
+            f"{ref}.file_path, CASE WHEN {ref}.kind IN "
+            f"{GraphStore._SHAPE_EDGE_KINDS_SQL} THEN {ref}.extra END, NULL, NULL "
+        )
+
+    def begin_change_capture(self) -> bool:
+        """Start recording node and edge changes on this connection."""
+        conn = self._conn
+        nodes = self._NODE_KINDS_SQL
+        shape = self._SHAPE_EDGE_KINDS_SQL
+        resolved = "('CALLS', 'TESTED_BY', 'IMPORTS_FROM', 'INHERITS')"
+        node_cols = "kind, name, qualified_name, file_path, parent_name, language, extra"
+        edge_cols = "kind, source_qualified, target_qualified, file_path, extra"
+        # ``edges.id`` is AUTOINCREMENT, so every edge inserted from here on
+        # has an id above the sequence's current value. Triggers take no
+        # parameters; the floor is an int read from the database.
+        try:
+            row = conn.execute(
+                "SELECT seq FROM sqlite_sequence WHERE name = 'edges'"
+            ).fetchone()
+        except sqlite3.Error as exc:
+            logger.debug("Change capture unavailable: %s", exc)
+            return False
+        floor = int(row[0]) if row else 0
+        self._capture_edge_floor = floor
+        statements = [
+            "CREATE TEMP TABLE IF NOT EXISTS crg_change_log ("
+            "tbl TEXT, sign INTEGER, row_id INTEGER, kind TEXT, "
+            "a TEXT, b TEXT, c TEXT, d TEXT, e TEXT, f TEXT)",
+            "DELETE FROM temp.crg_change_log",
+            f"CREATE TEMP TRIGGER IF NOT EXISTS crg_cap_node_ins AFTER INSERT ON main.nodes "
+            f"WHEN NEW.kind IN {nodes} BEGIN {self._node_log_row('NEW', 1)}; END",
+            f"CREATE TEMP TRIGGER IF NOT EXISTS crg_cap_node_del AFTER DELETE ON main.nodes "
+            f"WHEN OLD.kind IN {nodes} BEGIN {self._node_log_row('OLD', -1)}; END",
+            f"CREATE TEMP TRIGGER IF NOT EXISTS crg_cap_node_upd AFTER UPDATE OF "
+            f"{node_cols} ON main.nodes "
+            f"WHEN OLD.kind IN {nodes} OR NEW.kind IN {nodes} BEGIN "
+            f"{self._node_log_row('OLD', -1)} WHERE OLD.kind IN {nodes}; "
+            f"{self._node_log_row('NEW', 1)} WHERE NEW.kind IN {nodes}; END",
+            # An AFTER INSERT trigger on edges slows the bulk insert about
+            # sixfold, so new edges (ids above the floor) are read at the end
+            # instead, and these triggers only see rows that existed before.
+            f"CREATE TEMP TRIGGER IF NOT EXISTS crg_cap_edge_del AFTER DELETE ON main.edges "
+            f"WHEN OLD.id <= {floor} AND OLD.kind IN {shape} "
+            f"BEGIN {self._edge_log_row('OLD', -1)}; END",
+            f"CREATE TEMP TRIGGER IF NOT EXISTS crg_cap_edge_upd AFTER UPDATE OF "
+            f"{edge_cols} ON main.edges "
+            f"WHEN OLD.id <= {floor} AND (OLD.kind IN {resolved} OR NEW.kind IN {resolved}) "
+            f"BEGIN {self._edge_log_row('OLD', -1)} WHERE OLD.kind IN {shape}; "
+            f"{self._edge_log_row('NEW', 1)}; END",
+        ]
+        try:
+            for statement in statements:
+                conn.execute(statement)
+        except sqlite3.Error as exc:
+            logger.debug("Change capture unavailable: %s", exc)
+            self.end_change_capture()
+            return False
+        self._change_capture_active = True
+        return True
+
+    def end_change_capture(self) -> bool:
+        """Stop recording; prepare the dirty sets when a scoped pass is safe.
+
+        Returns True when ``resolve_bare_*(scoped=True)`` may be used, until
+        :meth:`drop_change_scope` is called.
+        """
+        conn = self._conn
+        active = getattr(self, "_change_capture_active", False)
+        self._change_capture_active = False
+        scoped = False
+        try:
+            for trigger in self._CAPTURE_TRIGGERS:
+                conn.execute(f"DROP TRIGGER IF EXISTS temp.{trigger}")
+            if active:
+                scoped = self._prepare_change_scope(conn)
+            conn.execute("DROP TABLE IF EXISTS temp.crg_change_log")
+        except sqlite3.Error as exc:
+            logger.debug("Change capture could not be read: %s", exc)
+            scoped = False
+        if not scoped:
+            self.drop_change_scope()
+        return scoped
+
+    def _prepare_change_scope(self, conn: sqlite3.Connection) -> bool:
+        shape = self._SHAPE_EDGE_KINDS_SQL
+        conn.execute(
+            "INSERT INTO temp.crg_change_log SELECT 'e', 1, id, kind, "
+            "source_qualified, target_qualified, file_path, extra, NULL, NULL "
+            f"FROM main.edges WHERE id > ? AND kind IN {shape}",
+            (self._capture_edge_floor,),
+        )
+        # Rows that left and came back unchanged (a reparsed file) cancel out.
+        moved = conn.execute(
+            "SELECT 1 FROM ("
+            "SELECT 1 FROM temp.crg_change_log WHERE tbl = 'n' "
+            "AND kind IN ('Class', 'File') "
+            "GROUP BY kind, a, b, c, d, e, f HAVING SUM(sign) != 0 "
+            "UNION ALL "
+            "SELECT 1 FROM temp.crg_change_log WHERE tbl = 'e' "
+            f"AND kind IN {shape} "
+            "GROUP BY kind, a, b, c, d HAVING SUM(sign) != 0"
+            ") LIMIT 1"
+        ).fetchone()
+        if moved is not None:
+            return False
+        conn.execute(
+            "CREATE TEMP TABLE IF NOT EXISTS crg_dirty_name (name TEXT PRIMARY KEY)"
+        )
+        conn.execute(
+            "CREATE TEMP TABLE IF NOT EXISTS crg_dirty_qn (qn TEXT PRIMARY KEY)"
+        )
+        conn.execute(
+            "CREATE TEMP TABLE IF NOT EXISTS crg_dirty_edge (id INTEGER PRIMARY KEY)"
+        )
+        for table in ("crg_dirty_name", "crg_dirty_qn", "crg_dirty_edge"):
+            conn.execute(f"DELETE FROM temp.{table}")
+        changed = conn.execute(
+            "SELECT a, b FROM temp.crg_change_log WHERE tbl = 'n' "
+            "AND kind IN ('Function', 'Test') "
+            "GROUP BY kind, a, b, c, d, e, f HAVING SUM(sign) != 0"
+        ).fetchall()
+        names = {row[0] for row in changed if row[0] is not None}
+        if "initialize" in names:
+            # ``Shop::Cart.new`` is looked up as ``initialize``.
+            names.add("new")
+        conn.executemany(
+            "INSERT OR IGNORE INTO temp.crg_dirty_name VALUES (?)",
+            [(name,) for name in names],
+        )
+        conn.executemany(
+            "INSERT OR IGNORE INTO temp.crg_dirty_qn VALUES (?)",
+            [(row[1],) for row in changed if row[1] is not None],
+        )
+        conn.execute(
+            "INSERT OR IGNORE INTO temp.crg_dirty_edge "
+            "SELECT row_id FROM temp.crg_change_log WHERE tbl = 'e' AND sign = 1 "
+            "AND kind IN ('CALLS', 'TESTED_BY')"
+        )
+        self._scope_edge_floor = self._capture_edge_floor
+        return True
+
+    def drop_change_scope(self) -> None:
+        """Forget the dirty sets of the last capture."""
+        for table in ("crg_dirty_name", "crg_dirty_qn", "crg_dirty_edge"):
+            try:
+                self._conn.execute(f"DROP TABLE IF EXISTS temp.{table}")
+            except sqlite3.Error as exc:  # pragma: no cover - defensive
+                logger.debug("Could not drop %s: %s", table, exc)
 
     @staticmethod
     def _directory_member_files(
@@ -4485,8 +4670,14 @@ class GraphStore:
                 self._bare_endpoint_context_cache = result
         return result
 
-    def _resolve_bare_endpoints(self, kind: str, endpoint: str) -> int:
-        """Resolve a bare edge endpoint only when one candidate has evidence."""
+    def _resolve_bare_endpoints(
+        self, kind: str, endpoint: str, *, scoped: bool = False,
+    ) -> int:
+        """Resolve a bare edge endpoint only when one candidate has evidence.
+
+        *scoped* reads only the edges the last change capture can have moved
+        (see :meth:`end_change_capture`); the rest are already at the answer.
+        """
         if endpoint == "target_qualified":
             raw_key = "bare_call_target"
             endpoint_column = "target_qualified"
@@ -4537,9 +4728,26 @@ class GraphStore:
             raw_imports,
         ) = self._get_bare_endpoint_context(conn)
 
+        if scoped:
+            caller_col = (
+                "source_qualified" if endpoint == "target_qualified" else "target_qualified"
+            )
+            select_sql += (
+                " AND (id > ?"
+                " OR id IN (SELECT id FROM temp.crg_dirty_edge)"
+                f" OR {endpoint_column} IN (SELECT name FROM temp.crg_dirty_name)"
+                f" OR {caller_col} IN (SELECT qn FROM temp.crg_dirty_qn)"
+                f" OR (extra LIKE '%\"{raw_key}\"%' AND CASE WHEN json_valid(extra)"
+                f" THEN json_extract(extra, '$.{raw_key}') END"
+                " IN (SELECT name FROM temp.crg_dirty_name)))"
+            )
+
         # Stream candidate rows lazily instead of materialising the full set
         # into memory (millions of rows on large graphs, issue #721).
-        bare_edges = conn.execute(select_sql, (kind,))
+        params: tuple[object, ...] = (kind,)
+        if scoped:
+            params = (kind, self._scope_edge_floor)
+        bare_edges = conn.execute(select_sql, params)
         inheritance = InheritanceIndex(conn, import_targets, raw_imports)
         # The function making the call: the edge's source for CALLS, and its
         # target for TESTED_BY, whose source is the callee.
