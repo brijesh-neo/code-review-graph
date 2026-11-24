@@ -2897,6 +2897,10 @@ def _prewarm_parser_probes(parser: Any, rel_paths: list[str]) -> None:
     ]
     if not unprobed:
         return
+    if len(unprobed) > 1 and parser_mod.fast_engine_enabled():
+        unprobed = _batch_probe_grammars(parser_mod, unprobed)
+        if not unprobed:
+            return
     if len(unprobed) == 1:
         probe_fn(unprobed[0])
         return
@@ -2904,6 +2908,62 @@ def _prewarm_parser_probes(parser: Any, rel_paths: list[str]) -> None:
         max_workers=min(len(unprobed), _MAX_PARSE_WORKERS)
     ) as pool:
         list(pool.map(probe_fn, unprobed))
+
+
+_BATCH_PROBE_CODE = (
+    "from tree_sitter_language_pack import get_parser\n"
+    "import sys\n"
+    "for grammar in sys.argv[1:]:\n"
+    "    try:\n"
+    "        get_parser(grammar)\n"
+    "    except Exception:\n"
+    "        continue\n"
+    "    print(grammar, flush=True)\n"
+)
+
+
+def _batch_probe_grammars(parser_mod: Any, grammars: list[str]) -> list[str]:
+    """Probe *grammars* in one child process; return the ones still unprobed.
+
+    Used with ``CRG_FAST_ENGINE``. A process per grammar costs an interpreter
+    start each. One child loads them all in turn and prints each grammar that
+    loads. Only those are recorded. A grammar that fails, crashes the child, or
+    is not reached before the timeout is returned, so it still gets its own
+    probe with its own failure detail and warning.
+    """
+    probe = getattr(parser_mod, "_run_parser_load_probe", None)
+    if getattr(probe, "__qualname__", "") != "_run_parser_load_probe":
+        # A replaced probe (tests) decides each grammar itself.
+        return grammars
+    try:
+        completed = subprocess.run(
+            [sys.executable, "-c", _BATCH_PROBE_CODE, *grammars],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            timeout=parser_mod._parser_load_timeout_seconds(),
+            check=False,
+            env=parser_mod._parser_probe_env(),
+        )
+        output = completed.stdout
+    except subprocess.TimeoutExpired as exc:
+        output = exc.stdout or b""
+    except OSError as exc:
+        logger.debug("batched grammar probe failed: %s", exc)
+        return grammars
+    if isinstance(output, str):
+        output = output.encode()
+    lines = output.decode("utf-8", errors="replace").split("\n")
+    # The last line is complete only when it ends in a newline.
+    loaded = set(lines[:-1]) & set(grammars)
+    if not loaded:
+        return grammars
+    with parser_mod._PARSER_PROBE_LOCK:
+        for grammar in loaded:
+            if parser_mod._PARSER_PROBE_RESULTS.get(grammar) is None:
+                parser_mod._PARSER_PROBE_RESULTS[grammar] = True
+                parser_mod._PARSER_PROBE_FAILURE_DETAILS.pop(grammar, None)
+    return [grammar for grammar in grammars if grammar not in loaded]
 
 
 class DependentList(list):
