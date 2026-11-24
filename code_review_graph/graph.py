@@ -2338,7 +2338,13 @@ class GraphStore:
             # native pass returns each edge whose endpoints all stay as they
             # are and hands every other one to the same Python call.
             if collisions:
-                edges = [self._align_edge_with_collisions(edge, collisions) for edge in edges]
+                # An edge with neither endpoint among the collisions is
+                # returned as it is, so only the others are aligned.
+                edges = [
+                    edge if edge.source not in collisions and edge.target not in collisions
+                    else self._align_edge_with_collisions(edge, collisions)
+                    for edge in edges
+                ]
             return native(
                 edges if type(edges) is list else list(edges), local_prefix, cache,
                 self._stored_identity_candidates, self._resolve_edge_identities,

@@ -200,7 +200,7 @@ pub fn edge_rows<'py>(
                 .call1((get.call1((intern!(py, "confidence"), &default_confidence))?,))?;
             let tier = str_type
                 .call1((get.call1((intern!(py, "confidence_tier"), default_tier))?,))?;
-            let extra = dumps.call1((&raw_extra,))?;
+            let extra = crate::json::dumps_or(py, &raw_extra, dumps)?;
             let offset = get.call1((intern!(py, "source_offset"),))?;
             (confidence, tier, extra, offset)
         } else {

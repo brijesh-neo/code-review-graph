@@ -25,6 +25,7 @@ mod certainty;
 mod restore;
 mod identities;
 mod node_rows;
+mod json;
 
 const CAPSULE_NAME: &CStr = c"tree_sitter.Language";
 
@@ -335,6 +336,7 @@ fn crg_fast(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<restore::RowRestorer>()?;
     module.add_function(wrap_pyfunction!(identities::settle_edges, module)?)?;
     module.add_function(wrap_pyfunction!(node_rows::node_rows, module)?)?;
+    module.add_function(wrap_pyfunction!(json::json_dumps, module)?)?;
     module.add_function(wrap_pyfunction!(sqlite_ext::sqlite_extension_loaded, module)?)?;
     module.add_function(wrap_pyfunction!(sqlite_ext::discard_job, module)?)?;
     module.add_function(wrap_pyfunction!(certainty::stage_certainty_refresh, module)?)?;

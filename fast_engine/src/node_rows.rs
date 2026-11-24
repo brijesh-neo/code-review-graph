@@ -201,7 +201,7 @@ fn native_row<'py>(
             },
             None => none.clone(),
         };
-        (dumps.call1((&extra,))?, docstring)
+        (crate::json::dumps_or(py, &extra, dumps)?, docstring)
     };
 
     let token_name = if kind_s == "File" { "" } else { name_s };
