@@ -32,6 +32,7 @@ try:
 except ModuleNotFoundError:  # pragma: no cover - Python 3.10
     import tomli as tomllib  # type: ignore[import-not-found,no-redef]
 
+from . import fast_parser
 from .config_keys import is_spring_config_path, normalize_spring_config_key
 from .constants import (
     IMPORT_CONTEXT_DEFERRED,
@@ -89,6 +90,11 @@ _DBT_REF_RE = re.compile(
 _PYTHON_STAR_CACHE_MAX = 15_000
 _PYTHON_STAR_EXPORT_CACHE: dict[tuple[str, int, int], dict[str, str]] = {}
 _PYTHON_STAR_EXPORT_CACHE_LOCK = threading.RLock()
+# Star-export cache keys whose exports were computed across an import cycle.
+# Such an answer depends on which module of the cycle was read first, so
+# :func:`python_module_cache_entries` never hands it to another process.
+_PYTHON_STAR_EXPORT_CYCLE_KEYS: set[tuple[str, int, int]] = set()
+_PYTHON_STAR_EXPORT_CYCLE_CUTS = [0]
 
 # ``{(module file, mtime, size): dotted module it installs as
 # sys.modules[__name__], or None}``. Process-wide like the star-export cache,
@@ -206,42 +212,52 @@ def _load_cargo_manifest(path: Path) -> dict[str, Any]:
     return _read_cargo_manifest(str(resolved), stat.st_mtime_ns, stat.st_size)
 
 
-class _PythonScopeBindingVisitor(ast.NodeVisitor):
-    """Collect names bound in one Python lexical scope."""
+class _PythonScopeBindingVisitor:
+    """Collect names bound in one Python lexical scope.
+
+    A name stored or deleted, a function or class defined, an import, or a
+    ``global`` statement binds a name. Nested functions, classes and lambdas
+    are their own scopes: their name counts, their bodies do not. The walk is
+    a plain loop rather than an ``ast.NodeVisitor`` because it runs over every
+    function body of every Python file during a build.
+    """
 
     def __init__(self) -> None:
         self.names: set[str] = set()
 
-    def visit_Name(self, node: ast.Name) -> None:  # noqa: N802
-        if isinstance(node.ctx, (ast.Store, ast.Del)):
-            self.names.add(node.id)
+    def visit(self, node: ast.AST) -> None:
+        names = self.names
+        stack: list[Any] = [node]  # checked by exact type below
+        while stack:
+            current = stack.pop()
+            kind = type(current)
+            if kind is ast.Name:
+                if isinstance(current.ctx, (ast.Store, ast.Del)):
+                    names.add(current.id)
+            elif kind in (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef):
+                names.add(current.name)
+            elif kind is ast.Lambda:
+                continue
+            elif kind is ast.Import:
+                for alias in current.names:
+                    names.add(alias.asname or alias.name.split(".", 1)[0])
+            elif kind is ast.ImportFrom:
+                for alias in current.names:
+                    if alias.name != "*":
+                        names.add(alias.asname or alias.name)
+            elif kind is ast.Global:
+                names.update(current.names)
+            else:
+                for field_name in current._fields:
+                    value = getattr(current, field_name, None)
+                    if isinstance(value, list):
+                        stack.extend(item for item in value if isinstance(item, ast.AST))
+                    elif isinstance(value, ast.AST):
+                        stack.append(value)
 
-    def visit_FunctionDef(self, node: ast.FunctionDef) -> None:  # noqa: N802
-        self.names.add(node.name)
 
-    def visit_AsyncFunctionDef(  # noqa: N802
-        self,
-        node: ast.AsyncFunctionDef,
-    ) -> None:
-        self.names.add(node.name)
+_PY_STATEMENT_HOLDERS = (ast.stmt, ast.excepthandler, ast.match_case)
 
-    def visit_ClassDef(self, node: ast.ClassDef) -> None:  # noqa: N802
-        self.names.add(node.name)
-
-    def visit_Lambda(self, node: ast.Lambda) -> None:  # noqa: N802
-        return
-
-    def visit_Import(self, node: ast.Import) -> None:  # noqa: N802
-        for alias in node.names:
-            self.names.add(alias.asname or alias.name.split(".", 1)[0])
-
-    def visit_ImportFrom(self, node: ast.ImportFrom) -> None:  # noqa: N802
-        for alias in node.names:
-            if alias.name != "*":
-                self.names.add(alias.asname or alias.name)
-
-    def visit_Global(self, node: ast.Global) -> None:  # noqa: N802
-        self.names.update(node.names)
 
 @lru_cache(maxsize=4)
 def _python_module_ast(source: bytes) -> Optional[ast.Module]:
@@ -259,15 +275,29 @@ def _python_module_ast(source: bytes) -> Optional[ast.Module]:
 
 def _python_function_scope_bindings(
     source: bytes,
-) -> dict[tuple[int, int], tuple[frozenset[str], frozenset[str]]]:
-    """Return parameter and local names for each Python function position."""
+) -> dict[tuple[int, int], tuple[frozenset[str], ast.AST]]:
+    """Return parameter names and the ``def`` node for each Python function position.
+
+    The local names are left to ``_python_function_local_names``: only a
+    closure that still sees a receiver needs them, and scanning every body
+    for them was the costliest step of the receiver walk.
+    """
     tree = _python_module_ast(source)
     if tree is None:
         return {}
-    scopes: dict[
-        tuple[int, int], tuple[frozenset[str], frozenset[str]],
-    ] = {}
-    for node in ast.walk(tree):
+    scopes: dict[tuple[int, int], tuple[frozenset[str], ast.AST]] = {}
+    # A ``def`` is a statement, and statements only sit in the statement
+    # lists of other statements, handlers and match cases, so the search
+    # skips every expression.
+    stack: list[ast.AST] = [tree]
+    while stack:
+        node = stack.pop()
+        for field_name in node._fields:
+            value = getattr(node, field_name, None)
+            if isinstance(value, list):
+                stack.extend(
+                    item for item in value if isinstance(item, _PY_STATEMENT_HOLDERS)
+                )
         if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
             continue
         arguments = node.args
@@ -283,14 +313,19 @@ def _python_function_scope_bindings(
             parameter_names.add(arguments.vararg.arg)
         if arguments.kwarg is not None:
             parameter_names.add(arguments.kwarg.arg)
-        bindings = _PythonScopeBindingVisitor()
-        for statement in node.body:
-            bindings.visit(statement)
-        bindings.names.update(parameter_names)
-        scopes[(node.lineno, node.col_offset)] = (
-            frozenset(parameter_names), frozenset(bindings.names),
-        )
+        scopes[(node.lineno, node.col_offset)] = (frozenset(parameter_names), node)
     return scopes
+
+
+def _python_function_local_names(
+    node: ast.AST, parameter_names: frozenset[str],
+) -> frozenset[str]:
+    """Return the names a Python function binds: its parameters and body bindings."""
+    bindings = _PythonScopeBindingVisitor()
+    for statement in getattr(node, "body", ()):
+        bindings.visit(statement)
+    bindings.names.update(parameter_names)
+    return frozenset(bindings.names)
 
 
 def _python_type_checking_aliases(
@@ -948,6 +983,80 @@ def _mark_parser_unavailable(grammar: str) -> None:
         _PARSER_PROBE_RESULTS[grammar] = False
 
 
+def parser_probe_results() -> dict[str, bool]:
+    """A copy of this process's grammar probe results."""
+    with _PARSER_PROBE_LOCK:
+        return dict(_PARSER_PROBE_RESULTS)
+
+
+def seed_parser_probe_results(results: dict[str, bool]) -> None:
+    """Take probe results another process already has, so this one skips them.
+
+    A spawned parse worker starts with an empty cache and would otherwise
+    start one interpreter per grammar again, for every grammar, in every
+    worker.
+    """
+    with _PARSER_PROBE_LOCK:
+        for grammar, result in results.items():
+            _PARSER_PROBE_RESULTS.setdefault(grammar, result)
+
+
+
+def _python_module_caches() -> tuple[tuple[str, dict, Any], ...]:
+    return (
+        ("star", _PYTHON_STAR_EXPORT_CACHE, _PYTHON_STAR_EXPORT_CACHE_LOCK),
+        ("alias", _PYTHON_MODULE_ALIAS_CACHE, _PYTHON_MODULE_ALIAS_CACHE_LOCK),
+        ("returns", _PYTHON_RETURN_ANNOTATION_CACHE, _PYTHON_RETURN_ANNOTATION_CACHE_LOCK),
+        (
+            "properties", _PYTHON_PROPERTY_RETURN_ANNOTATION_CACHE,
+            _PYTHON_RETURN_ANNOTATION_CACHE_LOCK,
+        ),
+        (
+            "classes", _PYTHON_MODULE_CLASS_IDENTITY_CACHE,
+            _PYTHON_MODULE_CLASS_IDENTITY_CACHE_LOCK,
+        ),
+    )
+
+
+def python_module_cache_entries(skip: set) -> list[tuple[str, tuple, Any]]:
+    """Entries of the process-wide Python module caches not named in *skip*.
+
+    Each entry is ``(cache name, key, value)`` and is added to *skip*. Every
+    entry is a function of the module file it is keyed by, so another parse
+    process can install it with :func:`seed_python_module_caches` and read
+    the same answer it would have computed. Star exports computed across an
+    import cycle are left out: they depend on the order the cycle was read.
+    """
+    entries: list[tuple[str, tuple, Any]] = []
+    for name, cache, lock in _python_module_caches():
+        with lock:
+            for key, value in cache.items():
+                if (name, key) in skip:
+                    continue
+                if name == "star" and key in _PYTHON_STAR_EXPORT_CYCLE_KEYS:
+                    continue
+                skip.add((name, key))
+                entries.append((name, key, value))
+    return entries
+
+
+def seed_python_module_caches(entries: list[tuple[str, tuple, Any]], skip: set) -> None:
+    """Install entries from :func:`python_module_cache_entries` of another process.
+
+    A key this process already holds keeps its own value. Installed keys are
+    added to *skip* so they are not sent back.
+    """
+    if not entries:
+        return
+    caches = {name: (cache, lock) for name, cache, lock in _python_module_caches()}
+    for name, key, value in entries:
+        skip.add((name, key))
+        cache, lock = caches[name]
+        with lock:
+            if key not in cache and len(cache) < _PYTHON_STAR_CACHE_MAX:
+                cache[key] = value
+
+
 def _clear_parser_probe_cache() -> None:
     """Clear process-level probe state (used by focused tests)."""
     with _PARSER_PROBE_LOCK:
@@ -956,12 +1065,48 @@ def _clear_parser_probe_cache() -> None:
         _PARSER_PROBE_GRAMMAR_LOCKS.clear()
 
 
+# Grammars the native engine (``CRG_FAST_ENGINE=1``) parses. Others,
+# and every grammar when the ``crg_fast`` module is not installed, use the
+# py-tree-sitter parser.
+_FAST_ENGINE_GRAMMARS = frozenset({"python", "javascript", "typescript", "tsx"})
+
+
+def fast_engine_enabled() -> bool:
+    """True when ``CRG_FAST_ENGINE`` turns the native engine on (off by default)."""
+    value = os.environ.get("CRG_FAST_ENGINE", "").strip().lower()
+    return value in {"1", "true", "yes", "on"}
+
+
+def _fast_engine_parser(language_pack, grammar: str):
+    """The native engine's parser for *grammar*, or None to use the default.
+
+    It parses with the grammar the language pack ships (the same compiled
+    ``TSLanguage``), so both engines see identical trees.
+    """
+    if grammar not in _FAST_ENGINE_GRAMMARS:
+        return None
+    if not fast_engine_enabled():
+        return None
+    try:
+        crg_fast = importlib.import_module("crg_fast")
+    except ImportError:
+        logger.debug("CRG_FAST_ENGINE is on but crg_fast is not installed")
+        return None
+    get_binding = getattr(language_pack, "get_binding", None)
+    if get_binding is None:
+        return None
+    return crg_fast.Parser(get_binding(grammar))
+
+
 def _load_tree_sitter_parser(grammar: str):
     """Load a probed grammar, suppressing only known availability errors."""
     if not _parser_load_probe_succeeds(grammar):
         return None
     try:
         language_pack = importlib.import_module("tree_sitter_language_pack")
+        fast = _fast_engine_parser(language_pack, grammar)
+        if fast is not None:
+            return fast
         return language_pack.get_parser(grammar)  # type: ignore[attr-defined]
     except _EXPECTED_PARSER_LOAD_ERRORS as exc:
         _mark_parser_unavailable(grammar)
@@ -3989,6 +4134,7 @@ class CodeParser:
             self._parsers.clear()
         with _PYTHON_STAR_EXPORT_CACHE_LOCK:
             _PYTHON_STAR_EXPORT_CACHE.clear()
+            _PYTHON_STAR_EXPORT_CYCLE_KEYS.clear()
         with _PYTHON_RETURN_ANNOTATION_CACHE_LOCK:
             _PYTHON_RETURN_ANNOTATION_CACHE.clear()
         for _cached_fn in (
@@ -8555,6 +8701,10 @@ class CodeParser:
         """
         if language not in self._TYPED_CALL_LANGUAGES:
             return {}
+        if language in fast_parser.TYPED_CALL_LANGUAGES and fast_parser.is_fast_node(root):
+            return fast_parser.collect_typed_call_targets(
+                self, root, language, file_path, import_map, defined_names,
+            )
 
         class_types = set(self._class_types.get(language, []))
         function_types = set(self._function_types.get(language, []))
@@ -8733,8 +8883,10 @@ class CodeParser:
                                     None, base_type, "typed_receiver_unresolved",
                                 )
 
+            # A leaf (a name, a keyword, punctuation) binds and calls nothing.
             for child in node.children:
-                walk(child, bindings, class_fields, depth + 1)
+                if child.child_count:
+                    walk(child, bindings, class_fields, depth + 1)
 
         walk(root, {}, {})
         return targets
@@ -9222,6 +9374,10 @@ class CodeParser:
         function that uses it, which is exactly where ``_collect_file_scope``
         stops looking.
         """
+        if fast_parser.is_fast_node(root):
+            return fast_parser.collect_python_receiver_evidence(
+                self, root, file_path, source,
+            )
         module_bindings: dict[str, set[str]] = {}
         imported_names: set[str] = set()
         class_names: set[str] = set()
@@ -9302,6 +9458,8 @@ class CodeParser:
             elif node.type in _PY_STATEMENT_FREE_TYPES and not node.has_error:
                 return
             for child in node.children:
+                if not child.child_count:
+                    continue  # a leaf declares and imports nothing
                 scan_declarations(
                     child, owner_class,
                     in_function or node.type == "function_definition",
@@ -9486,8 +9644,8 @@ class CodeParser:
                 scoped = dict(env)
                 scoped.update(class_fields)
                 function_key = (node.start_point[0] + 1, node.start_point[1])
-                parameter_names, local_names = function_scopes.get(
-                    function_key, (frozenset(), frozenset()),
+                parameter_names, function_ast = function_scopes.get(
+                    function_key, (frozenset(), None),
                 )
                 for parameter_name in parameter_names:
                     scoped.pop(parameter_name, None)
@@ -9502,6 +9660,19 @@ class CodeParser:
                     else current_function
                 )
                 # A closure still sees the method's receiver unless it hides it.
+                direct_method = bool(current_class) and current_function is None
+                local_names: frozenset[str] = frozenset()
+                if (
+                    not direct_method
+                    and function_ast is not None
+                    and (
+                        instance_receiver_name is not None
+                        or class_receiver_name is not None
+                    )
+                ):
+                    local_names = _python_function_local_names(
+                        function_ast, parameter_names,
+                    )
                 receiver_name = (
                     instance_receiver_parameter(node)
                     if current_class and current_function is None
@@ -9649,6 +9820,8 @@ class CodeParser:
                             constructed,
                         )
             for child in node.children:
+                if not child.child_count:
+                    continue  # a leaf is no binding, attribute or call
                 walk(
                     child, env, class_fields, current_class,
                     current_function, depth + 1, instance_receiver_name,
@@ -9717,7 +9890,8 @@ class CodeParser:
                         nested,
                     )
             for child in node.children:
-                visit(child, nested, depth + 1)
+                if child.child_count:  # a leaf is no assignment or ``as``
+                    visit(child, nested, depth + 1)
 
         visit(class_node, False)
         return {
@@ -9793,6 +9967,24 @@ class CodeParser:
             _PYTHON_PROPERTY_RETURN_ANNOTATION_CACHE[cache_key] = properties
             return properties
 
+    def python_importer_view(self, module_path: Path, source: bytes) -> tuple:
+        """What parsing another module reads from this Python module's *source*.
+
+        An importer's parse reads these summaries of the modules it imports
+        (class identities, property and return annotations, star exports and a
+        ``sys.modules`` swap), and nothing else of their bytes. Two versions
+        of a module with equal views parse every importer the same way.
+        """
+        resolved_path = module_path.resolve()
+        resolved = normalize_file_path(resolved_path)
+        return (
+            self._read_python_module_class_identities(resolved, source),
+            self._read_python_property_return_annotations(resolved_path, source),
+            self._read_python_return_annotations(resolved_path, source),
+            self._read_python_star_exports(resolved_path, frozenset(), source),
+            self._read_python_module_alias(resolved_path, source),
+        )
+
     def _python_module_class_identities(
         self, module_file: str,
     ) -> dict[str, tuple[str, str]]:
@@ -9812,13 +10004,37 @@ class CodeParser:
             if cached is not None:
                 return cached
 
+        identities = self._read_python_module_class_identities(resolved, source)
+        if identities is None:
+            return {}
+        with _PYTHON_MODULE_CLASS_IDENTITY_CACHE_LOCK:
+            for stale in [
+                key for key in _PYTHON_MODULE_CLASS_IDENTITY_CACHE
+                if key[0] == resolved and key != cache_key
+            ]:
+                _PYTHON_MODULE_CLASS_IDENTITY_CACHE.pop(stale, None)
+            if len(_PYTHON_MODULE_CLASS_IDENTITY_CACHE) >= _PYTHON_STAR_CACHE_MAX:
+                for oldest in list(_PYTHON_MODULE_CLASS_IDENTITY_CACHE)[
+                    : _PYTHON_STAR_CACHE_MAX // 2
+                ]:
+                    _PYTHON_MODULE_CLASS_IDENTITY_CACHE.pop(oldest, None)
+            _PYTHON_MODULE_CLASS_IDENTITY_CACHE[cache_key] = identities
+        return identities
+
+    def _read_python_module_class_identities(
+        self, resolved: str, source: bytes,
+    ) -> Optional[dict[str, tuple[str, str]]]:
+        """Class identities of the module stored at *resolved*, read from *source*.
+
+        None when the module cannot be parsed.
+        """
         parser = self._get_parser("python")
         if not parser:
-            return {}
+            return None
         try:
             tree = parser.parse(source)  # type: ignore[union-attr]
         except (RecursionError, ValueError):  # pragma: no cover
-            return {}
+            return None
 
         class_counts: dict[str, int] = {}
         imported_names: set[str] = set()
@@ -9862,29 +10078,20 @@ class CodeParser:
         for name, bindings in symbol_bindings.items():
             if len(bindings) == 1 and name not in class_counts:
                 identities[name] = next(iter(bindings))
-
-        with _PYTHON_MODULE_CLASS_IDENTITY_CACHE_LOCK:
-            for stale in [
-                key for key in _PYTHON_MODULE_CLASS_IDENTITY_CACHE
-                if key[0] == resolved and key != cache_key
-            ]:
-                _PYTHON_MODULE_CLASS_IDENTITY_CACHE.pop(stale, None)
-            if len(_PYTHON_MODULE_CLASS_IDENTITY_CACHE) >= _PYTHON_STAR_CACHE_MAX:
-                for oldest in list(_PYTHON_MODULE_CLASS_IDENTITY_CACHE)[
-                    : _PYTHON_STAR_CACHE_MAX // 2
-                ]:
-                    _PYTHON_MODULE_CLASS_IDENTITY_CACHE.pop(oldest, None)
-            _PYTHON_MODULE_CLASS_IDENTITY_CACHE[cache_key] = identities
         return identities
 
     def _read_python_property_return_annotations(
-        self, module_path: Path,
+        self, module_path: Path, source: bytes | None = None,
     ) -> dict[tuple[str, str], str]:
-        """Parse class property declarations without evaluating their bodies."""
-        try:
-            source = module_path.read_bytes()
-        except (OSError, PermissionError):
-            return {}
+        """Parse class property declarations without evaluating their bodies.
+
+        *source* stands in for the file's bytes when given.
+        """
+        if source is None:
+            try:
+                source = module_path.read_bytes()
+            except (OSError, PermissionError):
+                return {}
         parser = self._get_parser("python")
         if not parser:
             return {}
@@ -10445,13 +10652,17 @@ class CodeParser:
             return annotations
 
     def _read_python_return_annotations(
-        self, module_path: Path,
+        self, module_path: Path, source: bytes | None = None,
     ) -> dict[str, str]:
-        """Parse one module for the return annotations of its top-level defs."""
-        try:
-            source = module_path.read_bytes()
-        except (OSError, PermissionError):
-            return {}
+        """Parse one module for the return annotations of its top-level defs.
+
+        *source* stands in for the file's bytes when given.
+        """
+        if source is None:
+            try:
+                source = module_path.read_bytes()
+            except (OSError, PermissionError):
+                return {}
         parser = self._get_parser("python")
         if not parser:
             return {}
@@ -12367,6 +12578,13 @@ class CodeParser:
         """Recursively walk the AST and extract nodes/edges."""
         if _depth > self._MAX_AST_DEPTH:
             return
+        if language in fast_parser.TYPED_CALL_LANGUAGES and fast_parser.is_fast_node(root):
+            fast_parser.extract_from_tree(
+                self, root, source, language, file_path, nodes, edges,
+                enclosing_class, enclosing_func, import_map, defined_names,
+                _depth, _go_receiver_bindings,
+            )
+            return
         class_types, func_types, import_types, call_types = self._node_type_sets(language)
 
         for child in root.children:
@@ -12617,15 +12835,16 @@ class CodeParser:
             ):
                 continue
 
-            # Recurse for other node types
-            self._extract_from_tree(
-                child, source, language, file_path, nodes, edges,
-                enclosing_class=enclosing_class,
-                enclosing_func=enclosing_func,
-                import_map=import_map, defined_names=defined_names,
-                _depth=_depth + 1,
-                _go_receiver_bindings=_go_receiver_bindings,
-            )
+            # Recurse for other node types. A leaf has no children to visit.
+            if child.child_count:
+                self._extract_from_tree(
+                    child, source, language, file_path, nodes, edges,
+                    enclosing_class=enclosing_class,
+                    enclosing_func=enclosing_func,
+                    import_map=import_map, defined_names=defined_names,
+                    _depth=_depth + 1,
+                    _go_receiver_bindings=_go_receiver_bindings,
+                )
 
     def _node_type_sets(
         self, language: str,
@@ -16875,19 +17094,26 @@ class CodeParser:
             return
         scopes: dict[str, set[str]] = {}
         methods: list[tuple[int, str, str]] = []
+        class_types = self._class_types[language]
+        function_types = self._function_types[language]
         pending = [(root, "")]
         while pending:
             node, scope = pending.pop()
-            if node.type in self._class_types[language]:
+            node_type = node.type
+            if node_type in class_types:
                 name = self._get_name(node, language, "class")
                 if name:
                     scope = f"{scope}.{name}" if scope else name
                     scopes.setdefault(name, set()).add(scope)
-            if node.type in self._function_types[language] and scope:
+            if node_type in function_types and scope:
                 methods.append((node.id, scope.rsplit(".", 1)[-1], scope))
-            elif node.type in _PY_STATEMENT_FREE_TYPES and not node.has_error:
+            elif node_type in _PY_STATEMENT_FREE_TYPES and not node.has_error:
                 continue
-            pending.extend((child, scope) for child in reversed(node.named_children))
+            # A leaf (a name, a string) is neither a class nor a function.
+            pending.extend(
+                (child, scope) for child in reversed(node.named_children)
+                if child.child_count
+            )
         for node_id, leaf, scope in methods:
             if len(scopes.get(leaf, ())) > 1:
                 import_map[f"__crg_method_scope__:{node_id}"] = scope
@@ -20210,7 +20436,10 @@ class CodeParser:
             # `_python_import_origin` sees through sys.modules shims, so
             # `from shim import *` enumerates the real module's exports.
             resolved = self._python_import_origin(module, file_path)
-            if resolved is None or resolved in resolving:
+            if resolved is None:
+                continue
+            if resolved in resolving:
+                _PYTHON_STAR_EXPORT_CYCLE_CUTS[0] += 1
                 continue
             for name, origin in self._get_python_star_exports(
                 resolved, resolving,
@@ -20230,6 +20459,7 @@ class CodeParser:
             return {}
         resolved_module = normalize_file_path(module_path)
         if resolved_module in resolving:
+            _PYTHON_STAR_EXPORT_CYCLE_CUTS[0] += 1
             return {}
         if self._excluded_files:
             # Origins are resolved with the exclusions in force, so a cache
@@ -20243,11 +20473,18 @@ class CodeParser:
         with _PYTHON_STAR_EXPORT_CACHE_LOCK:
             cached = _PYTHON_STAR_EXPORT_CACHE.get(cache_key)
             if cached is not None:
+                if cache_key in _PYTHON_STAR_EXPORT_CYCLE_KEYS:
+                    _PYTHON_STAR_EXPORT_CYCLE_CUTS[0] += 1
                 return dict(cached)
 
+            cuts_before = _PYTHON_STAR_EXPORT_CYCLE_CUTS[0]
             exports = self._read_python_star_exports(
                 module_path, resolving,
             )
+            if _PYTHON_STAR_EXPORT_CYCLE_CUTS[0] != cuts_before:
+                _PYTHON_STAR_EXPORT_CYCLE_KEYS.add(cache_key)
+            else:
+                _PYTHON_STAR_EXPORT_CYCLE_KEYS.discard(cache_key)
             stale_keys = [
                 key for key in _PYTHON_STAR_EXPORT_CACHE
                 if key[0] == resolved_module and key != cache_key
@@ -20265,13 +20502,18 @@ class CodeParser:
         self,
         module_path: Path,
         resolving: frozenset[str],
+        source: bytes | None = None,
     ) -> dict[str, str]:
-        """Read and parse one Python module for star-export discovery."""
+        """Read and parse one Python module for star-export discovery.
+
+        *source* stands in for the file's bytes when given.
+        """
         resolved_module = normalize_file_path(module_path)
-        try:
-            source = module_path.read_bytes()
-        except (OSError, PermissionError):
-            return {}
+        if source is None:
+            try:
+                source = module_path.read_bytes()
+            except (OSError, PermissionError):
+                return {}
         try:
             parser = self._get_parser("python")
             if not parser:
@@ -20524,7 +20766,20 @@ class CodeParser:
         if package_file:
             path = Path(package_file)
             return path.parent if path.name == "__init__.py" else None
-        return self._resolve_python_namespace_dir(module, file_path)
+        # Cached beside the module lookups so the same clears drop it. Each
+        # miss walks the search roots on disk, and most names are not
+        # packages, so the misses are what repeat.
+        cache_key = f"python-namespace:{Path(file_path).parent}:{module}"
+        if cache_key in self._module_file_cache:
+            cached = self._module_file_cache[cache_key]
+            return Path(cached) if cached is not None else None
+        namespace_dir = self._resolve_python_namespace_dir(module, file_path)
+        if len(self._module_file_cache) >= self._MODULE_CACHE_MAX:
+            self._module_file_cache.clear()
+        self._module_file_cache[cache_key] = (
+            str(namespace_dir) if namespace_dir is not None else None
+        )
+        return namespace_dir
 
     def _python_submodule_file(
         self, package_dir: Path, name: str,
@@ -20623,7 +20878,9 @@ class CodeParser:
             return module_name
 
     @staticmethod
-    def _read_python_module_alias(module_path: Path) -> Optional[str]:
+    def _read_python_module_alias(
+        module_path: Path, source: bytes | None = None,
+    ) -> Optional[str]:
         """Dotted module a file installs as ``sys.modules[__name__]``, if any.
 
         Only the literal, module-level form counts:
@@ -20632,12 +20889,14 @@ class CodeParser:
         relative module name, a swap inside a function or ``if`` block, or a
         later write that replaces the literal swap is not something static
         analysis can follow, so the file stays the module. Of several
-        module-level swaps the last one is what importers get.
+        module-level swaps the last one is what importers get. *source*
+        stands in for the file's bytes when given.
         """
-        try:
-            source = module_path.read_bytes()
-        except OSError:
-            return None
+        if source is None:
+            try:
+                source = module_path.read_bytes()
+            except OSError:
+                return None
         if b"sys.modules" not in source or b"import_module" not in source:
             return None
         try:

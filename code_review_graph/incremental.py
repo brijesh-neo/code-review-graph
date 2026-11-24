@@ -21,9 +21,10 @@ import time
 import unicodedata
 import uuid
 from collections import deque
+from contextlib import nullcontext
 from functools import partial, wraps
 from pathlib import Path, PurePosixPath
-from typing import TYPE_CHECKING, Any, Callable, Iterable, NamedTuple, Optional
+from typing import TYPE_CHECKING, Any, Callable, Iterable, Iterator, NamedTuple, Optional
 
 from . import install_plan
 from .build_state import advance_to_postprocess_pending
@@ -76,6 +77,10 @@ _MCP_STDIO_ACTIVE = False
 # both cases and avoids rebuilding CodeParser (including its grammar probes and
 # parser caches) for every file in a parallel build.
 _PARSE_WORKER_STATE = threading.local()
+# Chunks in flight per worker when parse workers share module caches. One
+# keeps each chunk's cache entries as fresh as possible; a feeder thread sends
+# the next chunk the moment one returns, so workers do not wait for it.
+_SHARED_PARSE_WINDOW = 1
 
 
 def _windows_console_handle(fileno: int) -> bool:
@@ -150,7 +155,15 @@ def _make_executor(max_workers: int):
     """Construct the parallel-parse executor selected by [_select_executor_kind]."""
     if _select_executor_kind() == "thread":
         return concurrent.futures.ThreadPoolExecutor(max_workers=max_workers)
-    return concurrent.futures.ProcessPoolExecutor(max_workers=max_workers)
+    # The parent probed the grammars this run needs (``_prewarm_parser_probes``);
+    # a spawned worker would probe each of them again in a subprocess.
+    from .parser import parser_probe_results, seed_parser_probe_results
+
+    return concurrent.futures.ProcessPoolExecutor(
+        max_workers=max_workers,
+        initializer=seed_parser_probe_results,
+        initargs=(parser_probe_results(),),
+    )
 
 logger = logging.getLogger(__name__)
 
@@ -2826,6 +2839,9 @@ def assert_graph_serves_root(repo_root: Path, store: GraphStore) -> None:
 
 _MAX_DEPENDENT_HOPS = env_int("CRG_DEPENDENT_HOPS", 2)
 _MAX_DEPENDENT_FILES = 500
+# Dependents whose edges are re-saved per transaction. Each commit holds the
+# write lock only for its own batch, so other writers still get turns.
+_EDGE_WRITE_BATCH = 64
 
 
 def _single_hop_dependents(store: GraphStore, file_path: str) -> set[str]:
@@ -2881,6 +2897,10 @@ def _prewarm_parser_probes(parser: Any, rel_paths: list[str]) -> None:
     ]
     if not unprobed:
         return
+    if len(unprobed) > 1 and parser_mod.fast_engine_enabled():
+        unprobed = _batch_probe_grammars(parser_mod, unprobed)
+        if not unprobed:
+            return
     if len(unprobed) == 1:
         probe_fn(unprobed[0])
         return
@@ -2888,6 +2908,62 @@ def _prewarm_parser_probes(parser: Any, rel_paths: list[str]) -> None:
         max_workers=min(len(unprobed), _MAX_PARSE_WORKERS)
     ) as pool:
         list(pool.map(probe_fn, unprobed))
+
+
+_BATCH_PROBE_CODE = (
+    "from tree_sitter_language_pack import get_parser\n"
+    "import sys\n"
+    "for grammar in sys.argv[1:]:\n"
+    "    try:\n"
+    "        get_parser(grammar)\n"
+    "    except Exception:\n"
+    "        continue\n"
+    "    print(grammar, flush=True)\n"
+)
+
+
+def _batch_probe_grammars(parser_mod: Any, grammars: list[str]) -> list[str]:
+    """Probe *grammars* in one child process; return the ones still unprobed.
+
+    Used with ``CRG_FAST_ENGINE``. A process per grammar costs an interpreter
+    start each. One child loads them all in turn and prints each grammar that
+    loads. Only those are recorded. A grammar that fails, crashes the child, or
+    is not reached before the timeout is returned, so it still gets its own
+    probe with its own failure detail and warning.
+    """
+    probe = getattr(parser_mod, "_run_parser_load_probe", None)
+    if getattr(probe, "__qualname__", "") != "_run_parser_load_probe":
+        # A replaced probe (tests) decides each grammar itself.
+        return grammars
+    try:
+        completed = subprocess.run(
+            [sys.executable, "-c", _BATCH_PROBE_CODE, *grammars],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            timeout=parser_mod._parser_load_timeout_seconds(),
+            check=False,
+            env=parser_mod._parser_probe_env(),
+        )
+        output = completed.stdout
+    except subprocess.TimeoutExpired as exc:
+        output = exc.stdout or b""
+    except OSError as exc:
+        logger.debug("batched grammar probe failed: %s", exc)
+        return grammars
+    if isinstance(output, str):
+        output = output.encode()
+    lines = output.decode("utf-8", errors="replace").split("\n")
+    # The last line is complete only when it ends in a newline.
+    loaded = set(lines[:-1]) & set(grammars)
+    if not loaded:
+        return grammars
+    with parser_mod._PARSER_PROBE_LOCK:
+        for grammar in loaded:
+            if parser_mod._PARSER_PROBE_RESULTS.get(grammar) is None:
+                parser_mod._PARSER_PROBE_RESULTS[grammar] = True
+                parser_mod._PARSER_PROBE_FAILURE_DETAILS.pop(grammar, None)
+    return [grammar for grammar in grammars if grammar not in loaded]
 
 
 class DependentList(list):
@@ -2977,6 +3053,161 @@ def _parse_single_file(
         return (rel_path, [], [], str(e), "")
 
 
+
+def _parse_chunk_sharing_caches(
+    args_chunk: list[tuple[str, str]],
+    seed: list,
+) -> tuple[list, int, list]:
+    """Parse *args_chunk* in a process worker that shares its module caches.
+
+    *seed* holds Python module-cache entries other workers computed; they are
+    installed first. Returns the parse results, this worker's pid and the
+    cache entries it computed that no other worker has been sent by it yet.
+    """
+    from .parser import python_module_cache_entries, seed_python_module_caches
+
+    shared = getattr(_PARSE_WORKER_STATE, "shared_cache_keys", None)
+    if shared is None:
+        shared = _PARSE_WORKER_STATE.shared_cache_keys = set()
+    seed_python_module_caches(seed, shared)
+    results = [_parse_single_file(args) for args in args_chunk]
+    return results, os.getpid(), python_module_cache_entries(shared)
+
+
+
+def _shared_parse_chunks(
+    args_list: list[tuple[str, str]],
+    chunksize: int,
+    workers: int,
+) -> tuple[list[list[tuple[str, str]]], list[int]]:
+    """Split *args_list* into ordered chunks; a very large file gets its own.
+
+    Returns the chunks and the indexes of the single-file chunks whose file
+    holds more than a ``workers * 4``-th of all the bytes.
+    """
+    sizes = []
+    for rel_path, repo_root_str in args_list:
+        try:
+            sizes.append((Path(repo_root_str) / rel_path).stat().st_size)
+        except OSError:
+            sizes.append(0)
+    limit = max(1, sum(sizes) // (workers * 4))
+    chunks: list[list[tuple[str, str]]] = []
+    heavy: list[int] = []
+    current: list[tuple[str, str]] = []
+    for args, size in zip(args_list, sizes):
+        if size > limit:
+            if current:
+                chunks.append(current)
+                current = []
+            heavy.append(len(chunks))
+            chunks.append([args])
+            continue
+        current.append(args)
+        if len(current) == chunksize:
+            chunks.append(current)
+            current = []
+    if current:
+        chunks.append(current)
+    return chunks, heavy
+
+
+def _parse_sharing_caches(
+    executor: concurrent.futures.Executor,
+    args_list: list[tuple[str, str]],
+    chunksize: int,
+    workers: int,
+) -> Iterator[tuple[str, list, list, str | None, str]]:
+    """``executor.map(_parse_single_file, args_list)`` that shares module caches.
+
+    Each process worker would otherwise read and summarise the same imported
+    Python modules again (star exports, return annotations, ``sys.modules``
+    swaps). Entries a worker computes come back with its results and go out
+    with later chunks to the other workers. Every shared entry is a function
+    of its module file alone, so a parse reads the same answer either way.
+    Results are yielded in the order of *args_list*.
+    """
+    chunks, heavy = _shared_parse_chunks(args_list, chunksize, workers)
+    # A file far larger than the rest goes out first, alone: the caller takes
+    # results in order, so a late one holds up storing everything after it.
+    order = heavy + [index for index in range(len(chunks)) if index not in set(heavy)]
+    window = workers * _SHARED_PARSE_WINDOW
+    log: list = []
+    seen: dict[int, int] = {}
+    futures: dict[int, concurrent.futures.Future] = {}
+    cond = threading.Condition()
+    state: dict[str, Any] = {"stop": False, "error": None}
+
+    def feed() -> None:
+        # Its own thread, so a chunk goes out as soon as one comes back even
+        # while the caller is busy storing results.
+        in_flight: dict[concurrent.futures.Future, int] = {}
+        next_chunk = 0
+        try:
+            while True:
+                with cond:
+                    while (
+                        not state["stop"] and next_chunk < len(chunks)
+                        and len(in_flight) < window
+                    ):
+                        start = min(seen.values()) if len(seen) >= workers else 0
+                        chunk_index = order[next_chunk]
+                        future = executor.submit(
+                            _parse_chunk_sharing_caches, chunks[chunk_index], log[start:],
+                        )
+                        in_flight[future] = len(log)
+                        futures[chunk_index] = future
+                        next_chunk += 1
+                        cond.notify_all()
+                if not in_flight:
+                    return
+                done, _ = concurrent.futures.wait(
+                    in_flight, return_when=concurrent.futures.FIRST_COMPLETED,
+                )
+                with cond:
+                    for future in done:
+                        sent = in_flight.pop(future)
+                        if future.exception() is None:
+                            _, pid, entries = future.result()
+                            log.extend(entries)
+                            seen[pid] = max(seen.get(pid, 0), sent)
+        except BaseException as exc:  # handed to the caller, which re-raises it
+            with cond:
+                state["error"] = exc
+                cond.notify_all()
+
+    feeder = threading.Thread(target=feed, name="crg-parse-feeder", daemon=True)
+    feeder.start()
+    try:
+        for index in range(len(chunks)):
+            with cond:
+                while index not in futures and state["error"] is None:
+                    cond.wait()
+                if index not in futures:
+                    raise state["error"]
+                head = futures.pop(index)
+            results, _, _ = head.result()
+            yield from results
+    finally:
+        with cond:
+            state["stop"] = True
+            cond.notify_all()
+        feeder.join()
+
+
+def _parse_results(
+    executor: concurrent.futures.Executor,
+    args_list: list[tuple[str, str]],
+    chunksize: int,
+) -> Iterator[tuple[str, list, list, str | None, str]]:
+    """Parse *args_list* on *executor*, sharing module caches under the fast engine."""
+    from .parser import fast_engine_enabled
+
+    if fast_engine_enabled() and isinstance(executor, concurrent.futures.ProcessPoolExecutor):
+        return _parse_sharing_caches(executor, args_list, chunksize, _MAX_PARSE_WORKERS)
+    return executor.map(_parse_single_file, args_list, chunksize=chunksize)
+
+
 def _canonical_repo_root(repo_root: Path) -> Path:
     """Return one stable identity for a repository root.
 
@@ -3051,72 +3282,77 @@ def full_build(
             store.store_file_batch(pending)
             pending.clear()
 
-    if use_serial or file_count < 8:
-        # Serial fallback (for debugging or tiny repos)
-        for i, rel_path in enumerate(files, 1):
-            full_path = repo_root / rel_path
-            parsed: tuple[list, list, str] | None = None
-            try:
-                source = full_path.read_bytes()
-                fhash = hashlib.sha256(source).hexdigest()
-                nodes, edges = parser.parse_bytes(full_path, source)
-                _relink_edges(edges, repo_root, followed_dirs)
-                parsed = (nodes, edges, fhash)
-            except (OSError, PermissionError) as e:
-                errors.append({"file": rel_path, "error": str(e)})
-                if parser.detect_language(full_path) == "cpp":
-                    cpp_errors.add(str(rel_path))
-            except Exception as e:
-                logger.warning("Error parsing %s: %s", rel_path, e)
-                errors.append({"file": rel_path, "error": str(e)})
-                if parser.detect_language(full_path) == "cpp":
-                    cpp_errors.add(str(rel_path))
-            if parsed is not None:
-                # Deliberately outside the handlers above. A file this loop
-                # could not *parse* is reported and keeps no rows; a file it
-                # could not *write* is a different thing entirely — the usual
-                # cause is another process holding the SQLite write lock — and
-                # filing that as a parse error let the build carry on, write
-                # the VCS anchor and exit 0 while those files were missing
-                # from the graph for good. The build stops instead, so no
-                # anchor is written and the next run rebuilds.
-                pending.append((str(full_path), *parsed))
-                if len(pending) >= STORE_BATCH_FILES:
-                    flush()
-                total_nodes += len(parsed[0])
-                total_edges += len(parsed[1])
-            if i % 50 == 0 or i == file_count:
-                logger.info("Progress: %d/%d files parsed", i, file_count)
-    else:
-        # Parallel parsing — store calls remain serial (SQLite single-writer).
-        # Executor kind auto-selected: process for normal CLI/automation;
-        # thread for MCP stdio to avoid pipe-handle inheritance deadlocks and
-        # orphan workers (issues #46, #136, PR #615). Override via
-        # CRG_PARSE_EXECUTOR env.
-        _prewarm_parser_probes(parser, files)
-        args_list = [(rel_path, str(repo_root)) for rel_path in files]
-        with _make_executor(_MAX_PARSE_WORKERS) as executor:
-            for i, (rel_path, nodes, edges, error, fhash) in enumerate(
-                executor.map(_parse_single_file, args_list, chunksize=4),
-                1,
-            ):
-                if error:
-                    logger.warning("Error parsing %s: %s", rel_path, error)
-                    errors.append({"file": rel_path, "error": error})
-                    if parser.detect_language(repo_root / rel_path) == "cpp":
-                        cpp_errors.add(str(rel_path))
-                    continue
-                full_path = repo_root / rel_path
-                _relink_edges(edges, repo_root, followed_dirs)
-                pending.append((str(full_path), nodes, edges, fhash))
-                if len(pending) >= STORE_BATCH_FILES:
-                    flush()
-                total_nodes += len(nodes)
-                total_edges += len(edges)
-                if i % 200 == 0 or i == file_count:
-                    logger.info("Progress: %d/%d files parsed", i, file_count)
+    # With the native engine on, a build writes its edges with the edge
+    # indexes dropped and rebuilds them once at the end.
+    from .parser import fast_engine_enabled
 
-    flush()
+    with store.bulk_edge_load() if fast_engine_enabled() else nullcontext():
+        if use_serial or file_count < 8:
+            # Serial fallback (for debugging or tiny repos)
+            for i, rel_path in enumerate(files, 1):
+                full_path = repo_root / rel_path
+                parsed: tuple[list, list, str] | None = None
+                try:
+                    source = full_path.read_bytes()
+                    fhash = hashlib.sha256(source).hexdigest()
+                    nodes, edges = parser.parse_bytes(full_path, source)
+                    _relink_edges(edges, repo_root, followed_dirs)
+                    parsed = (nodes, edges, fhash)
+                except (OSError, PermissionError) as e:
+                    errors.append({"file": rel_path, "error": str(e)})
+                    if parser.detect_language(full_path) == "cpp":
+                        cpp_errors.add(str(rel_path))
+                except Exception as e:
+                    logger.warning("Error parsing %s: %s", rel_path, e)
+                    errors.append({"file": rel_path, "error": str(e)})
+                    if parser.detect_language(full_path) == "cpp":
+                        cpp_errors.add(str(rel_path))
+                if parsed is not None:
+                    # Deliberately outside the handlers above. A file this loop
+                    # could not *parse* is reported and keeps no rows; a file it
+                    # could not *write* is a different thing entirely — the usual
+                    # cause is another process holding the SQLite write lock — and
+                    # filing that as a parse error let the build carry on, write
+                    # the VCS anchor and exit 0 while those files were missing
+                    # from the graph for good. The build stops instead, so no
+                    # anchor is written and the next run rebuilds.
+                    pending.append((str(full_path), *parsed))
+                    if len(pending) >= STORE_BATCH_FILES:
+                        flush()
+                    total_nodes += len(parsed[0])
+                    total_edges += len(parsed[1])
+                if i % 50 == 0 or i == file_count:
+                    logger.info("Progress: %d/%d files parsed", i, file_count)
+        else:
+            # Parallel parsing — store calls remain serial (SQLite single-writer).
+            # Executor kind auto-selected: process for normal CLI/automation;
+            # thread for MCP stdio to avoid pipe-handle inheritance deadlocks and
+            # orphan workers (issues #46, #136, PR #615). Override via
+            # CRG_PARSE_EXECUTOR env.
+            _prewarm_parser_probes(parser, files)
+            args_list = [(rel_path, str(repo_root)) for rel_path in files]
+            with _make_executor(_MAX_PARSE_WORKERS) as executor:
+                for i, (rel_path, nodes, edges, error, fhash) in enumerate(
+                    _parse_results(executor, args_list, 4),
+                    1,
+                ):
+                    if error:
+                        logger.warning("Error parsing %s: %s", rel_path, error)
+                        errors.append({"file": rel_path, "error": error})
+                        if parser.detect_language(repo_root / rel_path) == "cpp":
+                            cpp_errors.add(str(rel_path))
+                        continue
+                    full_path = repo_root / rel_path
+                    _relink_edges(edges, repo_root, followed_dirs)
+                    pending.append((str(full_path), nodes, edges, fhash))
+                    if len(pending) >= STORE_BATCH_FILES:
+                        flush()
+                    total_nodes += len(nodes)
+                    total_edges += len(edges)
+                    if i % 200 == 0 or i == file_count:
+                        logger.info("Progress: %d/%d files parsed", i, file_count)
+
+        flush()
     store.set_metadata("last_updated", time.strftime("%Y-%m-%dT%H:%M:%S"))
     store.set_metadata("last_build_type", "full")
     if store.get_metadata(MOVED_FROM_KEY):
@@ -3199,6 +3435,196 @@ def _relative_update_input(repo_root: Path, path: str) -> str:
         return candidate.relative_to(repo_root).as_posix()
     except ValueError:
         return path
+
+
+# Edge kinds a module's importers can read through the graph: what it imports
+# and re-exports, and what its classes inherit. Calls, references, tests and
+# containment are its own business, and containment follows its nodes.
+_IMPORTER_VISIBLE_EDGE_KINDS = frozenset({
+    "IMPORTS_FROM", "INHERITS", "IMPLEMENTS", "DEPENDS_ON",
+})
+# Past this many changed symbol names, matching them against the importers'
+# edges stops paying off; every importer is re-parsed instead.
+_MAX_CHANGED_SYMBOL_NAMES = 64
+# A wildcard import anywhere in the text, comments included: such a file reads
+# every public name of the module it imports from.
+_WILDCARD_IMPORT_RE = re.compile(rb"\bimport\s*\*")
+
+
+def _committed_bytes(repo_root: Path, rel_path: str, file_hash: str) -> bytes | None:
+    """The bytes the graph holds for *rel_path*, read back from Git.
+
+    HEAD first, then the index. Only a blob whose sha256 equals the stored
+    *file_hash* counts, so a graph built from bytes Git does not have gets
+    None.
+    """
+    for spec in (f"HEAD:./{rel_path}", f":./{rel_path}"):
+        try:
+            result = subprocess.run(
+                ["git", "cat-file", "blob", spec],
+                cwd=str(repo_root), capture_output=True, timeout=_GIT_TIMEOUT,
+                check=False,
+            )
+        except (OSError, subprocess.SubprocessError) as exc:
+            logger.debug("Reading %s from Git failed: %s", spec, exc)
+            return None
+        if (
+            result.returncode == 0
+            and hashlib.sha256(result.stdout).hexdigest() == file_hash
+        ):
+            return result.stdout
+    return None
+
+
+def _node_shape(node: Any) -> tuple:
+    """A parsed node without its position, which nothing in another file reads."""
+    return (
+        node.kind, node.name, node.parent_name or "", node.language, node.params,
+        node.return_type, node.modifiers, node.is_test, node.identity_name,
+        json.dumps(node.extra, sort_keys=True, default=str),
+    )
+
+
+def _edge_shape(edge: Any) -> tuple:
+    return (
+        edge.kind, edge.source, edge.target,
+        json.dumps(edge.extra, sort_keys=True, default=str),
+    )
+
+
+def _changed_symbol_names(
+    repo_root: Path, rel_path: str, file_hash: str, parser: Any, parsed: dict,
+) -> tuple[set[str], bool] | None:
+    """Names whose definitions in *rel_path* changed since the graph stored it.
+
+    The flag says whether the module's public names changed, which only a
+    wildcard import reads. None when an importer's parse could have changed
+    too, or when that cannot be told: the file is not an indexed Python module
+    whose stored bytes Git still has, a summary importers read from it
+    differs, or an edge kind importers read through the graph (imports,
+    inheritance) changed. The new bytes are parsed with the update's own
+    *parser*, and that result goes into *parsed* for the update to store.
+    """
+    if not rel_path.endswith(".py"):
+        return None
+    abs_path = repo_root / rel_path
+    if abs_path.is_symlink() or not abs_path.is_file():
+        return None
+    try:
+        new_source = abs_path.read_bytes()
+    except OSError:
+        return None
+    old_source = _committed_bytes(repo_root, rel_path, file_hash)
+    if old_source is None:
+        return None
+    # A parser of its own for the old bytes: they must not reach a cache the
+    # update's parser shares with the files it parses next.
+    old_parser = _get_code_parser_cls()(repo_root)
+    own = normalize_file_path(abs_path.resolve())
+
+    def split_view(view: tuple) -> tuple[tuple, dict, set]:
+        # Names the module defines itself resolve to the module whether or
+        # not it exports them, so outside a wildcard import only the names it
+        # re-exports from elsewhere count.
+        exports = view[3] or {}
+        foreign = {name: origin for name, origin in exports.items() if origin != own}
+        local = {name for name, origin in exports.items() if origin == own}
+        return view[:3] + view[4:], foreign, local
+
+    try:
+        old_view = split_view(old_parser.python_importer_view(abs_path, old_source))
+        new_view = split_view(parser.python_importer_view(abs_path, new_source))
+        if old_view[:2] != new_view[:2]:
+            return None
+        old_nodes, old_edges = old_parser.parse_bytes(abs_path, old_source)
+        new_nodes, new_edges = parser.parse_bytes(abs_path, new_source)
+        parsed[rel_path] = (new_source, new_nodes, new_edges)
+    except Exception as exc:  # noqa: BLE001 - any failure means "re-parse all"
+        logger.debug("Comparing versions of %s failed: %s", rel_path, exc)
+        return None
+
+    def visible(edges: list) -> list[tuple]:
+        return sorted(
+            _edge_shape(edge) for edge in edges
+            if edge.kind in _IMPORTER_VISIBLE_EDGE_KINDS
+        )
+
+    if visible(old_edges) != visible(new_edges):
+        return None
+    old_shapes = sorted(_node_shape(node) for node in old_nodes)
+    new_shapes = sorted(_node_shape(node) for node in new_nodes)
+    names: set[str] = set()
+    for shape in set(old_shapes) ^ set(new_shapes):
+        names.add(shape[1])
+        names.add(shape[2])
+    # Same-named definitions share one name and take collision identities by
+    # position, so their names count as changed whenever anything moved.
+    for shapes in (old_shapes, new_shapes):
+        counts: dict[tuple, int] = {}
+        for shape in shapes:
+            key = (shape[0], shape[1], shape[2])
+            counts[key] = counts.get(key, 0) + 1
+        for (_kind, name, parent), count in counts.items():
+            if count > 1:
+                names.add(name)
+                names.add(parent)
+    names.discard("")
+    exports_changed = old_view[2] != new_view[2]
+    names |= old_view[2] ^ new_view[2]
+    return names, exports_changed
+
+
+def _importers_to_reparse(
+    repo_root: Path,
+    store: GraphStore,
+    changed: dict[str, str],
+    importers: set[str],
+    parser: Any,
+    parsed: dict,
+) -> set[str] | None:
+    """The importers of *changed* (path to stored hash) a re-parse could alter.
+
+    Used with ``CRG_FAST_ENGINE``. An importer with unchanged bytes parses as
+    before when every changed module shows its importers the same summaries
+    and imports (see :func:`_changed_symbol_names`). Its stored edges then only
+    go stale where they name a changed definition, so the importers whose edges
+    mention no changed name keep their rows, and the resolvers settle those
+    as they settle every other file. None means re-parse every importer.
+    """
+    names: set[str] = set()
+    exports_changed = False
+    for rel_path, file_hash in changed.items():
+        found = _changed_symbol_names(repo_root, rel_path, file_hash, parser, parsed)
+        if found is None:
+            return None
+        names |= found[0]
+        exports_changed = exports_changed or found[1]
+        if len(names) > _MAX_CHANGED_SYMBOL_NAMES:
+            return None
+    if exports_changed:
+        # A wildcard importer, or one that imports through it, reads the
+        # public names themselves rather than an edge that names them.
+        for rel_path in importers:
+            try:
+                if _WILDCARD_IMPORT_RE.search((repo_root / rel_path).read_bytes()):
+                    return None
+            except OSError:
+                return None
+    by_stored = {
+        normalize_file_path(repo_root / rel_path): rel_path for rel_path in importers
+    }
+    selected: set[str] = set()
+    conn = store._conn
+    for name in sorted(names):
+        for row in conn.execute(
+            "SELECT DISTINCT file_path FROM edges WHERE instr(source_qualified, ?) > 0 "
+            "OR instr(target_qualified, ?) > 0 OR instr(COALESCE(extra, ''), ?) > 0",
+            (name, name, name),
+        ).fetchall():
+            rel_path = by_stored.get(row[0])
+            if rel_path is not None:
+                selected.add(rel_path)
+    return selected
 
 
 @_with_build_cache
@@ -3406,6 +3832,9 @@ def incremental_update(
     # Find dependent files (files that import from changed files)
     dependents_pending = _load_dependents_pending(store)
     dependent_files: set[str] = set(dependents_pending)
+    # Changed files whose bytes differ from the stored ones, with the stored
+    # hash, or None once one of them cannot take the fast path below.
+    content_changed: dict[str, str] | None = {}
     for rel_path in changed_files:
         full_path = normalize_file_path(repo_root / rel_path)
         # Duplicate watch notifications do not invalidate dependents. A real
@@ -3426,6 +3855,11 @@ def incremental_update(
                     continue
             except (OSError, PermissionError):
                 pass
+        if content_changed is not None:
+            if existing and rel_path not in pending_nested and existing[0].file_hash:
+                content_changed[rel_path] = existing[0].file_hash
+            else:
+                content_changed = None
         deps = find_dependents(store, full_path)
         for d in deps:
             # Convert back to relative path if needed
@@ -3433,6 +3867,29 @@ def incremental_update(
                 dependent_files.add(str(Path(d).relative_to(repo_root)))
             except ValueError:
                 dependent_files.add(d)
+
+    # With the native engine, importers whose bytes did not change are
+    # re-parsed only where the change can reach them (``None``: all of them).
+    from .parser import fast_engine_enabled
+
+    importers_to_reparse: set[str] | None = None
+    # Changed files the check above already parsed: path to (bytes, nodes, edges).
+    preparsed: dict[str, tuple[bytes, list, list]] = {}
+    if (
+        fast_engine_enabled()
+        and content_changed
+        and dependent_files
+        and not identity_pending
+        and not pending_csharp
+        and not pending_nested
+        and _enrichment_skip_reason(enrich) is not None
+    ):
+        importers_to_reparse = _importers_to_reparse(
+            repo_root, store, content_changed, dependent_files - dependents_pending,
+            parser, preparsed,
+        )
+        if importers_to_reparse is not None:
+            importers_to_reparse |= dependents_pending
 
     # Combine changed + dependent
     all_files = set(changed_files) | dependent_files | (identity_pending or set())
@@ -3447,7 +3904,11 @@ def incremental_update(
     to_parse: list[str] = []
     # Importers re-parsed with unchanged bytes, and the hash that was checked.
     edges_only: dict[str, str] = {}
-    for rel_path in all_files:
+    # Importers left as stored (see ``importers_to_reparse``).
+    kept_importers: list[str] = []
+    # Sorted, so the rows (and the community ids read from them) come out the
+    # same on every run: set order follows per-process string hashes.
+    for rel_path in sorted(all_files):
         if _should_ignore(rel_path, ignore_patterns):
             if rel_path in remaining_identity:
                 ignored_path = repo_root / rel_path
@@ -3500,6 +3961,13 @@ def incremental_update(
             ):
                 if rel_path not in dependent_files:
                     continue
+                if (
+                    importers_to_reparse is not None
+                    and rel_path not in importers_to_reparse
+                ):
+                    # Its stored rows stand; the resolvers below settle them.
+                    kept_importers.append(rel_path)
+                    continue
                 edges_only[rel_path] = fhash
         except (OSError, PermissionError):
             pass
@@ -3530,6 +3998,7 @@ def incremental_update(
     # variant generation so we do not expand twice per update.
     lifecycle_inputs = [
         *[rel_path.replace("\\", "/") for rel_path in to_parse],
+        *[rel_path.replace("\\", "/") for rel_path in kept_importers],
         *missing_paths,
         *stale_files,
     ]
@@ -3544,14 +4013,29 @@ def incremental_update(
     # edges, so these are the only files the Jedi step needs to scan again.
     reparsed_paths: list[str] = []
 
+    # Dependents whose bytes did not change only get their edges re-saved,
+    # which is most of an update's writes: save them a batch per transaction.
+    pending_edges: list[tuple[str, list]] = []
+
+    def flush_edges() -> None:
+        store.store_files_edges(pending_edges)
+        pending_edges.clear()
+
     def store_parsed(rel_path: str, nodes: list, edges: list, fhash: str) -> None:
         reparsed_paths.append(str(repo_root / rel_path))
         _relink_edges(edges, repo_root, followed_dirs)
         # Same bytes, same symbols: keep the node ids that flows and communities
         # refer to. Only what the file's edges resolve to can have moved.
         if edges_only.get(rel_path) == fhash:
-            store.store_file_edges(str(repo_root / rel_path), edges)
+            pending_edges.append((str(repo_root / rel_path), edges))
+            if len(pending_edges) >= _EDGE_WRITE_BATCH:
+                flush_edges()
             return
+        # Earlier files' edges go first, so rows keep the order an unbatched
+        # write gives them (community detection reads edges in row order) and
+        # the flow capture below reads them.
+        if pending_edges:
+            flush_edges()
         file_paths = expand_changed_file_paths(store, [rel_path], repo_root=repo_root)
         cleared_entry_qns.update(capture_affected_flow_entry_points(store, file_paths))
         flow_node_ids.update(capture_flow_node_ids(store, file_paths))
@@ -3566,7 +4050,11 @@ def incremental_update(
             try:
                 source = abs_path.read_bytes()
                 fhash = hashlib.sha256(source).hexdigest()
-                nodes, edges = parser.parse_bytes(abs_path, source)
+                ready = preparsed.pop(rel_path, None)
+                if ready is not None and ready[0] == source:
+                    nodes, edges = ready[1], ready[2]
+                else:
+                    nodes, edges = parser.parse_bytes(abs_path, source)
             except (OSError, PermissionError) as e:
                 errors.append({"file": rel_path, "error": str(e)})
                 continue
@@ -3589,10 +4077,8 @@ def incremental_update(
         _prewarm_parser_probes(parser, to_parse)
         args_list = [(rel_path, str(repo_root)) for rel_path in to_parse]
         with _make_executor(_MAX_PARSE_WORKERS) as executor:
-            for rel_path, nodes, edges, error, fhash in executor.map(
-                _parse_single_file,
-                args_list,
-                chunksize=20,
+            for rel_path, nodes, edges, error, fhash in _parse_results(
+                executor, args_list, 20,
             ):
                 if error:
                     logger.warning("Error parsing %s: %s", rel_path, error)
@@ -3603,6 +4089,8 @@ def incremental_update(
                 parsed_files += 1
                 total_nodes += len(nodes)
                 total_edges += len(edges)
+
+    flush_edges()
 
     failed_dependents = dependent_files & {error["file"] for error in errors}
     if failed_dependents != dependents_pending:

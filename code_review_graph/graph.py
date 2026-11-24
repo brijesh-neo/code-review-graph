@@ -8,6 +8,7 @@ Supports impact-radius queries and subgraph extraction.
 
 from __future__ import annotations
 
+import functools
 import hashlib
 import json
 import logging
@@ -55,6 +56,8 @@ from .constants import (
 from .errors import GraphStoreError, is_lock_error
 from .inheritance import InheritanceIndex
 from .migrations import (
+    EDGES_COMPOSITE_INDEX_SQL,
+    EDGES_TARGET_RESOLUTION_INDEX_SQL,
     LATEST_VERSION,
     TARGET_RESOLUTION_EXPR,
     TARGET_RESOLUTION_KINDS,
@@ -232,6 +235,85 @@ def _compatible_edge_languages(language: str) -> tuple[str, ...]:
     if normalized in _JAVASCRIPT_LANGUAGE_FAMILY_SET:
         return _JAVASCRIPT_LANGUAGE_FAMILY
     return (language,)
+
+
+_INSERT_EDGE_SQL = """INSERT INTO edges
+               (kind, source_qualified, target_qualified, file_path, line, extra,
+                confidence, confidence_tier, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"""
+
+
+def _native_edge_rows() -> Any:
+    """``crg_fast.edge_rows`` under ``CRG_FAST_ENGINE``, else None."""
+    from .parser import fast_engine_enabled
+
+    if not fast_engine_enabled():
+        return None
+    try:
+        import crg_fast
+    except ImportError:
+        return None
+    return getattr(crg_fast, "edge_rows", None)
+
+
+def _native_settle_edges() -> Any:
+    """``crg_fast.settle_edges`` under ``CRG_FAST_ENGINE``, else None."""
+    from .parser import fast_engine_enabled
+
+    if not fast_engine_enabled():
+        return None
+    try:
+        import crg_fast
+    except ImportError:
+        return None
+    return getattr(crg_fast, "settle_edges", None)
+
+
+def _native_node_rows() -> Any:
+    """``crg_fast.node_rows`` under ``CRG_FAST_ENGINE``, else None."""
+    from .parser import fast_engine_enabled
+
+    if not fast_engine_enabled():
+        return None
+    try:
+        import crg_fast
+    except ImportError:
+        return None
+    return getattr(crg_fast, "node_rows", None)
+
+
+def _load_native_sql(conn: sqlite3.Connection) -> bool:
+    """Load ``crg_fast`` into *conn* as a SQLite extension (``CRG_FAST_ENGINE``).
+
+    The extension runs every call through this connection's own SQLite, so
+    native passes work inside Python's transaction without a second SQLite in
+    the process. False when the engine is off or the extension cannot load;
+    callers then run their SQL.
+    """
+    from .parser import fast_engine_enabled
+
+    if not fast_engine_enabled():
+        return False
+    try:
+        import crg_fast
+    except ImportError:
+        return False
+    if not hasattr(crg_fast, "stage_certainty_refresh"):
+        return False
+    # The compiled module itself, not the package's ``__init__.py``.
+    library = getattr(crg_fast, "crg_fast", crg_fast).__file__
+    if not library:
+        return False
+    try:
+        conn.enable_load_extension(True)
+        try:
+            conn.load_extension(str(library))
+        finally:
+            conn.enable_load_extension(False)
+    except (AttributeError, sqlite3.Error) as exc:
+        logger.warning("Could not load the crg_fast SQLite extension: %s", exc)
+        return False
+    return True
 
 
 def _symbol_of(qualified_name: str) -> str:
@@ -1035,6 +1117,9 @@ BUILD_CACHE_KIB = 100 * 1024
 class GraphStore:
     """SQLite-backed code knowledge graph."""
 
+    #: Whether ``crg_fast`` is loaded into the connection as a SQLite extension.
+    _native_sql = False
+
     def __init__(
         self,
         db_path: str | Path,
@@ -1113,6 +1198,11 @@ class GraphStore:
                     )
                     self._conn.commit()
                 run_migrations(self._conn)
+                from .parser import fast_engine_enabled
+
+                if fast_engine_enabled():
+                    self._restore_edge_indexes()
+                    self._native_sql = _load_native_sql(conn)
         except (sqlite3.Error, OSError, GraphStoreError) as exc:
             # A corrupt file, a foreign SQLite file, or a data directory this
             # process cannot write to used to escape as a raw traceback from
@@ -1176,6 +1266,13 @@ class GraphStore:
             dict[str, dict[str, str]],
         ] | None = None
         self._cache_lock = threading.Lock()
+        # Files whose edges a running bulk_edge_load() has written, else None.
+        self._bulk_edge_files: set[str] | None = None
+        # While a bulk load runs over a graph that already had edges: the files
+        # whose old edge rows it has replaced, committed and in the open
+        # transaction. The old rows are deleted in one pass when it ends.
+        self._bulk_replaced: set[str] | None = None
+        self._bulk_replacing: list[str] = []
         self._cache_epoch = 0
         # Identifies the read transaction currently open on this connection,
         # so a reader cannot roll back a transaction a writer took from it.
@@ -1203,6 +1300,32 @@ class GraphStore:
     def _init_schema(self) -> None:
         self._conn.executescript(_SCHEMA_SQL)
         self._conn.commit()
+
+    def _restore_edge_indexes(self) -> None:
+        """Recreate a migration's edge index that a bulk load left dropped.
+
+        :meth:`bulk_edge_load` drops the edge indexes while a full build
+        writes its rows. A build killed before it put them back would leave
+        them missing, and the migrations that made them have already run.
+        ``_init_schema`` restores the base schema's indexes on every open;
+        this restores the two the migrations add.
+        """
+        present = {
+            row[0] for row in self._conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = 'edges'"
+            )
+        }
+        restored = False
+        for name, sql in (
+            ("idx_edges_composite", EDGES_COMPOSITE_INDEX_SQL),
+            ("idx_edges_kind_target_resolution", EDGES_TARGET_RESOLUTION_INDEX_SQL),
+        ):
+            if name not in present:
+                self._conn.execute(sql)
+                restored = True
+        if restored:
+            self._conn.commit()
+            logger.warning("Restored edge indexes an interrupted build left out")
 
     def _invalidate_cache(self) -> None:
         """Invalidate the cached NetworkX graph after write operations."""
@@ -1237,6 +1360,31 @@ class GraphStore:
         except sqlite3.Error:
             pass
         release_os_memory()
+
+    def truncate_wal(self) -> bool:
+        """Checkpoint the whole WAL into the database and truncate it, without waiting.
+
+        A full build writes the graph's every page through the WAL. A store
+        left open (watch mode, the MCP server) would otherwise keep that file
+        at its peak size. A reader holding an older snapshot makes SQLite
+        report busy; the checkpoint is then left for later rather than waited
+        for. Returns whether it completed.
+        """
+        if self._conn.in_transaction:
+            self._conn.commit()
+        previous = int(self._conn.execute("PRAGMA busy_timeout").fetchone()[0])
+        self._conn.execute("PRAGMA busy_timeout=0")
+        try:
+            row = self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+        except sqlite3.OperationalError as exc:
+            logger.debug("WAL checkpoint skipped: %s", exc)
+            return False
+        finally:
+            self._conn.execute(f"PRAGMA busy_timeout={previous}")
+        if row is None or row[0]:
+            logger.debug("WAL checkpoint skipped: a reader holds the WAL")
+            return False
+        return True
 
     def close(self) -> None:
         # No gc.collect() here: every MCP tool call opens and closes a store,
@@ -1869,8 +2017,65 @@ class GraphStore:
             self._conn.commit()
         except BaseException:
             self._conn.rollback()
+            self._bulk_replacing.clear()
             raise
+        self._bulk_committed()
         self._invalidate_cache()
+
+    def _bulk_committed(self) -> None:
+        """Count the files of a committed transaction as replaced by the bulk load."""
+        if self._bulk_replaced is not None:
+            self._bulk_replaced.update(self._bulk_replacing)
+        self._bulk_replacing.clear()
+
+    @contextmanager
+    def bulk_edge_load(self) -> Iterator[bool]:
+        """Write a full build's edges with the edge indexes dropped, then rebuild them.
+
+        Yields True. Building an index once over all the rows is cheaper than
+        updating six of them on every insert. The indexes are recreated from
+        their stored statements in their original order, so the schema reads
+        as before. A process killed before that is repaired on the next open,
+        through ``_init_schema`` and :meth:`_restore_edge_indexes`.
+
+        A rebuild over a graph that has edges keeps the old rows in place while
+        it loads (without the indexes, the per-file DELETE would scan them all
+        for every file), and when it ends deletes, in one pass, the old rows of
+        each file it stored. That leaves the rows and ids the per-file DELETE
+        would: a file the build did not store, such as one that failed to
+        parse, keeps its old edges.
+        """
+        old_max_id = self._conn.execute("SELECT MAX(id) FROM edges").fetchone()[0]
+        indexes = self._conn.execute(
+            "SELECT name, sql FROM sqlite_master WHERE type = 'index' "
+            "AND tbl_name = 'edges' AND sql IS NOT NULL ORDER BY rowid"
+        ).fetchall()
+        for name, _sql in indexes:
+            self._conn.execute(f'DROP INDEX IF EXISTS "{name}"')  # nosec B608
+        self._conn.commit()
+        self._bulk_edge_files = set()
+        self._bulk_replaced = set() if old_max_id is not None else None
+        self._bulk_replacing.clear()
+        try:
+            yield True
+        finally:
+            self._bulk_edge_files = None
+            replaced, self._bulk_replaced = self._bulk_replaced, None
+            self._bulk_replacing.clear()
+            if self._conn.in_transaction:
+                self._conn.rollback()
+            if replaced:
+                self._delete_replaced_edges(old_max_id, replaced)
+            present = {
+                row[0] for row in self._conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'index' "
+                    "AND tbl_name = 'edges'"
+                )
+            }
+            for name, sql in indexes:
+                if name not in present:
+                    self._conn.execute(sql)
+            self._conn.commit()
 
     def store_file_batch(
         self, batch: list[tuple[str, list[NodeInfo], list[EdgeInfo], str]]
@@ -1883,8 +2088,28 @@ class GraphStore:
             self._conn.commit()
         except BaseException:
             self._conn.rollback()
+            self._bulk_replacing.clear()
             raise
+        self._bulk_committed()
         self._invalidate_cache()
+
+    def _delete_replaced_edges(self, old_max_id: int, replaced: set[str]) -> None:
+        """Delete the pre-load edge rows (id <= *old_max_id*) of the *replaced* files."""
+        self._conn.execute(
+            "CREATE TEMP TABLE IF NOT EXISTS crg_bulk_replaced (path TEXT PRIMARY KEY)"
+        )
+        self._conn.execute("DELETE FROM temp.crg_bulk_replaced")
+        self._conn.executemany(
+            "INSERT OR IGNORE INTO temp.crg_bulk_replaced (path) VALUES (?)",
+            [(path,) for path in replaced],
+        )
+        self._conn.execute(
+            "DELETE FROM edges WHERE id <= ? AND file_path IN "
+            "(SELECT path FROM temp.crg_bulk_replaced)",
+            (old_max_id,),
+        )
+        self._conn.execute("DROP TABLE temp.crg_bulk_replaced")
+        self._conn.commit()
 
     def store_file_edges(self, file_path: str, edges: list[EdgeInfo]) -> None:
         """Atomically replace a file's edges and keep its node rows.
@@ -1892,32 +2117,46 @@ class GraphStore:
         For a file whose bytes did not change. Its symbols are the same, and
         flows and communities point at their node ids, so those ids must stay.
         """
-        normalized = normalize_file_path(file_path)
+        self.store_files_edges([(file_path, edges)])
+
+    def store_files_edges(self, batch: list[tuple[str, list[EdgeInfo]]]) -> None:
+        """:meth:`store_file_edges` for several files in one transaction.
+
+        An update re-saves the edges of every dependent of a changed file;
+        one commit per file was most of the cost of writing them.
+        """
+        if not batch:
+            return
         self._begin_immediate()
         try:
-            # The edges come from a fresh parse and name base identities; align
-            # them with the collision identities this file's rows already hold.
-            stored = self._conn.execute(
-                "SELECT qualified_name, line_start, line_end FROM nodes "
-                "WHERE file_path = ?",
-                (normalized,),
-            ).fetchall()
-            collisions = self._collision_map(
-                (
-                    self._collision_base(row["qualified_name"]),
-                    row["line_start"], row["line_end"], row["qualified_name"],
-                )
-                for row in stored
-            )
-            self._conn.execute("DELETE FROM edges WHERE file_path = ?", (normalized,))
-            self._insert_edges(
-                self._aligned_edges(normalized, edges, collisions), time.time(),
-            )
+            for file_path, edges in batch:
+                self._replace_file_edges(normalize_file_path(file_path), edges)
             self._conn.commit()
         except BaseException:
             self._conn.rollback()
             raise
         self._invalidate_cache()
+
+    def _replace_file_edges(self, normalized: str, edges: list[EdgeInfo]) -> None:
+        """Replace one file's edges. Must be called inside an open transaction."""
+        # The edges come from a fresh parse and name base identities; align
+        # them with the collision identities this file's rows already hold.
+        stored = self._conn.execute(
+            "SELECT qualified_name, line_start, line_end FROM nodes "
+            "WHERE file_path = ?",
+            (normalized,),
+        ).fetchall()
+        collisions = self._collision_map(
+            (
+                self._collision_base(row["qualified_name"]),
+                row["line_start"], row["line_end"], row["qualified_name"],
+            )
+            for row in stored
+        )
+        self._conn.execute("DELETE FROM edges WHERE file_path = ?", (normalized,))
+        self._insert_edges(
+            self._aligned_edges(normalized, edges, collisions), time.time(),
+        )
 
     def relocate_edge_targets(self, old_prefix: str, new_prefix: str) -> int:
         """Rewrite edge targets that start with *old_prefix* to *new_prefix*.
@@ -1957,16 +2196,22 @@ class GraphStore:
         # own rows (#585). Plan identities before the old rows are deleted.
         identities = self._plan_file_identities(normalized, nodes)
         self._conn.execute("DELETE FROM nodes WHERE file_path = ?", (normalized,))
-        self._conn.execute("DELETE FROM edges WHERE file_path = ?", (normalized,))
+        bulk_files = self._bulk_edge_files
+        if bulk_files is None or normalized in bulk_files:
+            # Without the edge indexes this is a full scan, so a bulk load
+            # runs it only for a file whose edges it already wrote.
+            self._conn.execute("DELETE FROM edges WHERE file_path = ?", (normalized,))
+        if self._bulk_replaced is not None:
+            # Its pre-load rows go when the bulk load ends.
+            self._bulk_replacing.append(normalized)
 
         now = time.time()
         if nodes:
             # Planned identities are unique within the file. ON CONFLICT keeps
             # upsert_node()'s semantics for any row another spelling left.
-            node_rows: list[tuple] = []
-            for node, qualified in zip(nodes, identities):
+            def node_row(node: NodeInfo, qualified: str) -> tuple:
                 extra = json.dumps(node.extra) if node.extra else "{}"
-                node_rows.append((
+                return (
                     node.kind, node.name, qualified, node.file_path,
                     node.line_start, node.line_end, node.language,
                     node.parent_name, node.params, node.return_type,
@@ -1975,8 +2220,30 @@ class GraphStore:
                     node_index_tokens(node.kind, node.name, node.parent_name,
                                       normalized),
                     now,
-                ))
-            self._conn.executemany(
+                )
+
+            native = _native_node_rows()
+            stripper = None
+            if native is not None:
+                codec = getattr(self._conn, "codec", None)
+                stripper = codec.native_stripper() if codec is not None else None
+                # ``node_index_tokens`` takes the stem of this same path for
+                # every node of the file.
+                node_rows = native(
+                    nodes if type(nodes) is list else list(nodes), identities, fhash, now,
+                    PurePosixPath(normalized or "").stem, json.dumps, _indexed_docstring,
+                    node_row, stripper,
+                )
+            else:
+                node_rows = [
+                    node_row(node, qualified) for node, qualified in zip(nodes, identities)
+                ]
+            # The rows are already in their stored form when a stripper made them.
+            executemany = (
+                functools.partial(sqlite3.Connection.executemany, self._conn)
+                if stripper is not None else self._conn.executemany
+            )
+            executemany(
                 """INSERT INTO nodes
                    (kind, name, qualified_name, file_path, line_start, line_end,
                     language, parent_name, params, return_type, modifiers, is_test,
@@ -2001,7 +2268,15 @@ class GraphStore:
             (self._make_qualified(node), node.line_start, node.line_end, qualified)
             for node, qualified in zip(nodes, identities)
         )
-        self._insert_edges(self._aligned_edges(normalized, edges, collisions), now)
+        aligned = self._aligned_edges(normalized, edges, collisions)
+        if bulk_files is not None:
+            if all(edge.file_path == normalized for edge in aligned):
+                bulk_files.add(normalized)
+            else:
+                # Rows filed under another path: the skipped DELETE above can
+                # no longer be known to be a no-op, so stop skipping it.
+                self._bulk_edge_files = None
+        self._insert_edges(aligned, now)
         self._invalidate_cache()
 
     def _insert_edges(self, edges: list[EdgeInfo], now: float) -> None:
@@ -2014,12 +2289,26 @@ class GraphStore:
         # plain INSERT batch is safe — the file's previous rows were
         # deleted above and an identical edge cannot come from another
         # file (file_path is part of the identity).
+        native = _native_edge_rows()
+        if native is not None:
+            conn = self._conn
+            codec = getattr(conn, "codec", None)
+            stripper = codec.native_stripper() if codec is not None else None
+            rows = native(edges if type(edges) is list else list(edges), now,
+                          json.dumps, stripper)
+            if stripper is not None:
+                # The rows are already in their stored form.
+                sqlite3.Connection.executemany(conn, _INSERT_EDGE_SQL, rows)
+            else:
+                conn.executemany(_INSERT_EDGE_SQL, rows)
+            return
         edge_by_site: dict[tuple[str, str, str, str, int, int | None], tuple] = {}
         for edge in edges:
             extra_dict = edge.extra if edge.extra else {}
             confidence = float(extra_dict.get("confidence", 1.0))
             confidence_tier = str(extra_dict.get("confidence_tier", "EXTRACTED"))
-            extra = json.dumps(extra_dict)
+            # ``json.dumps({})`` is ``"{}"``; most edges carry no extra.
+            extra = json.dumps(extra_dict) if extra_dict else "{}"
             site = (
                 edge.kind, edge.source, edge.target, edge.file_path, edge.line,
                 extra_dict.get("source_offset"),
@@ -2028,13 +2317,7 @@ class GraphStore:
                 edge.kind, edge.source, edge.target, edge.file_path, edge.line,
                 extra, confidence, confidence_tier, now,
             )
-        self._conn.executemany(
-            """INSERT INTO edges
-               (kind, source_qualified, target_qualified, file_path, line, extra,
-                confidence, confidence_tier, updated_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            list(edge_by_site.values()),
-        )
+        self._conn.executemany(_INSERT_EDGE_SQL, list(edge_by_site.values()))
 
     def _aligned_edges(
         self,
@@ -2049,6 +2332,23 @@ class GraphStore:
         """
         local_prefix = f"{file_path}::"
         cache: dict[str, list[str]] = {}
+        native = _native_settle_edges()
+        if native is not None:
+            # Alignment reads only *collisions*, so it can run first; the
+            # native pass returns each edge whose endpoints all stay as they
+            # are and hands every other one to the same Python call.
+            if collisions:
+                # An edge with neither endpoint among the collisions is
+                # returned as it is, so only the others are aligned.
+                edges = [
+                    edge if edge.source not in collisions and edge.target not in collisions
+                    else self._align_edge_with_collisions(edge, collisions)
+                    for edge in edges
+                ]
+            return native(
+                edges if type(edges) is list else list(edges), local_prefix, cache,
+                self._stored_identity_candidates, self._resolve_edge_identities,
+            )
         return [
             self._resolve_edge_identities(
                 self._align_edge_with_collisions(edge, collisions)
@@ -3424,43 +3724,70 @@ class GraphStore:
         # takes up edges an earlier pass settled.
         self._resolve_inherited_endpoints()
         self._settle_unbound_endpoints()
+        self._begin_immediate()
+        try:
+            changed = self._native_certainty_refresh() if self._native_sql else -1
+            if changed < 0:
+                changed = self._certainty_refresh_sql()
+            self._conn.commit()
+        except BaseException:
+            self._conn.rollback()
+            raise
+        self._settle_collision_endpoints()
+        return changed
+
+    def _native_certainty_refresh(self) -> int:
+        """The four UPDATEs of ``_certainty_refresh_sql`` in one native pass.
+
+        Same rows, same values, and the same count back. -1 when a row holds
+        a value the native pass does not read the way SQLite does; it has then
+        written nothing.
+        """
+        import crg_fast
+
+        token = crg_fast.stage_certainty_refresh(
+            list(_RESOLVER_BOUND_KEYS),
+            (_SCORE_UNRESOLVED, _SCORE_AMBIGUOUS, _SCORE_INFERRED, _SCORE_EXTRACTED),
+        )
+        try:
+            row = self._conn.execute("SELECT crg_run(?)", (token,)).fetchone()
+        except BaseException:
+            crg_fast.discard_job(token)
+            raise
+        return int(row[0])
+
+    def _certainty_refresh_sql(self) -> int:
+        """Rewrite each edge's resolution, tier and score; rows changed in the first."""
         placeholders = ", ".join("?" for _ in TARGET_RESOLUTION_KINDS)
         call_tier = _certainty_tier_sql(f"target_resolution = '{RESOLUTION_UNRESOLVED}'")
         tested_by_tier = _certainty_tier_sql(
             "NOT EXISTS (SELECT 1 FROM nodes crg_cert_n "
             "WHERE crg_cert_n.qualified_name = edges.source_qualified)"
         )
-        self._begin_immediate()
-        try:
-            cursor = self._conn.execute(
-                "UPDATE edges SET target_resolution = "  # noqa: S608
-                f"{TARGET_RESOLUTION_EXPR} WHERE kind IN ({placeholders}) "
-                f"AND target_resolution IS NOT ({TARGET_RESOLUTION_EXPR})",
-                TARGET_RESOLUTION_KINDS,
-            )
-            # Only rows that change are written. The stored certainty is read by
-            # nothing on the traversal paths, so this must not cost a rewrite of
-            # the whole table on every incremental update.
-            self._conn.execute(
-                f"UPDATE edges SET confidence_tier = {call_tier} "  # noqa: S608
-                f"WHERE kind IN ({placeholders}) AND confidence_tier IS NOT {call_tier}",
-                TARGET_RESOLUTION_KINDS,
-            )
-            self._conn.execute(
-                f"UPDATE edges SET confidence_tier = {tested_by_tier} "  # noqa: S608
-                f"WHERE kind = 'TESTED_BY' AND confidence_tier IS NOT {tested_by_tier}",
-            )
-            self._conn.execute(
-                f"UPDATE edges SET confidence = {_CERTAINTY_SCORE_SQL} "  # noqa: S608
-                f"WHERE kind IN ({placeholders}, 'TESTED_BY') "
-                f"AND confidence IS NOT {_CERTAINTY_SCORE_SQL}",
-                TARGET_RESOLUTION_KINDS,
-            )
-            self._conn.commit()
-        except BaseException:
-            self._conn.rollback()
-            raise
-        self._settle_collision_endpoints()
+        cursor = self._conn.execute(
+            "UPDATE edges SET target_resolution = "  # noqa: S608
+            f"{TARGET_RESOLUTION_EXPR} WHERE kind IN ({placeholders}) "
+            f"AND target_resolution IS NOT ({TARGET_RESOLUTION_EXPR})",
+            TARGET_RESOLUTION_KINDS,
+        )
+        # Only rows that change are written. The stored certainty is read by
+        # nothing on the traversal paths, so this must not cost a rewrite of
+        # the whole table on every incremental update.
+        self._conn.execute(
+            f"UPDATE edges SET confidence_tier = {call_tier} "  # noqa: S608
+            f"WHERE kind IN ({placeholders}) AND confidence_tier IS NOT {call_tier}",
+            TARGET_RESOLUTION_KINDS,
+        )
+        self._conn.execute(
+            f"UPDATE edges SET confidence_tier = {tested_by_tier} "  # noqa: S608
+            f"WHERE kind = 'TESTED_BY' AND confidence_tier IS NOT {tested_by_tier}",
+        )
+        self._conn.execute(
+            f"UPDATE edges SET confidence = {_CERTAINTY_SCORE_SQL} "  # noqa: S608
+            f"WHERE kind IN ({placeholders}, 'TESTED_BY') "
+            f"AND confidence IS NOT {_CERTAINTY_SCORE_SQL}",
+            TARGET_RESOLUTION_KINDS,
+        )
         return cursor.rowcount if cursor.rowcount and cursor.rowcount > 0 else 0
 
     def _resolve_inherited_endpoints(self) -> int:

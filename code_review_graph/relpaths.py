@@ -46,6 +46,10 @@ ESCAPE = "!"
 
 # First characters of a value that is JSON text, translated string by string.
 _JSON_FIRST = frozenset('{["')
+# Entries kept by PathCodec.strip_params before the cache starts over.
+_STRIP_CACHE_LIMIT = 200_000
+# JSON parameters up to this length are cached by strip_params too.
+_CACHED_JSON_MAX = 256
 # A JSON string opens after one of these (``json.dumps`` output) or at the
 # start of the value; a quote anywhere else is inside a string.
 _JSON_STRING_START = r'(?:^|(?<=[{\[,:\s]))"'
@@ -167,8 +171,15 @@ class PathCodec:
         # Besides JSON text, the first characters a value must start with for strip() to change it:
         # a root spelling's, or "." / "!" (what _looks_relative needs).
         self._leads = frozenset({v[:1] for v in self._roots} | {".", ESCAPE})
+        # Any value strip() can change starts with one of these.
+        self._strip_leads = self._leads | _JSON_FIRST
         self._lock = threading.Lock()
         self._specs: dict[int, tuple[Any, tuple[int, ...]]] = {}
+        # The last cursor description and its spec, read once per row.
+        self._last_spec: tuple[Any, tuple[int, ...]] = (None, ())
+        # Stored form of each recently stripped non-JSON value (see strip_params).
+        self._strip_cache: dict[str, str] = {}
+        self._native_stripper: Any = None
 
     # -- inbound -------------------------------------------------------------
 
@@ -206,14 +217,77 @@ class PathCodec:
         return stripped
 
     def strip_params(self, params: Any) -> Any:
+        strip, leads = self.strip, self._strip_leads
         if isinstance(params, dict):
-            return {k: self.strip(v) if isinstance(v, str) else v for k, v in params.items()}
+            return {
+                k: strip(v) if isinstance(v, str) and v[:1] in leads else v
+                for k, v in params.items()
+            }
         if isinstance(params, (tuple, list)):
-            strip = self.strip
-            return tuple([strip(v) if isinstance(v, str) else v for v in params])
+            # A batch repeats the same paths and names row after row, so each
+            # stored form is worked out once, and a string that needs nothing
+            # is remembered as itself. Long JSON text is rarely repeated and is
+            # left out of the cache; short metadata such as ``{}`` repeats.
+            cache = self._strip_cache
+            if len(cache) > _STRIP_CACHE_LIMIT:
+                cache.clear()
+            get = cache.get
+            out: Optional[list] = None
+            for index, v in enumerate(params):
+                if type(v) is not str:
+                    if not isinstance(v, str):
+                        continue
+                    # A str subclass: the plain path, which never caches it.
+                    if v[:1] not in leads:
+                        continue
+                    stored = strip(v)
+                else:
+                    stored = get(v)
+                    if stored is None:
+                        first = v[:1]
+                        if first not in leads:
+                            stored = v
+                        else:
+                            stored = strip(v)
+                        if first not in _JSON_FIRST or len(v) <= _CACHED_JSON_MAX:
+                            cache[v] = stored
+                if stored is not v:
+                    if out is None:
+                        out = list(params)
+                    out[index] = stored
+            return tuple(params) if out is None else tuple(out)
         return params
 
+    def native_stripper(self) -> Any:
+        """:meth:`strip_params` for row tuples in ``crg_fast``, or None without it."""
+        stripper = self._native_stripper
+        if stripper is None:
+            try:
+                import crg_fast
+            except ImportError:
+                return None
+            stripper = crg_fast.PathStripper(
+                list(self._prefixes), list(self._roots), sorted(self._leads), self.strip,
+            )
+            self._native_stripper = stripper
+        return stripper
+
     # -- outbound ------------------------------------------------------------
+
+    def fast_row_factory(self) -> Any:
+        """:meth:`row_factory`, from ``crg_fast`` under ``CRG_FAST_ENGINE``."""
+        from .parser import fast_engine_enabled
+
+        if not fast_engine_enabled():
+            return self.row_factory
+        try:
+            import crg_fast
+        except ImportError:
+            return self.row_factory
+        restorer = getattr(crg_fast, "RowRestorer", None)
+        if restorer is None:
+            return self.row_factory
+        return restorer(self.root, self.restore, self._spec, sqlite3.Row)
 
     def _restore_json_match(self, match: re.Match) -> str:
         escape = match.group("esc")
@@ -267,7 +341,11 @@ class PathCodec:
         return result
 
     def row_factory(self, cursor: sqlite3.Cursor, row: tuple) -> sqlite3.Row:
-        spec = self._spec(cursor)
+        last_desc, spec = self._last_spec
+        desc = cursor.description
+        if desc is not last_desc or desc is None:
+            spec = self._spec(cursor)
+            self._last_spec = (desc, spec)
         if spec:
             values = None
             for index in spec:
@@ -275,7 +353,12 @@ class PathCodec:
                 if isinstance(value, str) and value[:1] in _RESTORED_FIRST:
                     if values is None:
                         values = list(row)
-                    values[index] = self.restore(value)
+                    # ``./x`` is by far the commonest stored form; restore() says the same.
+                    values[index] = (
+                        self.root + value[1:]
+                        if value.startswith(REL_PREFIX)
+                        else self.restore(value)
+                    )
             if values is not None:
                 row = tuple(values)
         return sqlite3.Row(cursor, row)
@@ -304,7 +387,7 @@ class TranslatingConnection(sqlite3.Connection):
         """Turn translation on for *root*, or off with ``None``."""
         if root:
             self.codec = PathCodec(root)
-            self.row_factory = self.codec.row_factory
+            self.row_factory = self.codec.fast_row_factory()
         else:
             self.codec = None
             self.row_factory = sqlite3.Row

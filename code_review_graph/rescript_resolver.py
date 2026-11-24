@@ -35,6 +35,10 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# First characters the path codec may rewrite in a stored value (relative and
+# escaped forms, JSON text); a root starts with "/" and is checked separately.
+_CODEC_LEADS = frozenset('.!{["')
+
 
 def resolve_rescript_cross_module(store: GraphStore) -> dict:
     """Resolve ReScript cross-module targets in the graph store.
@@ -97,7 +101,25 @@ def resolve_rescript_cross_module(store: GraphStore) -> dict:
             opens_by_file.setdefault(fp, []).append(root)
 
     # --- 1 + 2. Resolve CALLS edges ---
+    # Only a call naming a ReScript module, or made from a ReScript file that
+    # opens one, can resolve; SQL drops the rest before they become rows. The
+    # filter is looser than the checks below (LIKE ignores case, and a stored
+    # ``./`` value is kept whatever it restores to), never tighter.
+    # A module name starting with a character the path codec rewrites would
+    # not compare equal in its stored form, so such a graph keeps the full scan.
+    heads = json.dumps(sorted(basename_to_path))
+    filtered = not any(
+        stem[:1] in _CODEC_LEADS or stem[:1] == "/" for stem in basename_to_path
+    )
     call_rows = conn.execute(
+        "SELECT id, source_qualified, target_qualified, file_path, extra "
+        "FROM edges WHERE kind = 'CALLS' AND target_qualified NOT LIKE '%::%' "
+        "AND (file_path LIKE '%.res' OR file_path LIKE '%.resi' "
+        "OR target_qualified LIKE './%' "
+        "OR substr(target_qualified, 1, instr(target_qualified, '.') - 1) "
+        "IN (SELECT value FROM json_each(?)))",
+        (heads,),
+    ).fetchall() if filtered else conn.execute(
         "SELECT id, source_qualified, target_qualified, file_path, extra "
         "FROM edges WHERE kind = 'CALLS'"
     ).fetchall()
@@ -133,6 +155,13 @@ def resolve_rescript_cross_module(store: GraphStore) -> dict:
     # --- 3. Resolve IMPORTS_FROM edge targets to file paths ---
     import_updates: list[tuple[str, int]] = []
     import_rows_full = conn.execute(
+        "SELECT id, target_qualified, file_path FROM edges "
+        "WHERE kind = 'IMPORTS_FROM' AND (target_qualified LIKE './%' "
+        "OR (CASE WHEN instr(target_qualified, '.') > 0 "
+        "THEN substr(target_qualified, 1, instr(target_qualified, '.') - 1) "
+        "ELSE target_qualified END) IN (SELECT value FROM json_each(?)))",
+        (heads,),
+    ).fetchall() if filtered else conn.execute(
         "SELECT id, target_qualified, file_path FROM edges "
         "WHERE kind = 'IMPORTS_FROM'"
     ).fetchall()

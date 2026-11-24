@@ -344,7 +344,9 @@ def resolve_aop_advice(store: "GraphStore") -> dict:
     # -------------------------------------------------------------------
     stale_ids: list[tuple[int]] = []
     for row in conn.execute(
-        "SELECT id, extra FROM edges WHERE kind = 'CALLS'"
+        # Only an edge whose extra names the flag can carry it.
+        "SELECT id, extra FROM edges WHERE kind = 'CALLS' "
+        "AND extra LIKE '%\"aop_resolved\"%'"
     ).fetchall():
         if _load_extra(row["extra"]).get(_DERIVED_FLAG):
             stale_ids.append((row["id"],))

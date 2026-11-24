@@ -834,7 +834,7 @@ def _dedupe_community_names(
 
 
 def detect_communities(
-    store: GraphStore, min_size: int = 2
+    store: GraphStore, min_size: int = 2, nodes: list[GraphNode] | None = None,
 ) -> list[dict[str, Any]]:
     """Detect communities in the code graph.
 
@@ -844,6 +844,8 @@ def detect_communities(
     Args:
         store: The GraphStore instance.
         min_size: Minimum number of nodes for a community to be included.
+        nodes: What ``store.get_all_nodes(exclude_files=True)`` returns, when
+            the caller already holds it.
 
     Returns:
         List of community dicts with keys: name, level, size, cohesion,
@@ -858,7 +860,7 @@ def detect_communities(
         ).fetchall()
     ]
     # Gather all nodes (exclude File nodes to focus on code entities)
-    unique_nodes = store.get_all_nodes(exclude_files=True)
+    unique_nodes = nodes if nodes is not None else store.get_all_nodes(exclude_files=True)
 
     logger.debug(
         "Loaded %d unique nodes, %d edges",
