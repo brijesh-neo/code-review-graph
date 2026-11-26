@@ -14,9 +14,10 @@ import json
 import logging
 import re
 import sqlite3
+import sys
 import threading
 import time
-from collections.abc import Iterable, Iterator
+from collections.abc import Callable, Iterable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath, PureWindowsPath
@@ -1273,6 +1274,10 @@ class GraphStore:
         # transaction. The old rows are deleted in one pass when it ends.
         self._bulk_replaced: set[str] | None = None
         self._bulk_replacing: list[str] = []
+        # While grouped_writes() runs: files stored in its open transaction,
+        # else None.
+        self._write_group: list[int] | None = None
+        self._write_group_limit = 0
         self._cache_epoch = 0
         # Identifies the read transaction currently open on this connection,
         # so a reader cannot roll back a transaction a writer took from it.
@@ -1994,6 +1999,10 @@ class GraphStore:
         """Start an IMMEDIATE transaction, rolling back any prior uncommitted
         transaction first (regression guard for #135 / #489).
         """
+        if self._conn.in_transaction and self._write_group is not None:
+            # A grouped write's transaction holds only whole files: commit them
+            # rather than lose them.
+            self._commit_write_group()
         if self._conn.in_transaction:
             if self._active_read_txn is None:
                 logger.warning(
@@ -2011,6 +2020,9 @@ class GraphStore:
         self, file_path: str, nodes: list[NodeInfo], edges: list[EdgeInfo], fhash: str = ""
     ) -> None:
         """Atomically replace all data for a file."""
+        if self._write_group is not None:
+            self._grouped_write(lambda: self._replace_file_data(file_path, nodes, edges, fhash), 1)
+            return
         self._begin_immediate()
         try:
             self._replace_file_data(file_path, nodes, edges, fhash)
@@ -2021,6 +2033,169 @@ class GraphStore:
             raise
         self._bulk_committed()
         self._invalidate_cache()
+
+    @contextmanager
+    def grouped_writes(self, limit: int, bulk_edges: bool = False) -> Iterator[None]:
+        """Commit the files :meth:`store_file_nodes_edges` and :meth:`store_files_edges`
+        store about *limit* at a time instead of once per call.
+
+        Each file is still written whole, in call order, so the rows and their
+        ids are those of one commit per call; the reads between calls go
+        through this connection and see the open transaction. A commit writes
+        every page the transaction dirtied, and the indexes the files share
+        are dirtied again by each one, so fewer commits write far fewer pages.
+        A failed write rolls back the files stored since the last commit; a
+        build state that one commit per call could also leave behind.
+
+        With *bulk_edges*, everything is written in one transaction with the
+        edge indexes dropped (see :meth:`_grouped_bulk_edges`).
+        """
+        if self._write_group is not None:
+            yield
+            return
+        if bulk_edges and self._bulk_edge_files is None and self._bulk_replaced is None:
+            with self._grouped_bulk_edges():
+                yield
+            return
+        self._write_group = [0]
+        self._write_group_limit = max(1, limit)
+        try:
+            yield
+            self._commit_write_group()
+        except BaseException:
+            if self._conn.in_transaction:
+                self._conn.rollback()
+            self._bulk_replacing.clear()
+            raise
+        finally:
+            self._write_group = None
+
+    @contextmanager
+    def _grouped_bulk_edges(self) -> Iterator[None]:
+        """:meth:`grouped_writes` in one transaction with the edge indexes dropped.
+
+        For a write that replaces most of the edge rows: building the indexes
+        once is cheaper than updating them for every row. As in
+        :meth:`bulk_edge_load`, a stored file's pre-load rows stay in place
+        while it runs and are deleted in one pass at the end, which leaves the
+        rows and ids a per-file DELETE would. The reads between writes do not
+        read edges. A failure rolls the whole transaction back, indexes too.
+        """
+        self._begin_immediate()
+        try:
+            old_max_id = self._conn.execute("SELECT MAX(id) FROM edges").fetchone()[0]
+            indexes = self._conn.execute(
+                "SELECT name, sql FROM sqlite_master WHERE type = 'index' "
+                "AND tbl_name = 'edges' AND sql IS NOT NULL ORDER BY rowid"
+            ).fetchall()
+            # DROP INDEX deletes an index's planner statistics. An update does
+            # not run ANALYZE, so they are put back as they were.
+            stats = self._edge_index_stats({name for name, _sql in indexes})
+            for name, _sql in indexes:
+                self._conn.execute(f'DROP INDEX IF EXISTS "{name}"')  # nosec B608
+        except BaseException:
+            self._conn.rollback()
+            raise
+        self._bulk_edge_files = set()
+        self._bulk_replaced = set() if old_max_id is not None else None
+        self._bulk_replacing.clear()
+        # Never full: everything commits once, after the indexes are back.
+        self._write_group = [0]
+        self._write_group_limit = sys.maxsize
+        finished = False
+        try:
+            yield
+            finished = True
+        finally:
+            self._write_group = None
+            self._bulk_edge_files = None
+            replaced, self._bulk_replaced = self._bulk_replaced, None
+            if finished and replaced is not None:
+                replaced.update(self._bulk_replacing)
+            self._bulk_replacing.clear()
+            if not finished and self._conn.in_transaction:
+                # Left: only what a commit in between (another writer's
+                # BEGIN) already made durable.
+                self._conn.rollback()
+            if replaced:
+                self._delete_replaced_edges(old_max_id, replaced, commit=False)
+            present = {
+                row[0] for row in self._conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'index' "
+                    "AND tbl_name = 'edges'"
+                )
+            }
+            for name, sql in indexes:
+                if name not in present:
+                    self._conn.execute(sql)
+            if stats and self._edge_index_stats({name for name, _sql in indexes}) != stats:
+                self._conn.execute(
+                    "DELETE FROM sqlite_stat1 WHERE tbl = 'edges' AND idx IN "
+                    "(SELECT value FROM json_each(?))",
+                    (json.dumps([idx for _rowid, _tbl, idx, _stat in stats]),),
+                )
+                self._conn.executemany(
+                    "INSERT INTO sqlite_stat1 (rowid, tbl, idx, stat) VALUES (?, ?, ?, ?)",
+                    stats,
+                )
+                # Load the restored rows into the query planner.
+                self._conn.execute("ANALYZE sqlite_schema")
+            self._conn.commit()
+            self._invalidate_cache()
+
+    def _edge_index_stats(self, names: set[str]) -> list[tuple[int, str, str, str]]:
+        """The sqlite_stat1 rows of the edge indexes *names*, in rowid order."""
+        if self._conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'sqlite_stat1'"
+        ).fetchone() is None:
+            return []
+        return [
+            (row[0], row[1], row[2], row[3]) for row in self._conn.execute(
+                "SELECT rowid, tbl, idx, stat FROM sqlite_stat1 WHERE tbl = 'edges' "
+                "ORDER BY rowid"
+            ) if row[2] in names
+        ]
+
+    def _grouped_write(self, write: Callable[[], None], files: int) -> None:
+        """Run *write* in the open :meth:`grouped_writes` transaction."""
+        group = self._write_group
+        assert group is not None
+        if not self._conn.in_transaction:
+            self._begin_immediate()
+            group[0] = 0
+        try:
+            write()
+        except BaseException:
+            self._conn.rollback()
+            self._bulk_replacing.clear()
+            group[0] = 0
+            raise
+        group[0] += files
+        self._invalidate_cache()
+        if group[0] >= self._write_group_limit:
+            self._commit_write_group()
+
+    def _commit_write_group(self) -> None:
+        """Commit the files :meth:`grouped_writes` has stored so far."""
+        group = self._write_group
+        if group is None:
+            return
+        if self._conn.in_transaction:
+            self._conn.commit()
+            self._bulk_committed()
+        group[0] = 0
+
+    def edge_row_share(self, file_paths: Iterable[str]) -> float:
+        """The share of the edge rows filed under *file_paths*, from 0 to 1."""
+        total = self._conn.execute("SELECT COUNT(*) FROM edges").fetchone()[0]
+        if not total:
+            return 0.0
+        count = 0
+        for path in dict.fromkeys(normalize_file_path(p) for p in file_paths):
+            count += self._conn.execute(
+                "SELECT COUNT(*) FROM edges WHERE file_path = ?", (path,),
+            ).fetchone()[0]
+        return count / total
 
     def _bulk_committed(self) -> None:
         """Count the files of a committed transaction as replaced by the bulk load."""
@@ -2093,7 +2268,9 @@ class GraphStore:
         self._bulk_committed()
         self._invalidate_cache()
 
-    def _delete_replaced_edges(self, old_max_id: int, replaced: set[str]) -> None:
+    def _delete_replaced_edges(
+        self, old_max_id: int, replaced: set[str], commit: bool = True,
+    ) -> None:
         """Delete the pre-load edge rows (id <= *old_max_id*) of the *replaced* files."""
         self._conn.execute(
             "CREATE TEMP TABLE IF NOT EXISTS crg_bulk_replaced (path TEXT PRIMARY KEY)"
@@ -2109,7 +2286,8 @@ class GraphStore:
             (old_max_id,),
         )
         self._conn.execute("DROP TABLE temp.crg_bulk_replaced")
-        self._conn.commit()
+        if commit:
+            self._conn.commit()
 
     def store_file_edges(self, file_path: str, edges: list[EdgeInfo]) -> None:
         """Atomically replace a file's edges and keep its node rows.
@@ -2126,6 +2304,12 @@ class GraphStore:
         one commit per file was most of the cost of writing them.
         """
         if not batch:
+            return
+        if self._write_group is not None:
+            def write() -> None:
+                for file_path, edges in batch:
+                    self._replace_file_edges(normalize_file_path(file_path), edges)
+            self._grouped_write(write, len(batch))
             return
         self._begin_immediate()
         try:
@@ -2153,10 +2337,18 @@ class GraphStore:
             )
             for row in stored
         )
-        self._conn.execute("DELETE FROM edges WHERE file_path = ?", (normalized,))
-        self._insert_edges(
-            self._aligned_edges(normalized, edges, collisions), time.time(),
-        )
+        bulk_files = self._bulk_edge_files
+        if bulk_files is None or normalized in bulk_files:
+            self._conn.execute("DELETE FROM edges WHERE file_path = ?", (normalized,))
+        if self._bulk_replaced is not None:
+            self._bulk_replacing.append(normalized)
+        aligned = self._aligned_edges(normalized, edges, collisions)
+        if bulk_files is not None:
+            if all(edge.file_path == normalized for edge in aligned):
+                bulk_files.add(normalized)
+            else:
+                self._bulk_edge_files = None
+        self._insert_edges(aligned, time.time())
 
     def relocate_edge_targets(self, old_prefix: str, new_prefix: str) -> int:
         """Rewrite edge targets that start with *old_prefix* to *new_prefix*.

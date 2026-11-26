@@ -2842,6 +2842,12 @@ _MAX_DEPENDENT_FILES = 500
 # Dependents whose edges are re-saved per transaction. Each commit holds the
 # write lock only for its own batch, so other writers still get turns.
 _EDGE_WRITE_BATCH = 64
+# Files grouped_writes() commits together during an update (CRG_FAST_ENGINE).
+_GROUPED_WRITE_FILES = 256
+# Share of the edge rows an update must replace before it writes them with the
+# edge indexes dropped (CRG_FAST_ENGINE): rebuilding the indexes costs about
+# what updating them for 40% of the rows does.
+_BULK_EDGE_SHARE = 0.5
 
 
 def _single_hop_dependents(store: GraphStore, file_path: str) -> set[str]:
@@ -4371,56 +4377,68 @@ def incremental_update(
         store.store_file_nodes_edges(str(repo_root / rel_path), nodes, edges, fhash)
         stored_sources[rel_path] = fhash
 
-    use_serial = os.environ.get("CRG_SERIAL_PARSE", "") == "1"
-    parsed_files = 0
+    # Under the native engine the stored files are committed a group at a
+    # time: one commit per file rewrote the shared index pages every time.
+    # When they replace most of the edge rows, the edge indexes are dropped
+    # and rebuilt once instead.
+    fast_writes = fast_engine_enabled()
+    bulk_edges = fast_writes and len(to_parse) >= 8 and store.edge_row_share(
+        str(repo_root / rel_path) for rel_path in to_parse
+    ) >= _BULK_EDGE_SHARE
+    with (
+        store.grouped_writes(_GROUPED_WRITE_FILES, bulk_edges=bulk_edges) if fast_writes
+        else nullcontext()
+    ):
+        use_serial = os.environ.get("CRG_SERIAL_PARSE", "") == "1"
+        parsed_files = 0
 
-    if use_serial or len(to_parse) < 8:
-        for rel_path in to_parse:
-            abs_path = repo_root / rel_path
-            try:
-                source = abs_path.read_bytes()
-                fhash = hashlib.sha256(source).hexdigest()
-                ready = preparsed.pop(rel_path, None)
-                if ready is not None and ready[0] == source:
-                    nodes, edges = ready[1], ready[2]
-                else:
-                    nodes, edges = parser.parse_bytes(abs_path, source)
-            except (OSError, PermissionError) as e:
-                errors.append({"file": rel_path, "error": str(e)})
-                continue
-            except Exception as e:
-                logger.warning("Error parsing %s: %s", rel_path, e)
-                errors.append({"file": rel_path, "error": str(e)})
-                continue
-            # Parse succeeded: note this file's flows, then replace its nodes.
-            # Same reasoning as the serial loop in full_build: a failed write
-            # is not a failed parse. Letting it propagate stops the update
-            # before the freshness anchor is advanced, so the next run still
-            # sees this file as changed.
-            store_parsed(rel_path, nodes, edges, fhash)
-            remaining_identity.discard(rel_path)
-            parsed_files += 1
-            total_nodes += len(nodes)
-            total_edges += len(edges)
-    else:
-        # See full-build comment above for executor kind rationale.
-        _prewarm_parser_probes(parser, to_parse)
-        args_list = [(rel_path, str(repo_root)) for rel_path in to_parse]
-        with _make_executor(_MAX_PARSE_WORKERS) as executor:
-            for rel_path, nodes, edges, error, fhash in _parse_results(
-                executor, args_list, 20,
-            ):
-                if error:
-                    logger.warning("Error parsing %s: %s", rel_path, error)
-                    errors.append({"file": rel_path, "error": error})
+        if use_serial or len(to_parse) < 8:
+            for rel_path in to_parse:
+                abs_path = repo_root / rel_path
+                try:
+                    source = abs_path.read_bytes()
+                    fhash = hashlib.sha256(source).hexdigest()
+                    ready = preparsed.pop(rel_path, None)
+                    if ready is not None and ready[0] == source:
+                        nodes, edges = ready[1], ready[2]
+                    else:
+                        nodes, edges = parser.parse_bytes(abs_path, source)
+                except (OSError, PermissionError) as e:
+                    errors.append({"file": rel_path, "error": str(e)})
                     continue
+                except Exception as e:
+                    logger.warning("Error parsing %s: %s", rel_path, e)
+                    errors.append({"file": rel_path, "error": str(e)})
+                    continue
+                # Parse succeeded: note this file's flows, then replace its nodes.
+                # Same reasoning as the serial loop in full_build: a failed write
+                # is not a failed parse. Letting it propagate stops the update
+                # before the freshness anchor is advanced, so the next run still
+                # sees this file as changed.
                 store_parsed(rel_path, nodes, edges, fhash)
                 remaining_identity.discard(rel_path)
                 parsed_files += 1
                 total_nodes += len(nodes)
                 total_edges += len(edges)
+        else:
+            # See full-build comment above for executor kind rationale.
+            _prewarm_parser_probes(parser, to_parse)
+            args_list = [(rel_path, str(repo_root)) for rel_path in to_parse]
+            with _make_executor(_MAX_PARSE_WORKERS) as executor:
+                for rel_path, nodes, edges, error, fhash in _parse_results(
+                    executor, args_list, 20,
+                ):
+                    if error:
+                        logger.warning("Error parsing %s: %s", rel_path, error)
+                        errors.append({"file": rel_path, "error": error})
+                        continue
+                    store_parsed(rel_path, nodes, edges, fhash)
+                    remaining_identity.discard(rel_path)
+                    parsed_files += 1
+                    total_nodes += len(nodes)
+                    total_edges += len(edges)
 
-    flush_edges()
+        flush_edges()
     if fast_engine_enabled():
         _save_source_copies(store, repo_root, stored_sources)
 
