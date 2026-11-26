@@ -480,16 +480,62 @@ fn dedupe(communities: &mut [Community], nodes: &[Node]) {
 }
 
 /// `store_communities` for communities the Leiden detector made.
+/// Every node's id, stored qualified name and community id, read before
+/// anything is written so a value this cannot read fails with nothing written.
+pub(crate) fn read_assignments(
+    db: *mut ffi::sqlite3,
+    paths: &Paths,
+) -> R<Vec<(i64, String, Option<i64>)>> {
+    let rows = Rows::new(
+        db,
+        "SELECT id, qualified_name, community_id IS NULL, IFNULL(community_id, 0) FROM nodes",
+        paths,
+    )?;
+    let mut current = Vec::new();
+    while rows.step()? {
+        let id = rows.int(0)?;
+        let qn = rows.stored(1)?.ok_or(Fail::Back)?.to_owned();
+        let community = if rows.truthy(2)? { None } else { Some(rows.int(3)?) };
+        current.push((id, qn, community));
+    }
+    Ok(current)
+}
+
+/// What `UPDATE nodes SET community_id = NULL` followed by one
+/// `UPDATE nodes SET community_id = ? WHERE qualified_name = ?` per member
+/// leaves, written only where a node's value changes. *wanted* maps a stored
+/// qualified name to its community, the last assignment winning.
+pub(crate) fn write_assignments(
+    db: *mut ffi::sqlite3,
+    current: &[(i64, String, Option<i64>)],
+    wanted: &HashMap<String, i64>,
+) -> R<()> {
+    let update = Stmt::prepare(db, "UPDATE nodes SET community_id = ? WHERE id = ?")?;
+    for (id, qn, community) in current {
+        let target = wanted.get(qn).copied();
+        if target == *community {
+            continue;
+        }
+        match target {
+            Some(value) => update.bind_i64(1, value)?,
+            None => update.bind_null(1)?,
+        }
+        update.bind_i64(2, *id)?;
+        update.run()?;
+    }
+    Ok(())
+}
+
 fn store(db: *mut ffi::sqlite3, paths: &Paths, nodes: &[Node], communities: &[Community]) -> R<i64> {
+    let current = read_assignments(db, paths)?;
     Stmt::prepare(db, "DELETE FROM communities")?.run()?;
-    Stmt::prepare(db, "UPDATE nodes SET community_id = NULL")?.run()?;
+    let mut wanted: HashMap<String, i64> = HashMap::default();
     let insert = Stmt::prepare(
         db,
         "INSERT INTO communities \
          (name, level, cohesion, size, dominant_language, description) \
          VALUES (?, ?, ?, ?, ?, ?)",
     )?;
-    let assign = Stmt::prepare(db, "UPDATE nodes SET community_id = ? WHERE qualified_name = ?")?;
     for community in communities {
         insert.bind_text(1, &paths.strip(&community.name))?;
         insert.bind_i64(2, community.level)?;
@@ -500,11 +546,10 @@ fn store(db: *mut ffi::sqlite3, paths: &Paths, nodes: &[Node], communities: &[Co
         insert.run()?;
         let id = unsafe { ffi::sqlite3_last_insert_rowid(db) };
         for &m in &community.members {
-            assign.bind_i64(1, id)?;
-            assign.bind_text(2, &paths.strip(&nodes[m].qualified_name))?;
-            assign.run()?;
+            wanted.insert(paths.strip(&nodes[m].qualified_name).into_owned(), id);
         }
     }
+    write_assignments(db, &current, &wanted)?;
     // Metadata values are not translated.
     if communities.is_empty() {
         let delete = Stmt::prepare(db, "DELETE FROM metadata WHERE key = ?")?;
