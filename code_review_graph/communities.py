@@ -10,6 +10,7 @@ import importlib.util
 import logging
 import random
 import re
+import sys
 from collections import Counter, defaultdict, namedtuple
 from collections.abc import Sequence
 from pathlib import Path
@@ -360,6 +361,28 @@ def _reassign_test_nodes(
     return reassigned
 
 
+def _import_igraph() -> Any:
+    """``import igraph``; under the fast engine, without its matplotlib backend.
+
+    igraph's drawing package imports matplotlib when it is installed, which
+    costs most of igraph's import time and is only needed for plotting. Under
+    ``CRG_FAST_ENGINE`` the import runs with matplotlib hidden, so igraph
+    takes its no-matplotlib path; Leiden is the same code either way.
+    """
+    from .parser import fast_engine_enabled
+
+    if not fast_engine_enabled() or "matplotlib" in sys.modules:
+        import igraph as _ig  # type: ignore[import-untyped]
+        return _ig
+    sys.modules["matplotlib"] = None  # type: ignore[assignment]
+    try:
+        import igraph as _ig
+    finally:
+        if sys.modules.get("matplotlib", 0) is None:
+            del sys.modules["matplotlib"]
+    return _ig
+
+
 def _load_igraph() -> bool:
     """Import igraph lazily; a failed import disables the package for good.
 
@@ -374,7 +397,7 @@ def _load_igraph() -> bool:
     if ig is not None:
         return True
     try:
-        import igraph as _ig  # type: ignore[import-untyped]
+        _ig = _import_igraph()
         # A native build can import and still fail on first attribute access,
         # so touch the type we need while the handlers are still in scope.
         _ig.Graph
@@ -1132,6 +1155,84 @@ def store_communities(
     return count
 
 
+
+def _leiden_clusters(
+    vertex_count: int,
+    edge_list: list[tuple[int, int]],
+    weights: list[float],
+    **leiden_args: Any,
+) -> Any:
+    """igraph's Leiden partition of a weighted graph, seeded as everywhere here."""
+    g = ig.Graph(n=vertex_count, edges=edge_list, directed=False)
+    g.es["weight"] = weights
+    seed = env_int("CRG_LEIDEN_SEED", _LEIDEN_SEED)
+    # Deterministic seeding for benchmark reproducibility — community
+    # detection is not a security-sensitive context. nosec B311.
+    ig.set_random_number_generator(random.Random(seed))  # nosec B311
+    return g.community_leiden(
+        objective_function="modularity", weights="weight", **leiden_args,
+    )
+
+
+def _native_leiden_store(store: GraphStore, min_size: int) -> int:
+    """``store_communities(store, detect_communities(store, min_size))`` with Leiden.
+
+    ``crg_fast`` reads the graph once and does every step but the Leiden
+    calls, which igraph runs here on the same graphs with the same seed, so
+    the stored communities are the same. -1 when this ``crg_fast`` lacks the
+    passes or the graph holds something they do not read the way Python
+    does; nothing is written then.
+    """
+    try:
+        import crg_fast
+    except ImportError:
+        return -1
+    stage_read = getattr(crg_fast, "stage_leiden_read", None)
+    if stage_read is None or getattr(crg_fast, "stage_leiden_store", None) is None:
+        return -1
+    token, state = stage_read(list(EDGE_WEIGHTS.items()), 0.5, store._codec_fields())
+    try:
+        try:
+            row = store._conn.execute("SELECT crg_run(?)", (token,)).fetchone()
+        except BaseException:
+            crg_fast.discard_job(token)
+            raise
+        if int(row[0]) < 0:
+            return -1
+        graph = crg_fast.leiden_graph(state)
+        if graph is None:
+            return -1
+        vertex_count, edge_list, weights = graph
+        import math
+        resolution = max(0.05, 1.0 / math.log10(max(vertex_count, 10)))
+        partition = _leiden_clusters(
+            vertex_count, edge_list, weights, resolution=resolution, n_iterations=2,
+        )
+        oversized = crg_fast.leiden_communities(
+            state, [list(cluster_ids) for cluster_ids in partition], min_size,
+        )
+        if oversized is None:
+            return -1
+        splits: list[tuple[int, list[list[int]] | None]] = []
+        for position, sub_count, sub_edges, sub_weights in oversized:
+            try:
+                sub_partition = _leiden_clusters(
+                    sub_count, sub_edges, sub_weights, resolution=0.5,
+                )
+                partition_clusters: dict[int, list[int]] = {}
+                for idx, cid in enumerate(sub_partition.membership):
+                    partition_clusters.setdefault(cid, []).append(idx)
+                splits.append((position, list(partition_clusters.values())))
+            except Exception:
+                logger.warning(
+                    "Failed to split community %d, keeping as-is", position, exc_info=True,
+                )
+                splits.append((position, None))
+        return store._native_resolver_job("stage_leiden_store", state, splits)
+    finally:
+        crg_fast.discard_leiden(state)
+
+
 def detect_and_store_communities(
     store: GraphStore, min_size: int = 2, nodes: list[GraphNode] | None = None,
 ) -> int:
@@ -1139,10 +1240,15 @@ def detect_and_store_communities(
 
     Under ``CRG_FAST_ENGINE`` without igraph, the file-based detector and the
     writes run as one native job on the store's connection, with the same
-    result. *nodes* is as for :func:`detect_communities`. Returns the number of
-    communities stored.
+    result. With igraph, only its Leiden calls run in Python
+    (:func:`_native_leiden_store`). *nodes* is as for
+    :func:`detect_communities`. Returns the number of communities stored.
     """
-    if getattr(store, "_native_sql", False) and not _load_igraph():
+    if getattr(store, "_native_sql", False) and _load_igraph():
+        count = _native_leiden_store(store, min_size)
+        if count >= 0:
+            return count
+    elif getattr(store, "_native_sql", False):
         count = store._native_resolver_job("stage_file_communities", min_size)
         if count >= 0:
             logger.info(

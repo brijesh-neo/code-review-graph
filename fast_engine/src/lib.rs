@@ -31,6 +31,7 @@ mod pathcodec;
 mod resolve;
 mod communities;
 mod flows;
+mod leiden;
 
 const CAPSULE_NAME: &CStr = c"tree_sitter.Language";
 
@@ -350,6 +351,11 @@ fn crg_fast(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(resolve::stage_unbound_settle, module)?)?;
     module.add_function(wrap_pyfunction!(communities::stage_file_communities, module)?)?;
     module.add_function(wrap_pyfunction!(flows::stage_flow_trace, module)?)?;
+    module.add_function(wrap_pyfunction!(leiden::stage_leiden_read, module)?)?;
+    module.add_function(wrap_pyfunction!(leiden::discard_leiden, module)?)?;
+    module.add_function(wrap_pyfunction!(leiden::leiden_graph, module)?)?;
+    module.add_function(wrap_pyfunction!(leiden::leiden_communities, module)?)?;
+    module.add_function(wrap_pyfunction!(leiden::stage_leiden_store, module)?)?;
     module.add_function(wrap_pyfunction!(flows::take_flow_trace, module)?)?;
     Ok(())
 }
