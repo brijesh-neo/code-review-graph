@@ -109,6 +109,17 @@ impl<'p> Rows<'p> {
         Ok(self.stmt.bind_text(index, value)?)
     }
 
+    pub fn bind_int(&self, index: c_int, value: i64) -> R<()> {
+        Ok(self.stmt.bind_i64(index, value)?)
+    }
+
+    /// Ready the statement to run again with new bindings.
+    pub fn reset(&self) {
+        unsafe {
+            ffi::sqlite3_reset(self.stmt.raw);
+        }
+    }
+
     pub fn step(&self) -> R<bool> {
         match unsafe { ffi::sqlite3_step(self.stmt.raw) } {
             ffi::SQLITE_ROW => Ok(true),

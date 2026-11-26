@@ -862,6 +862,67 @@ def _trace_single_flow(
     return flow
 
 
+def _native_traced_flows(
+    store: GraphStore, entry_points: list[GraphNode], max_depth: int,
+) -> Optional[list[dict]]:
+    """``_trace_single_flow`` over a lazy adjacency, for each of *entry_points*, natively.
+
+    The same reads in the same order, so the same flows. None when this
+    ``crg_fast`` lacks the pass, SQLite would read calls in an order the lazy
+    adjacency does not reproduce, or a row holds a value the pass does not
+    read the way Python does.
+    """
+    try:
+        import crg_fast
+    except ImportError:
+        return None
+    stage_job = getattr(crg_fast, "stage_flow_trace", None)
+    take = getattr(crg_fast, "take_flow_trace", None)
+    if stage_job is None or take is None or not getattr(store, "_native_sql", False):
+        return None
+    order = _plan_order(store._conn, _CALLS_SQL, _CALLS_ORDERS)
+    if order is None:
+        return None
+    entries = [(ep.id, ep.qualified_name, ep.name, ep.file_path) for ep in entry_points]
+    token = stage_job(entries, max_depth, order, store._codec_fields())
+    try:
+        row = store._conn.execute("SELECT crg_run(?)", (token,)).fetchone()
+    except BaseException:
+        crg_fast.discard_job(token)
+        take(token)
+        raise
+    traced = take(token)
+    if int(row[0]) < 0 or traced is None:
+        return None
+    sensitive: dict[tuple[str, str], bool] = {}
+    flows: list[dict] = []
+    for ep, result in zip(entry_points, traced):
+        if result is None:
+            continue
+        path, depth, file_count, scored, scored_files, external_count, tested_count = result
+        security_hits = 0
+        for qualified_name, name in scored:
+            key = (name, qualified_name)
+            hit = sensitive.get(key)
+            if hit is None:
+                hit = sensitive[key] = _security_sensitive(name, qualified_name)
+            security_hits += hit
+        flows.append({
+            "name": _sanitize_name(ep.name),
+            "entry_point": ep.qualified_name,
+            "entry_point_id": ep.id,
+            "path": path,
+            "depth": depth,
+            "node_count": len(path),
+            "file_count": file_count,
+            "criticality": _criticality_score(
+                scored_files, external_count, security_hits, tested_count,
+                len(scored), depth,
+            ),
+        })
+    return flows
+
+
 def trace_flows(
     store: GraphStore,
     max_depth: int = 15,
@@ -931,39 +992,55 @@ def compute_criticality(flow: dict, adj: FlowAdjacency) -> float:
     if not nodes:
         return 0.0
 
-    # --- File spread (0.0 - 1.0) ---
     file_count = len({n.file_path for n in nodes})
-    # Normalize: 1 file => 0.0, 5+ files => 1.0
-    file_spread = min((file_count - 1) / 4.0, 1.0) if file_count > 1 else 0.0
 
-    # --- External calls (0.0 - 1.0) ---
     # Calls that target nodes NOT in the graph are considered external.
     external_count = 0
     for n in nodes:
         for target_qn in calls_out.get(n.qualified_name, ()):
             if target_qn not in nodes_by_qn:
                 external_count += 1
+
+    security_hits = sum(1 for n in nodes if _security_sensitive(n.name, n.qualified_name))
+    tested_count = sum(1 for n in nodes if n.qualified_name in has_tested_by)
+    return _criticality_score(
+        file_count, external_count, security_hits, tested_count, len(nodes),
+        flow.get("depth", 0),
+    )
+
+
+def _security_sensitive(name: str, qualified_name: str) -> bool:
+    """Whether a security keyword is in a node's name or qualified name."""
+    name_lower = name.lower()
+    qn_lower = qualified_name.lower()
+    return any(kw in name_lower or kw in qn_lower for kw in _SECURITY_KEYWORDS)
+
+
+def _criticality_score(
+    file_count: int,
+    external_count: int,
+    security_hits: int,
+    tested_count: int,
+    node_count: int,
+    depth: int,
+) -> float:
+    """The weighted score :func:`compute_criticality` gives these counts."""
+    # --- File spread (0.0 - 1.0) ---
+    # Normalize: 1 file => 0.0, 5+ files => 1.0
+    file_spread = min((file_count - 1) / 4.0, 1.0) if file_count > 1 else 0.0
+
+    # --- External calls (0.0 - 1.0) ---
     # Normalize: 0 => 0.0, 5+ => 1.0
     external_score = min(external_count / 5.0, 1.0)
 
     # --- Security sensitivity (0.0 - 1.0) ---
-    security_hits = 0
-    for n in nodes:
-        name_lower = n.name.lower()
-        qn_lower = n.qualified_name.lower()
-        for kw in _SECURITY_KEYWORDS:
-            if kw in name_lower or kw in qn_lower:
-                security_hits += 1
-                break  # Count each node at most once.
-    security_score = min(security_hits / max(len(nodes), 1), 1.0)
+    security_score = min(security_hits / max(node_count, 1), 1.0)
 
     # --- Test coverage gap (0.0 - 1.0) ---
-    tested_count = sum(1 for n in nodes if n.qualified_name in has_tested_by)
-    coverage = tested_count / max(len(nodes), 1)
+    coverage = tested_count / max(node_count, 1)
     test_gap = 1.0 - coverage
 
     # --- Depth (0.0 - 1.0) ---
-    depth = flow.get("depth", 0)
     # Normalize: 0 => 0.0, 10+ => 1.0
     depth_score = min(depth / 10.0, 1.0)
 
@@ -1183,7 +1260,13 @@ def incremental_trace_flows(
     # 5. BFS-trace each relevant entry point
     # ------------------------------------------------------------------
     new_flows: list[dict] = []
-    if relevant_eps:
+    native_flows = (
+        _native_traced_flows(store, relevant_eps, max_depth)
+        if relevant_eps and fast_engine_enabled() else None
+    )
+    if native_flows is not None:
+        new_flows = native_flows
+    elif relevant_eps:
         adj = (_lazy_flow_adjacency(store) if fast_engine_enabled() else None) or (
             store.load_flow_adjacency()
         )

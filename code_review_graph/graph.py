@@ -5040,6 +5040,20 @@ class GraphStore:
         """
         return self._native_resolver_job("stage_bare_resolve", kind, endpoint)
 
+    def _codec_fields(self) -> Optional[tuple]:
+        """The path codec's settings as native passes take them, or None."""
+        codec = getattr(self._conn, "codec", None)
+        if codec is None:
+            return None
+        return (
+            codec.root,
+            codec._json_root_out,
+            list(codec._prefixes),
+            list(codec._roots),
+            list(codec._json_roots),
+            sorted(codec._leads),
+        )
+
     def _native_resolver_job(self, stage_name: str, *args: object) -> int:
         """Run one native resolver pass from ``crg_fast`` in one transaction.
 
@@ -5053,17 +5067,7 @@ class GraphStore:
         stage_job = getattr(crg_fast, stage_name, None)
         if stage_job is None:
             return -1
-        codec = getattr(self._conn, "codec", None)
-        fields = None
-        if codec is not None:
-            fields = (
-                codec.root,
-                codec._json_root_out,
-                list(codec._prefixes),
-                list(codec._roots),
-                list(codec._json_roots),
-                sorted(codec._leads),
-            )
+        fields = self._codec_fields()
         self._begin_immediate()
         try:
             token = stage_job(*args, fields)
