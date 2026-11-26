@@ -3535,7 +3535,8 @@ def _prune_source_copies(store: GraphStore, copy_dir: Path | None) -> None:
     }
     try:
         for entry in copy_dir.iterdir():
-            if entry.name not in held:
+            # ``<hash>`` and ``<hash>.summary`` go with the file that holds it.
+            if entry.name.split(".", 1)[0] not in held:
                 entry.unlink()
     except OSError as exc:
         logger.warning("Pruning source copies in %s failed: %s", copy_dir, exc)
@@ -3584,6 +3585,164 @@ def _edge_shape(edge: Any) -> tuple:
     )
 
 
+# What a comparison reads of one version of a module, saved beside its source
+# copy as ``<sha256>.summary`` so the next update of the file need not parse
+# the stored bytes again. Only a summary written by this very code (and this
+# repository's custom-language config) is read back.
+_SUMMARY_SUFFIX = ".summary"
+_SUMMARY_VERSION = 1
+_CODE_FINGERPRINT: str | None = None
+_CODE_FINGERPRINT_LOCK = threading.Lock()
+
+
+def _code_fingerprint() -> str:
+    """sha256 of this package's Python sources and the native extension."""
+    global _CODE_FINGERPRINT
+    with _CODE_FINGERPRINT_LOCK:
+        if _CODE_FINGERPRINT is None:
+            digest = hashlib.sha256()
+            package = Path(__file__).resolve().parent
+            files = sorted(package.rglob("*.py"))
+            try:
+                import importlib.util
+
+                spec = importlib.util.find_spec("crg_fast")
+                if spec is not None and spec.origin:
+                    files += sorted(Path(spec.origin).parent.glob("*.so"))
+                    files += sorted(Path(spec.origin).parent.glob("*.pyd"))
+            except (ImportError, ValueError) as exc:
+                logger.debug("Locating crg_fast failed: %s", exc)
+            for path in files:
+                digest.update(str(path).encode("utf-8", "surrogatepass") + b"\0")
+                digest.update(hashlib.sha256(path.read_bytes()).digest())
+            _CODE_FINGERPRINT = digest.hexdigest()
+        return _CODE_FINGERPRINT
+
+
+def _summary_fingerprint(repo_root: Path) -> str | None:
+    try:
+        digest = hashlib.sha256(_code_fingerprint().encode())
+        config = Path(repo_root) / ".code-review-graph" / "languages.toml"
+        digest.update(config.read_bytes() if config.is_file() else b"\0none")
+    except OSError as exc:
+        logger.debug("No summary fingerprint for %s: %s", repo_root, exc)
+        return None
+    return digest.hexdigest()
+
+
+def _tagged(value: Any) -> Any:
+    """*value* as JSON that two values share only when they are equal."""
+    if value is None or isinstance(value, str):
+        return value
+    if isinstance(value, bool):
+        return {"b": value}
+    if isinstance(value, int):
+        return {"i": value}
+    if isinstance(value, float):
+        return {"f": repr(value)}
+    if isinstance(value, tuple):
+        return {"t": [_tagged(item) for item in value]}
+    if isinstance(value, list):
+        return {"l": [_tagged(item) for item in value]}
+    if isinstance(value, (set, frozenset)):
+        return {"s": sorted(_canonical_json(item) for item in value)}
+    if isinstance(value, dict):
+        pairs = [[_canonical_json(key), _tagged(item)] for key, item in value.items()]
+        return {"d": sorted(pairs, key=lambda pair: pair[0])}
+    raise TypeError(f"no canonical form for {type(value).__name__}")
+
+
+def _canonical_json(value: Any) -> str:
+    return json.dumps(_tagged(value), sort_keys=True, separators=(",", ":"))
+
+
+def _comparison_summary(view: tuple, nodes: list, edges: list, own: str) -> dict:
+    """What :func:`_changed_symbol_names` compares of one version of a module.
+
+    Names the module defines itself resolve to the module whether or not it
+    exports them, so outside a wildcard import only the names it re-exports
+    from elsewhere count among what importers read; the local ones are kept
+    apart.
+    """
+    exports = view[3] or {}
+    foreign = {name: origin for name, origin in exports.items() if origin != own}
+    local = sorted(name for name, origin in exports.items() if origin == own)
+    if not all(isinstance(name, str) for name in local):
+        raise TypeError("export names are not strings")
+    records = []
+    for node in nodes:
+        shape = _node_shape(node)
+        if not (
+            isinstance(shape[0], str) and isinstance(shape[1], str)
+            and isinstance(shape[2], str) and isinstance(node.line_start, int)
+        ):
+            raise TypeError("node kind, name or parent is not a string")
+        records.append([shape[0], shape[1], shape[2], node.line_start, _canonical_json(shape)])
+    return {
+        "imports": _canonical_json((view[:3] + view[4:], foreign)),
+        "local": local,
+        "visible": _canonical_json(sorted(
+            _edge_shape(edge) for edge in edges if edge.kind in _IMPORTER_VISIBLE_EDGE_KINDS
+        )),
+        "nodes": records,
+    }
+
+
+def _valid_summary(summary: Any) -> bool:
+    if not isinstance(summary, dict):
+        return False
+    if not (
+        isinstance(summary.get("imports"), str) and isinstance(summary.get("visible"), str)
+        and isinstance(summary.get("local"), list) and isinstance(summary.get("nodes"), list)
+    ):
+        return False
+    if not all(isinstance(name, str) for name in summary["local"]):
+        return False
+    return all(
+        isinstance(record, list) and len(record) == 5
+        and all(isinstance(record[i], str) for i in (0, 1, 2, 4))
+        and isinstance(record[3], int) and not isinstance(record[3], bool)
+        for record in summary["nodes"]
+    )
+
+
+def _read_summary(copy_dir: Path | None, file_hash: str, fingerprint: str | None) -> dict | None:
+    if copy_dir is None or fingerprint is None or not _SHA256_HEX_RE.fullmatch(file_hash or ""):
+        return None
+    try:
+        saved = json.loads((copy_dir / f"{file_hash}{_SUMMARY_SUFFIX}").read_text("utf-8"))
+    except (OSError, ValueError) as exc:
+        if not isinstance(exc, FileNotFoundError):
+            logger.debug("Reading the summary of %s failed: %s", file_hash, exc)
+        return None
+    if not (
+        isinstance(saved, dict) and saved.get("version") == _SUMMARY_VERSION
+        and saved.get("fingerprint") == fingerprint and saved.get("hash") == file_hash
+        and _valid_summary(saved.get("summary"))
+    ):
+        return None
+    return saved["summary"]
+
+
+def _write_summary(
+    copy_dir: Path | None, file_hash: str, fingerprint: str | None, summary: dict,
+) -> None:
+    if copy_dir is None or fingerprint is None or not _SHA256_HEX_RE.fullmatch(file_hash):
+        return
+    target = copy_dir / f"{file_hash}{_SUMMARY_SUFFIX}"
+    payload = json.dumps({
+        "version": _SUMMARY_VERSION, "fingerprint": fingerprint, "hash": file_hash,
+        "summary": summary,
+    }, separators=(",", ":"))
+    try:
+        copy_dir.mkdir(exist_ok=True)
+        partial_path = copy_dir / f".{file_hash}.{uuid.uuid4().hex}.tmp"
+        partial_path.write_text(payload, "utf-8")
+        os.replace(partial_path, target)
+    except OSError as exc:
+        logger.warning("Keeping the summary of %s in %s failed: %s", file_hash, copy_dir, exc)
+
+
 def _changed_symbol_names(
     repo_root: Path, rel_path: str, file_hash: str, parser: Any, parsed: dict,
     copy_dir: Path | None = None,
@@ -3593,10 +3752,12 @@ def _changed_symbol_names(
     The flag says whether the module's public names changed, which only a
     wildcard import reads. None when an importer's parse could have changed
     too, or when that cannot be told: the file is not an indexed Python module
-    whose stored bytes Git still has, a summary importers read from it
-    differs, or an edge kind importers read through the graph (imports,
-    inheritance) changed. The new bytes are parsed with the update's own
-    *parser*, and that result goes into *parsed* for the update to store.
+    whose stored bytes Git (or *copy_dir*) still has, a summary importers read
+    from it differs, or an edge kind importers read through the graph
+    (imports, inheritance) changed. The new bytes are parsed with the update's
+    own *parser*, and that result goes into *parsed* for the update to store.
+    The stored version's side comes from the summary an earlier update saved
+    in *copy_dir* when there is one, and the new version's is saved there.
     """
     if not rel_path.endswith(".py"):
         return None
@@ -3607,60 +3768,63 @@ def _changed_symbol_names(
         new_source = abs_path.read_bytes()
     except OSError:
         return None
-    old_source = _committed_bytes(repo_root, rel_path, file_hash, copy_dir)
-    if old_source is None:
-        return None
-    # A parser of its own for the old bytes: they must not reach a cache the
-    # update's parser shares with the files it parses next.
-    old_parser = _get_code_parser_cls()(repo_root)
+    fingerprint = _summary_fingerprint(repo_root) if copy_dir is not None else None
+    old = _read_summary(copy_dir, file_hash, fingerprint)
+    old_source = None
+    if old is None:
+        old_source = _committed_bytes(repo_root, rel_path, file_hash, copy_dir)
+        if old_source is None:
+            return None
     own = normalize_file_path(abs_path.resolve())
 
-    def split_view(view: tuple) -> tuple[tuple, dict, set]:
-        # Names the module defines itself resolve to the module whether or
-        # not it exports them, so outside a wildcard import only the names it
-        # re-exports from elsewhere count.
-        exports = view[3] or {}
-        foreign = {name: origin for name, origin in exports.items() if origin != own}
-        local = {name for name, origin in exports.items() if origin == own}
-        return view[:3] + view[4:], foreign, local
-
     try:
-        old_view = split_view(old_parser.python_importer_view(abs_path, old_source))
-        new_view = split_view(parser.python_importer_view(abs_path, new_source))
-        if old_view[:2] != new_view[:2]:
+        new_view = parser.python_importer_view(abs_path, new_source)
+        if old_source is not None:
+            # A parser of its own for the old bytes: they must not reach a
+            # cache the update's parser shares with the files it parses next.
+            old_parser = _get_code_parser_cls()(repo_root)
+            old_view = old_parser.python_importer_view(abs_path, old_source)
+            if _comparison_summary(old_view, [], [], own)["imports"] != (
+                _comparison_summary(new_view, [], [], own)["imports"]
+            ):
+                return None
+            old_nodes, old_edges = old_parser.parse_bytes(abs_path, old_source)
+            old = json.loads(json.dumps(
+                _comparison_summary(old_view, old_nodes, old_edges, own),
+            ))
+        elif old["imports"] != _comparison_summary(new_view, [], [], own)["imports"]:
             return None
-        old_nodes, old_edges = old_parser.parse_bytes(abs_path, old_source)
         new_nodes, new_edges = parser.parse_bytes(abs_path, new_source)
         parsed[rel_path] = (new_source, new_nodes, new_edges)
+        # Round-tripped, so both sides are compared in the form a saved one has.
+        new = json.loads(json.dumps(_comparison_summary(new_view, new_nodes, new_edges, own)))
     except Exception as exc:  # noqa: BLE001 - any failure means "re-parse all"
         logger.debug("Comparing versions of %s failed: %s", rel_path, exc)
         return None
+    _write_summary(copy_dir, hashlib.sha256(new_source).hexdigest(), fingerprint, new)
 
-    def visible(edges: list) -> list[tuple]:
-        return sorted(
-            _edge_shape(edge) for edge in edges
-            if edge.kind in _IMPORTER_VISIBLE_EDGE_KINDS
-        )
-
-    if visible(old_edges) != visible(new_edges):
+    if old["visible"] != new["visible"]:
         return None
-    old_shapes = sorted(_node_shape(node) for node in old_nodes)
-    new_shapes = sorted(_node_shape(node) for node in new_nodes)
     names: set[str] = set()
-    for shape in set(old_shapes) ^ set(new_shapes):
-        names.add(shape[1])
-        names.add(shape[2])
+    old_shapes = {record[4]: record for record in old["nodes"]}
+    new_shapes = {record[4]: record for record in new["nodes"]}
+    for shape in old_shapes.keys() ^ new_shapes.keys():
+        record = old_shapes.get(shape) or new_shapes[shape]
+        names.add(record[1])
+        names.add(record[2])
+
     # Same-named definitions share one name and take collision identities by
     # position (a stored row keeps its identity while it keeps its line), so
     # their names count as changed whenever one of them moved or changed.
-    def groups(nodes: list) -> dict[tuple, list[tuple]]:
+    def groups(records: list) -> dict[tuple, list[tuple]]:
         by_key: dict[tuple, list[tuple]] = {}
-        for node in nodes:
-            shape = _node_shape(node)
-            by_key.setdefault(shape[:3], []).append((node.line_start, shape))
+        for record in records:
+            by_key.setdefault((record[0], record[1], record[2]), []).append(
+                (record[3], record[4]),
+            )
         return {key: sorted(members) for key, members in by_key.items()}
 
-    old_groups, new_groups = groups(old_nodes), groups(new_nodes)
+    old_groups, new_groups = groups(old["nodes"]), groups(new["nodes"])
     for key in old_groups.keys() | new_groups.keys():
         old_members = old_groups.get(key, [])
         new_members = new_groups.get(key, [])
@@ -3668,9 +3832,9 @@ def _changed_symbol_names(
             names.add(key[1])
             names.add(key[2])
     names.discard("")
-    exports_changed = old_view[2] != new_view[2]
-    names |= old_view[2] ^ new_view[2]
-    return names, exports_changed
+    old_local, new_local = set(old["local"]), set(new["local"])
+    names |= old_local ^ new_local
+    return names, old_local != new_local
 
 
 def _importers_to_reparse(

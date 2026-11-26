@@ -14,6 +14,7 @@ without the native ``crg_fast`` module installed.
 
 from __future__ import annotations
 
+import json
 import shutil
 import sqlite3
 import subprocess
@@ -313,12 +314,13 @@ def test_second_save_before_a_commit_skips_importers_and_matches_legacy(
     assert len(selections) == 2
     assert isinstance(selections[1], set)
     assert {"a.py", "b.py", "c.py", "d.py"} - selections[1]
-    # Only the copy of the bytes the graph now holds is left.
+    # Only the copy and summary of the bytes the graph now holds are left.
     stored = (tmp_path / "on" / "lib.py").read_bytes()
     import hashlib
 
+    digest = hashlib.sha256(stored).hexdigest()
     copies = sorted(p.name for p in (fast.parent / "source-copies").iterdir())
-    assert copies == [hashlib.sha256(stored).hexdigest()]
+    assert copies == [digest, f"{digest}.summary"]
 
 
 def test_a_copy_that_does_not_match_its_name_is_not_read(tmp_path: Path) -> None:
@@ -416,3 +418,90 @@ def test_same_named_definitions_count_as_changed_only_when_they_move(
     assert len(selections) == 1 and isinstance(selections[0], set)
     assert selections[0] & {"a.py"} == reparsed
 
+
+def _second_save_selection(
+    base_repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    between: Callable[[Path], None],
+) -> tuple[object, Path]:
+    """The second update's importer selection, *between* run on the copy dir."""
+    selections: list[object] = []
+    original = incremental._importers_to_reparse
+
+    def spy(*args, **kwargs):
+        selected = original(*args, **kwargs)
+        selections.append(selected)
+        return selected
+
+    monkeypatch.setattr(incremental, "_importers_to_reparse", spy)
+    repo = tmp_path / "on"
+    shutil.copytree(base_repo, repo)
+    data = tmp_path / "on-data"
+    monkeypatch.setenv("CRG_DATA_DIR", str(data))
+    monkeypatch.delenv("CRG_FAST_ENGINE", raising=False)
+    assert build_or_update_graph(full_rebuild=True, repo_root=str(repo))["status"] == "ok"
+    monkeypatch.setenv("CRG_FAST_ENGINE", "1")
+    _add_symbol(repo)
+    assert build_or_update_graph(repo_root=str(repo))["status"] == "ok"
+    between(data / "source-copies")
+    (repo / "lib.py").write_text(
+        (LIB + "\n\ndef later():\n    return 3\n").replace("helper", "helper_two")
+    )
+    assert build_or_update_graph(repo_root=str(repo))["status"] == "ok"
+    monkeypatch.delenv("CRG_FAST_ENGINE", raising=False)
+    return selections[-1], data / "graph.db"
+
+
+def _drop_byte_copies(copies: Path) -> None:
+    for entry in copies.iterdir():
+        if "." not in entry.name:
+            entry.unlink()
+
+
+def test_a_saved_summary_stands_in_for_the_stored_bytes(
+    base_repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    legacy = _twice_updated_graph(base_repo, tmp_path, monkeypatch, "off", False)
+    parses: list[Path] = []
+    original = incremental._committed_bytes
+
+    def spy(*args, **kwargs):
+        parses.append(args[1])
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(incremental, "_committed_bytes", spy)
+    selected, fast = _second_save_selection(
+        base_repo, tmp_path, monkeypatch, _drop_byte_copies,
+    )
+    assert _dump(fast) == _dump(legacy)
+    assert isinstance(selected, set)
+    # Only the first update had to read stored bytes; the second read none.
+    assert parses == ["lib.py"]
+
+
+def test_a_summary_another_code_version_wrote_is_not_read(
+    base_repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def stale(copies: Path) -> None:
+        _drop_byte_copies(copies)
+        for entry in copies.glob("*.summary"):
+            saved = json.loads(entry.read_text())
+            saved["fingerprint"] = "0" * 64
+            entry.write_text(json.dumps(saved))
+
+    selected, _ = _second_save_selection(base_repo, tmp_path, monkeypatch, stale)
+    assert selected is None
+
+
+def test_canonical_json_tells_apart_values_python_tells_apart() -> None:
+    values = [
+        None, "1", 1, 1.0, True, (1,), [1], {1}, {"1": 1}, {1: 1}, ("a", ("b",)),
+        ("a", ["b"]), frozenset({"x", "y"}), {"k": ("v",)},
+    ]
+    encoded = [incremental._canonical_json(value) for value in values]
+    assert len(set(encoded)) == len(values)
+    assert incremental._canonical_json({"y", "x"}) == incremental._canonical_json(
+        frozenset({"x", "y"}),
+    )
+    assert incremental._canonical_json({"b": 1, "a": 2}) == incremental._canonical_json(
+        {"a": 2, "b": 1},
+    )
