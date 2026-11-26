@@ -3651,16 +3651,22 @@ def _changed_symbol_names(
         names.add(shape[1])
         names.add(shape[2])
     # Same-named definitions share one name and take collision identities by
-    # position, so their names count as changed whenever anything moved.
-    for shapes in (old_shapes, new_shapes):
-        counts: dict[tuple, int] = {}
-        for shape in shapes:
-            key = (shape[0], shape[1], shape[2])
-            counts[key] = counts.get(key, 0) + 1
-        for (_kind, name, parent), count in counts.items():
-            if count > 1:
-                names.add(name)
-                names.add(parent)
+    # position (a stored row keeps its identity while it keeps its line), so
+    # their names count as changed whenever one of them moved or changed.
+    def groups(nodes: list) -> dict[tuple, list[tuple]]:
+        by_key: dict[tuple, list[tuple]] = {}
+        for node in nodes:
+            shape = _node_shape(node)
+            by_key.setdefault(shape[:3], []).append((node.line_start, shape))
+        return {key: sorted(members) for key, members in by_key.items()}
+
+    old_groups, new_groups = groups(old_nodes), groups(new_nodes)
+    for key in old_groups.keys() | new_groups.keys():
+        old_members = old_groups.get(key, [])
+        new_members = new_groups.get(key, [])
+        if max(len(old_members), len(new_members)) > 1 and old_members != new_members:
+            names.add(key[1])
+            names.add(key[2])
     names.discard("")
     exports_changed = old_view[2] != new_view[2]
     names |= old_view[2] ^ new_view[2]

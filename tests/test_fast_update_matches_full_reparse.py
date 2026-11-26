@@ -350,3 +350,69 @@ def test_a_full_build_drops_copies_no_file_holds(
     (copies / ("0" * 64)).write_bytes(b"gone\n")
     assert build_or_update_graph(full_rebuild=True, repo_root=str(base_repo))["status"] == "ok"
     assert sorted(p.name for p in copies.iterdir()) == [held]
+
+
+# Two definitions of one name: the second one in the file takes a collision
+# identity, and which one an edge names follows their lines.
+DUP_LIB = """\
+def dup(x):
+    return x
+
+
+def dup(x, y):
+    return x + y
+
+
+def plain():
+    return 0
+"""
+
+
+@pytest.fixture
+def dup_repo(tmp_path: Path) -> Path:
+    repo = tmp_path / "dup-base"
+    repo.mkdir()
+    _git(repo, "init", "-q", "-b", "main")
+    (repo / "lib.py").write_text(DUP_LIB)
+    (repo / "a.py").write_text("from lib import dup\n\n\ndef use():\n    return dup(1, 2)\n")
+    (repo / "b.py").write_text("from lib import plain\n\n\ndef use_b():\n    return plain()\n")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-qm", "init")
+    return repo
+
+
+@pytest.mark.parametrize(
+    ("edit", "reparsed"),
+    [
+        # Nothing before the two definitions moves: a.py keeps its rows.
+        (lambda text: text + "\n\ndef later():\n    return 3\n", set()),
+        (lambda text: text.replace("return 0", "return 10"), set()),
+        # A line above them shifts both, so a.py's call is parsed again.
+        (lambda text: "def first():\n    return 9\n\n\n" + text, {"a.py"}),
+        (lambda text: text.replace("def dup(x, y):", "def dup(x, z):"), {"a.py"}),
+    ],
+    ids=["appended", "unrelated_body", "shifted", "one_changed"],
+)
+def test_same_named_definitions_count_as_changed_only_when_they_move(
+    edit: Callable[[str], str], reparsed: set[str],
+    dup_repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    selections: list[object] = []
+    original = incremental._importers_to_reparse
+
+    def spy(*args, **kwargs):
+        selected = original(*args, **kwargs)
+        selections.append(selected)
+        return selected
+
+    monkeypatch.setattr(incremental, "_importers_to_reparse", spy)
+
+    def apply(repo: Path) -> None:
+        (repo / "lib.py").write_text(edit(DUP_LIB))
+
+    legacy = _updated_graph(dup_repo, tmp_path, monkeypatch, "off", apply, False)
+    fast = _updated_graph(dup_repo, tmp_path, monkeypatch, "on", apply, True)
+    assert _dump(fast) == _dump(legacy)
+    assert len(selections) == 1 and isinstance(selections[0], set)
+    assert selections[0] & {"a.py"} == reparsed
+
