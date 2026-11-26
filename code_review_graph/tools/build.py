@@ -465,21 +465,15 @@ def _run_postprocess(
                 force=communities_were_affected,
             )
         else:
-            from code_review_graph.communities import (
-                detect_communities as _detect_communities,
-            )
-            from code_review_graph.communities import (
-                store_communities as _store_communities,
-            )
+            from code_review_graph.communities import detect_and_store_communities
 
-            comms = _detect_communities(
+            count = detect_and_store_communities(
                 store,
                 nodes=None if shared_adjacency is None else [
                     node for node in shared_adjacency.nodes_by_id.values()
                     if node.kind != "File"
                 ],
             )
-            count = _store_communities(store, comms)
         build_result["communities_detected"] = count
     except (sqlite3.OperationalError, ImportError) as e:
         logger.warning("Community detection failed: %s", e)
@@ -1031,15 +1025,9 @@ def run_postprocess(
 
         if communities:
             try:
-                from code_review_graph.communities import (
-                    detect_communities as _detect_communities,
-                )
-                from code_review_graph.communities import (
-                    store_communities as _store_communities,
-                )
+                from code_review_graph.communities import detect_and_store_communities
 
-                comms = _detect_communities(store)
-                count = _store_communities(store, comms)
+                count = detect_and_store_communities(store)
                 result["communities_detected"] = count
             except (sqlite3.OperationalError, ImportError) as e:
                 store.rollback()

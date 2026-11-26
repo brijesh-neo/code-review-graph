@@ -1050,8 +1050,7 @@ def incremental_detect_communities(
         return 0  # No communities affected, skip
 
     # Re-run full community detection (correct and fast enough)
-    communities = detect_communities(store, min_size=min_size)
-    return store_communities(store, communities)
+    return detect_and_store_communities(store, min_size=min_size)
 
 
 def store_communities(
@@ -1131,6 +1130,29 @@ def store_communities(
         conn.rollback()
         raise
     return count
+
+
+def detect_and_store_communities(
+    store: GraphStore, min_size: int = 2, nodes: list[GraphNode] | None = None,
+) -> int:
+    """:func:`detect_communities`, then :func:`store_communities`.
+
+    Under ``CRG_FAST_ENGINE`` without igraph, the file-based detector and the
+    writes run as one native job on the store's connection, with the same
+    result. *nodes* is as for :func:`detect_communities`. Returns the number of
+    communities stored.
+    """
+    if getattr(store, "_native_sql", False) and not _load_igraph():
+        count = store._native_resolver_job("stage_file_communities", min_size)
+        if count >= 0:
+            logger.info(
+                'Tip: pip install "code-review-graph[communities]" for finer communities '
+                "(grouping by file for now)."
+            )
+            return count
+    return store_communities(
+        store, detect_communities(store, min_size=min_size, nodes=nodes),
+    )
 
 
 def get_communities(

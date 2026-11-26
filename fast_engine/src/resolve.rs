@@ -137,6 +137,51 @@ impl<'p> Rows<'p> {
         }
     }
 
+    /// The index of the result column called *name*.
+    pub fn column_index(&self, name: &str) -> R<c_int> {
+        unsafe {
+            let count = ffi::sqlite3_column_count(self.stmt.raw);
+            for index in 0..count {
+                let ptr = ffi::sqlite3_column_name(self.stmt.raw, index);
+                if !ptr.is_null() && std::ffi::CStr::from_ptr(ptr).to_bytes() == name.as_bytes() {
+                    return Ok(index);
+                }
+            }
+        }
+        Err(Fail::Back)
+    }
+
+    /// A TEXT or NULL column as stored, not restored; valid until the next step.
+    pub fn stored(&self, index: c_int) -> R<Option<&str>> {
+        unsafe {
+            match ffi::sqlite3_column_type(self.stmt.raw, index) {
+                ffi::SQLITE_NULL => Ok(None),
+                ffi::SQLITE_TEXT => {
+                    let ptr = ffi::sqlite3_column_text(self.stmt.raw, index);
+                    let len = ffi::sqlite3_column_bytes(self.stmt.raw, index) as usize;
+                    if len == 0 {
+                        return Ok(Some(""));
+                    }
+                    let bytes = std::slice::from_raw_parts(ptr, len);
+                    std::str::from_utf8(bytes).map(Some).map_err(|_| Fail::Back)
+                }
+                _ => Err(Fail::Back),
+            }
+        }
+    }
+
+    /// `bool(row[index])` for a NULL, INTEGER or REAL column.
+    pub fn truthy(&self, index: c_int) -> R<bool> {
+        unsafe {
+            match ffi::sqlite3_column_type(self.stmt.raw, index) {
+                ffi::SQLITE_NULL => Ok(false),
+                ffi::SQLITE_INTEGER => Ok(ffi::sqlite3_column_int64(self.stmt.raw, index) != 0),
+                ffi::SQLITE_FLOAT => Ok(ffi::sqlite3_column_double(self.stmt.raw, index) != 0.0),
+                _ => Err(Fail::Back),
+            }
+        }
+    }
+
     /// A column that must hold text.
     pub fn req(&self, index: c_int) -> R<String> {
         self.text(index)?.ok_or(Fail::Back)

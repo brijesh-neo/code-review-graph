@@ -187,10 +187,9 @@ def _detect_communities(
 ) -> None:
     """Detect code communities via Leiden algorithm or file grouping."""
     try:
-        from .communities import detect_communities, store_communities
+        from .communities import detect_and_store_communities
 
-        comms = detect_communities(store)
-        count = store_communities(store, comms)
+        count = detect_and_store_communities(store)
         result["communities_detected"] = count
     except (sqlite3.OperationalError, ImportError) as e:
         logger.warning("Community detection failed: %s", e)

@@ -260,7 +260,7 @@ class TestPostProcessingStepIsolation:
 
     def test_community_failure_still_has_signatures(self):
         with patch(
-            "code_review_graph.communities.detect_communities",
+            "code_review_graph.communities.detect_and_store_communities",
             side_effect=ImportError("comm boom"),
         ):
             result = run_post_processing(self.store)

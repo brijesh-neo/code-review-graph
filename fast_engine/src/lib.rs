@@ -29,6 +29,7 @@ mod json;
 mod pyjson;
 mod pathcodec;
 mod resolve;
+mod communities;
 
 const CAPSULE_NAME: &CStr = c"tree_sitter.Language";
 
@@ -346,5 +347,6 @@ fn crg_fast(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(resolve::stage_bare_resolve, module)?)?;
     module.add_function(wrap_pyfunction!(resolve::stage_inherited_resolve, module)?)?;
     module.add_function(wrap_pyfunction!(resolve::stage_unbound_settle, module)?)?;
+    module.add_function(wrap_pyfunction!(communities::stage_file_communities, module)?)?;
     Ok(())
 }
