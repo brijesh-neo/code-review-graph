@@ -4,10 +4,12 @@ A complete graph is a fixed point of the bare-endpoint pass, so after an
 update only edges that touch a change can get a different answer: edges the
 update wrote, edges whose bare name belongs to a Function or Test node that
 changed, and edges whose caller changed. ``begin_change_capture`` records the
-changes in TEMP tables (nothing is stored in the graph), and a change to Class
-or File nodes, or to import or inheritance edges, sends the pass back to a
-full run. Each case runs the same edit with the scoped pass and with the full
-pass and requires identical nodes and edges.
+changes in TEMP tables (nothing is stored in the graph). A changed import
+reaches the edges written in the importing file, because import evidence is
+read per file. A change to Class or File nodes, to inheritance edges, to a
+scoped import, or to the imports of a file whose classes have parents, sends
+the pass back to a full run. Each case runs the same edit with the scoped pass
+and with the full pass and requires identical nodes and edges.
 """
 
 from __future__ import annotations
@@ -105,7 +107,14 @@ EDITS: dict[str, tuple[Callable[[Path], None], bool]] = {
     "class_added": (
         _append("lib.py", "\n\nclass Box:\n    def third(self):\n        return 6\n"), False,
     ),
-    "import_added": (_append("a.py", "\nimport lib3\n"), False),
+    "import_added": (_append("a.py", "\nimport lib3\n"), True),
+    "import_removed": (
+        lambda repo: (repo / "both.py").write_text(FILES["both.py"].replace("import lib3\n", "")),
+        True,
+    ),
+    "import_added_beside_a_parented_class": (
+        _append("a.py", "\nimport lib3\n\n\nclass Kid(lib3.Base):\n    pass\n"), False,
+    ),
 }
 
 
@@ -394,5 +403,64 @@ def test_a_changed_caller_reaches_its_edges_by_qualified_name(tmp_path: Path) ->
         )
         assert target == "map"
         assert "unresolved_targets" in extra
+    finally:
+        store.close()
+
+
+def test_an_import_change_reaches_the_bare_edges_of_its_file(tmp_path: Path) -> None:
+    store = _graph(
+        tmp_path,
+        _FILES + [
+            ("Function", "caller", "x.py::caller", "x.py", "python", None),
+            ("Function", "later", "y.py::later", "y.py", "python", None),
+            ("Function", "later", "z.py::later", "z.py", "python", None),
+        ],
+        _IMPORTS + [("CALLS", "x.py::caller", "later", "x.py", "{}")],
+    )
+    try:
+        before, _ = _call(store)
+        # Neither ``later`` nor the caller changes: only the import does.
+        target, _ = _scoped_then_full(
+            store,
+            "DELETE FROM edges WHERE kind = 'IMPORTS_FROM' AND target_qualified = 'z.py'",
+        )
+        assert target != before
+        assert target == "y.py::later"
+    finally:
+        store.close()
+
+
+def test_a_scoped_import_sends_the_pass_back_to_full(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    try:
+        assert store.begin_change_capture()
+        store._conn.execute(
+            "INSERT INTO edges (kind, source_qualified, target_qualified, file_path, "
+            "line, extra, updated_at) VALUES ('IMPORTS_FROM', 'm.py', 'pkg', 'm.py', 1, "
+            "'{\"import_scope\": \"pkg\"}', 0)"
+        )
+        assert not store.end_change_capture()
+    finally:
+        store.close()
+
+
+def test_an_import_change_beside_a_parented_class_sends_the_pass_back_to_full(
+    tmp_path: Path,
+) -> None:
+    store = _store(tmp_path)
+    try:
+        conn = store._conn
+        conn.execute(
+            "INSERT INTO edges (kind, source_qualified, target_qualified, file_path, "
+            "line, extra, updated_at) VALUES ('INHERITS', 'm.py::Box', 'Base', 'm.py', 1, "
+            "'{}', 0)"
+        )
+        assert store.begin_change_capture()
+        conn.execute(
+            "INSERT INTO edges (kind, source_qualified, target_qualified, file_path, "
+            "line, extra, updated_at) VALUES ('IMPORTS_FROM', 'm.py', 'n.py', 'm.py', 1, "
+            "'{}', 0)"
+        )
+        assert not store.end_change_capture()
     finally:
         store.close()

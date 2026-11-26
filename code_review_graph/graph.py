@@ -4411,6 +4411,11 @@ class GraphStore:
             (self._capture_edge_floor,),
         )
         # Rows that left and came back unchanged (a reparsed file) cancel out.
+        # What a file imports is evidence only for the edges written in that
+        # file and for the parents of the classes it defines, so a changed
+        # import scopes the pass to the file unless one of its classes has a
+        # parent. Directory scopes are shared by every importer of the
+        # directory, so a changed one still runs the full pass.
         moved = conn.execute(
             "SELECT 1 FROM ("
             "SELECT 1 FROM temp.crg_change_log WHERE tbl = 'n' "
@@ -4418,23 +4423,41 @@ class GraphStore:
             "GROUP BY kind, a, b, c, d, e, f HAVING SUM(sign) != 0 "
             "UNION ALL "
             "SELECT 1 FROM temp.crg_change_log WHERE tbl = 'e' "
-            f"AND kind IN {shape} "
+            "AND kind = 'INHERITS' "
+            "GROUP BY kind, a, b, c, d HAVING SUM(sign) != 0 "
+            "UNION ALL "
+            "SELECT 1 FROM temp.crg_change_log WHERE tbl = 'e' "
+            "AND kind = 'IMPORTS_FROM' AND d LIKE ? "
             "GROUP BY kind, a, b, c, d HAVING SUM(sign) != 0"
-            ") LIMIT 1"
+            ") LIMIT 1",
+            (f'%"{IMPORT_SCOPE_KEY}"%',),
         ).fetchone()
         if moved is not None:
             return False
-        conn.execute(
-            "CREATE TEMP TABLE IF NOT EXISTS crg_dirty_name (name TEXT PRIMARY KEY)"
-        )
-        conn.execute(
-            "CREATE TEMP TABLE IF NOT EXISTS crg_dirty_qn (qn TEXT PRIMARY KEY)"
-        )
-        conn.execute(
-            "CREATE TEMP TABLE IF NOT EXISTS crg_dirty_edge (id INTEGER PRIMARY KEY)"
-        )
-        for table in ("crg_dirty_name", "crg_dirty_qn", "crg_dirty_edge"):
+        for table, column in (
+            ("crg_dirty_name", "name TEXT"),
+            ("crg_dirty_qn", "qn TEXT"),
+            ("crg_dirty_edge", "id INTEGER"),
+            ("crg_dirty_file", "path TEXT"),
+        ):
+            conn.execute(
+                f"CREATE TEMP TABLE IF NOT EXISTS {table} ({column} PRIMARY KEY)"
+            )
             conn.execute(f"DELETE FROM temp.{table}")
+        conn.execute(
+            "INSERT OR IGNORE INTO temp.crg_dirty_file "
+            "SELECT c FROM temp.crg_change_log WHERE tbl = 'e' "
+            "AND kind = 'IMPORTS_FROM' AND c IS NOT NULL "
+            "GROUP BY kind, a, b, c, d HAVING SUM(sign) != 0"
+        )
+        parented = conn.execute(
+            "SELECT 1 FROM nodes n WHERE n.kind = 'Class' "
+            "AND n.file_path IN (SELECT path FROM temp.crg_dirty_file) "
+            "AND EXISTS (SELECT 1 FROM edges e WHERE e.kind = 'INHERITS' "
+            "AND e.source_qualified = n.qualified_name) LIMIT 1"
+        ).fetchone()
+        if parented is not None:
+            return False
         changed = conn.execute(
             "SELECT a, b FROM temp.crg_change_log WHERE tbl = 'n' "
             "AND kind IN ('Function', 'Test') "
@@ -4462,7 +4485,7 @@ class GraphStore:
 
     def drop_change_scope(self) -> None:
         """Forget the dirty sets of the last capture."""
-        for table in ("crg_dirty_name", "crg_dirty_qn", "crg_dirty_edge"):
+        for table in ("crg_dirty_name", "crg_dirty_qn", "crg_dirty_edge", "crg_dirty_file"):
             try:
                 self._conn.execute(f"DROP TABLE IF EXISTS temp.{table}")
             except sqlite3.Error as exc:  # pragma: no cover - defensive
@@ -4735,6 +4758,7 @@ class GraphStore:
             select_sql += (
                 " AND (id > ?"
                 " OR id IN (SELECT id FROM temp.crg_dirty_edge)"
+                " OR file_path IN (SELECT path FROM temp.crg_dirty_file)"
                 f" OR {endpoint_column} IN (SELECT name FROM temp.crg_dirty_name)"
                 f" OR {caller_col} IN (SELECT qn FROM temp.crg_dirty_qn)"
                 f" OR (extra LIKE '%\"{raw_key}\"%' AND CASE WHEN json_valid(extra)"
