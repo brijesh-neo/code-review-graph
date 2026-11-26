@@ -508,6 +508,10 @@ def detect_entry_points(
     When *include_tests* is False (the default), Test nodes are excluded so
     that flow analysis focuses on production entry points.
     """
+    if not include_tests and fast_engine_enabled():
+        native = _native_entry_points(store)
+        if native is not None:
+            return native
     # Build a set of all qualified names that are CALLS targets. Exclude
     # edges sourced at File nodes so that script-/notebook-/top-level-only
     # callees (e.g. ``run_job()`` invoked from module scope, a top-level
@@ -576,6 +580,103 @@ def _is_entry_point(
         or _has_framework_decorator(node)
         or _matches_entry_name(node)
     )
+
+
+def _answer(called: bool) -> Callable[[GraphNode], bool]:
+    """An ``is_called`` for :func:`_is_entry_point` that answers *called*."""
+    return lambda _node: called
+
+
+def _native_entry_points(
+    store: GraphStore,
+    among: Optional[tuple[list[str], list[int], list[str]]] = None,
+) -> Optional[list[GraphNode]]:
+    """``detect_entry_points(store)``, its reads done in one native pass.
+
+    With *among* (file paths, node ids, qualified names), only the candidates
+    in one of them, as :func:`_entry_points_among` keeps them. The test-file
+    rule and the decorator and name patterns are this module's, applied to
+    the same values. None when this ``crg_fast`` lacks the pass, SQLite would
+    list candidates in an order it does not reproduce, or a row holds a value
+    the pass does not read the way Python does.
+    """
+    try:
+        import crg_fast
+    except ImportError:
+        return None
+    stage_job = getattr(crg_fast, "stage_entry_scan", None)
+    take = getattr(crg_fast, "take_entry_scan", None)
+    if stage_job is None or take is None or not getattr(store, "_native_sql", False):
+        return None
+    order = _plan_order(store._conn, _CANDIDATE_SQL, _CANDIDATE_ORDERS, _CANDIDATE_PARAMS)
+    if order is None:
+        return None
+    token = stage_job(order, among, store._codec_fields())
+    try:
+        row = store._conn.execute("SELECT crg_run(?)", (token,)).fetchone()
+    except BaseException:
+        crg_fast.discard_job(token)
+        take(token)
+        raise
+    candidates = take(token)
+    if int(row[0]) < 0 or candidates is None:
+        return None
+    repo_root = store.get_repo_root()
+    test_files: dict[str, bool] = {}
+    kept: list[int] = []
+    for (
+        node_id, kind, name, qualified_name, file_path, language, is_test, raw_extra,
+        called_any, called_outside_tests,
+    ) in candidates:
+        if is_test:
+            continue
+        test_file = test_files.get(file_path)
+        if test_file is None:
+            test_file = test_files[file_path] = _is_test_file(file_path, repo_root)
+        if test_file:
+            continue
+        probe = GraphNode(
+            id=node_id, kind=kind, name=name, qualified_name=qualified_name,
+            file_path=file_path, line_start=0, line_end=0, language=language or "",
+            parent_name=None, params=None, return_type=None, is_test=False,
+            file_hash=None,
+            extra=json.loads(raw_extra) if raw_extra and raw_extra != "{}" else {},
+        )
+        called = (
+            called_outside_tests if probe.language in ("ruby", "java") else called_any
+        )
+        # The test rule was applied above, as detect_entry_points applies it.
+        if _is_entry_point(probe, repo_root, True, _answer(called)):
+            kept.append(node_id)
+    by_id: dict[int, GraphNode] = {}
+    for i in range(0, len(kept), _SQL_BATCH):
+        batch = kept[i:i + _SQL_BATCH]
+        placeholders = ",".join("?" * len(batch))
+        for node_row in store._conn.execute(
+            f"SELECT * FROM nodes WHERE id IN ({placeholders})",  # nosec B608
+            batch,
+        ):
+            node = store._row_to_node(node_row)
+            by_id[node.id] = node
+    if len(by_id) != len(kept):
+        return None
+    return [by_id[node_id] for node_id in kept]
+
+
+def trace_flows_native(store: GraphStore, max_depth: int = 15) -> Optional[list[dict]]:
+    """``trace_flows(store)`` for storing, with the reads and the BFS done natively.
+
+    The flows carry what :func:`store_flows` writes (no ``files``). None when
+    the native passes cannot run on this graph.
+    """
+    entry_points = detect_entry_points(store)
+    if not entry_points:
+        return []
+    flows = _native_traced_flows(store, entry_points, max_depth)
+    if flows is None:
+        return None
+    flows.sort(key=lambda f: f["criticality"], reverse=True)
+    return flows
 
 
 # The plans SQLite picks for the whole-graph reads of detect_entry_points and
@@ -737,15 +838,19 @@ def _entry_points_among(
     its own. None when SQLite would list candidates in an order this does not
     reproduce.
     """
+    among = (sorted(set(file_paths)), sorted(set(node_ids)), sorted(set(qualified_names)))
+    native = _native_entry_points(store, among)
+    if native is not None:
+        return native
     order = _plan_order(store._conn, _CANDIDATE_SQL, _CANDIDATE_ORDERS, _CANDIDATE_PARAMS)
     if order is None:
         return None
     conn = store._conn
     ids: set[int] = set()
     for column, values in (
-        ("file_path", sorted(set(file_paths))),
-        ("id", sorted(set(node_ids))),
-        ("qualified_name", sorted(set(qualified_names))),
+        ("file_path", among[0]),
+        ("id", among[1]),
+        ("qualified_name", among[2]),
     ):
         for i in range(0, len(values), _SQL_BATCH):
             batch = values[i:i + _SQL_BATCH]
