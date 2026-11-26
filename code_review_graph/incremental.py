@@ -3458,6 +3458,7 @@ _WILDCARD_IMPORT_RE = re.compile(rb"\bimport\s*\*")
 # again before a commit), instead of re-parsing every importer.
 _SOURCE_COPY_DIR = "source-copies"
 _SHA256_HEX_RE = re.compile(r"[0-9a-f]{64}")
+_GIT_COMMIT_RE = re.compile(r"[0-9a-f]{40}|[0-9a-f]{64}")
 
 
 def _source_copy_dir(store: GraphStore, repo_root: Path) -> Path | None:
@@ -3544,14 +3545,19 @@ def _prune_source_copies(store: GraphStore, copy_dir: Path | None) -> None:
 
 def _committed_bytes(
     repo_root: Path, rel_path: str, file_hash: str, copy_dir: Path | None = None,
+    stored_commit: str | None = None,
 ) -> bytes | None:
     """The bytes the graph holds for *rel_path*, read back from Git.
 
-    HEAD first, then the index, then the copy an update kept in *copy_dir*.
-    Only bytes whose sha256 equals the stored *file_hash* count, so a graph
-    built from bytes none of them has gets None.
+    The commit the graph was last synced to (*stored_commit*, which holds them
+    once a new commit lands), then HEAD, then the index, then the copy an
+    update kept in *copy_dir*. Only bytes whose sha256 equals the stored
+    *file_hash* count, so a graph built from bytes none of them has gets None.
     """
-    for spec in (f"HEAD:./{rel_path}", f":./{rel_path}"):
+    specs = [f"HEAD:./{rel_path}", f":./{rel_path}"]
+    if stored_commit and _GIT_COMMIT_RE.fullmatch(stored_commit):
+        specs.insert(0, f"{stored_commit}:./{rel_path}")
+    for spec in specs:
         try:
             result = subprocess.run(
                 ["git", "cat-file", "blob", spec],
@@ -3590,7 +3596,7 @@ def _edge_shape(edge: Any) -> tuple:
 # the stored bytes again. Only a summary written by this very code (and this
 # repository's custom-language config) is read back.
 _SUMMARY_SUFFIX = ".summary"
-_SUMMARY_VERSION = 1
+_SUMMARY_VERSION = 2
 _CODE_FINGERPRINT: str | None = None
 _CODE_FINGERPRINT_LOCK = threading.Lock()
 
@@ -3678,8 +3684,21 @@ def _comparison_summary(view: tuple, nodes: list, edges: list, own: str) -> dict
         ):
             raise TypeError("node kind, name or parent is not a string")
         records.append([shape[0], shape[1], shape[2], node.line_start, _canonical_json(shape)])
+    # An importer reads a return or property annotation only under the name
+    # its own source writes for the callee or the attribute, so each entry
+    # goes with that name and only importers that spell it are re-parsed.
+    annotated = [
+        [name, _canonical_json(("return", name, annotation))]
+        for name, annotation in (view[2] or {}).items()
+    ] + [
+        [key[1], _canonical_json(("property", key, annotation))]
+        for key, annotation in (view[1] or {}).items()
+    ]
+    if not all(isinstance(token, str) for token, _entry in annotated):
+        raise TypeError("annotated names are not strings")
     return {
-        "imports": _canonical_json((view[:3] + view[4:], foreign)),
+        "imports": _canonical_json(((view[0], view[4]), foreign)),
+        "annotated": sorted(annotated),
         "local": local,
         "visible": _canonical_json(sorted(
             _edge_shape(edge) for edge in edges if edge.kind in _IMPORTER_VISIBLE_EDGE_KINDS
@@ -3697,6 +3716,13 @@ def _valid_summary(summary: Any) -> bool:
     ):
         return False
     if not all(isinstance(name, str) for name in summary["local"]):
+        return False
+    annotated = summary.get("annotated")
+    if not isinstance(annotated, list) or not all(
+        isinstance(entry, list) and len(entry) == 2
+        and all(isinstance(part, str) for part in entry)
+        for entry in annotated
+    ):
         return False
     return all(
         isinstance(record, list) and len(record) == 5
@@ -3745,16 +3771,19 @@ def _write_summary(
 
 def _changed_symbol_names(
     repo_root: Path, rel_path: str, file_hash: str, parser: Any, parsed: dict,
-    copy_dir: Path | None = None,
-) -> tuple[set[str], bool] | None:
+    copy_dir: Path | None = None, stored_commit: str | None = None,
+) -> tuple[set[str], bool, set[str]] | None:
     """Names whose definitions in *rel_path* changed since the graph stored it.
 
     The flag says whether the module's public names changed, which only a
-    wildcard import reads. None when an importer's parse could have changed
-    too, or when that cannot be told: the file is not an indexed Python module
-    whose stored bytes Git (or *copy_dir*) still has, a summary importers read
-    from it differs, or an edge kind importers read through the graph
-    (imports, inheritance) changed. The new bytes are parsed with the update's
+    wildcard import reads. The last set holds the names of the return and
+    property annotations that changed: an importer's parse reads one only
+    where its source spells that name, so those importers' parses can change.
+    None when another importer's parse could have changed too, or when that
+    cannot be told: the file is not an indexed Python module whose stored
+    bytes Git (or *copy_dir*) still has, a summary importers read from it
+    differs, or an edge kind importers read through the graph (imports,
+    inheritance) changed. The new bytes are parsed with the update's
     own *parser*, and that result goes into *parsed* for the update to store.
     The stored version's side comes from the summary an earlier update saved
     in *copy_dir* when there is one, and the new version's is saved there.
@@ -3772,7 +3801,9 @@ def _changed_symbol_names(
     old = _read_summary(copy_dir, file_hash, fingerprint)
     old_source = None
     if old is None:
-        old_source = _committed_bytes(repo_root, rel_path, file_hash, copy_dir)
+        old_source = _committed_bytes(
+            repo_root, rel_path, file_hash, copy_dir, stored_commit,
+        )
         if old_source is None:
             return None
     own = normalize_file_path(abs_path.resolve())
@@ -3834,7 +3865,10 @@ def _changed_symbol_names(
     names.discard("")
     old_local, new_local = set(old["local"]), set(new["local"])
     names |= old_local ^ new_local
-    return names, old_local != new_local
+    old_annotated = {tuple(entry) for entry in old["annotated"]}
+    new_annotated = {tuple(entry) for entry in new["annotated"]}
+    spelled = {token for token, _entry in old_annotated ^ new_annotated}
+    return names, old_local != new_local, spelled
 
 
 def _importers_to_reparse(
@@ -3855,17 +3889,22 @@ def _importers_to_reparse(
     as they settle every other file. None means re-parse every importer.
     """
     names: set[str] = set()
+    spelled: set[str] = set()
     exports_changed = False
     copy_dir = _source_copy_dir(store, repo_root)
+    # Once a commit lands, the bytes the graph holds are in the commit it was
+    # last synced to rather than in HEAD.
+    stored_commit = store.get_metadata("git_head_sha")
     for rel_path, file_hash in changed.items():
         found = _changed_symbol_names(
-            repo_root, rel_path, file_hash, parser, parsed, copy_dir,
+            repo_root, rel_path, file_hash, parser, parsed, copy_dir, stored_commit,
         )
         if found is None:
             return None
         names |= found[0]
         exports_changed = exports_changed or found[1]
-        if len(names) > _MAX_CHANGED_SYMBOL_NAMES:
+        spelled |= found[2]
+        if len(names) > _MAX_CHANGED_SYMBOL_NAMES or len(spelled) > _MAX_CHANGED_SYMBOL_NAMES:
             return None
     if exports_changed:
         # A wildcard importer, or one that imports through it, reads the
@@ -3880,6 +3919,22 @@ def _importers_to_reparse(
         normalize_file_path(repo_root / rel_path): rel_path for rel_path in importers
     }
     selected: set[str] = set()
+    if spelled:
+        # Any spelling counts, even in a comment or a string: only an importer
+        # whose bytes never hold the name surely parses as before.
+        spelling = re.compile(
+            rb"(?<![A-Za-z0-9_])(?:"
+            + b"|".join(
+                re.escape(name.encode("utf-8", "surrogatepass")) for name in sorted(spelled)
+            )
+            + rb")(?![A-Za-z0-9_])",
+        )
+        for rel_path in importers:
+            try:
+                if spelling.search((repo_root / rel_path).read_bytes()):
+                    selected.add(rel_path)
+            except OSError:
+                return None
     conn = store._conn
     for name in sorted(names):
         for row in conn.execute(
@@ -4121,12 +4176,18 @@ def incremental_update(
                     continue
             except (OSError, PermissionError):
                 pass
+        deps = find_dependents(store, full_path)
         if content_changed is not None:
             if existing and rel_path not in pending_nested and existing[0].file_hash:
                 content_changed[rel_path] = existing[0].file_hash
-            else:
+            elif (
+                existing or deps or rel_path in pending_nested
+                or parser.detect_language(repo_root / rel_path) is not None
+            ):
                 content_changed = None
-        deps = find_dependents(store, full_path)
+            # Otherwise a file no parser indexes (a changelog, say), with no
+            # rows and nothing importing it: it adds no names an importer
+            # could read, so it leaves the shortcut below as it is.
         for d in deps:
             # Convert back to relative path if needed
             try:
