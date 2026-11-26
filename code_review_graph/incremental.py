@@ -30,6 +30,8 @@ from . import install_plan
 from .build_state import advance_to_postprocess_pending
 from .constants import GIT_TIMEOUT as _GIT_TIMEOUT
 from .constants import (
+    IMPORT_CONTEXT_DEFERRED,
+    IMPORT_CONTEXT_KEY,
     discovery_timeout,
     env_float,
     env_int,
@@ -3447,9 +3449,12 @@ _IMPORTER_VISIBLE_EDGE_KINDS = frozenset({
 # Past this many changed symbol names, matching them against the importers'
 # edges stops paying off; every importer is re-parsed instead.
 _MAX_CHANGED_SYMBOL_NAMES = 64
-# A wildcard import anywhere in the text, comments included: such a file reads
-# every public name of the module it imports from.
-_WILDCARD_IMPORT_RE = re.compile(rb"\bimport\s*\*")
+# A wildcard import statement: such a file reads every public name of the
+# module it imports from. One that starts a line, or follows ``:`` or ``;``,
+# counts, even inside a comment or a string; ``from`` mid-sentence does not.
+_WILDCARD_IMPORT_RE = re.compile(
+    rb"(?:^|[:;])[ \t\f]*from[\s\\]+[^\s\\]+[\s\\]+import[\s\\]*\*", re.MULTILINE,
+)
 
 
 # Copies of the Python sources an update stored, named by their sha256, in
@@ -3596,7 +3601,7 @@ def _edge_shape(edge: Any) -> tuple:
 # the stored bytes again. Only a summary written by this very code (and this
 # repository's custom-language config) is read back.
 _SUMMARY_SUFFIX = ".summary"
-_SUMMARY_VERSION = 2
+_SUMMARY_VERSION = 4
 _CODE_FINGERPRINT: str | None = None
 _CODE_FINGERPRINT_LOCK = threading.Lock()
 
@@ -3696,26 +3701,62 @@ def _comparison_summary(view: tuple, nodes: list, edges: list, own: str) -> dict
     ]
     if not all(isinstance(token, str) for token, _entry in annotated):
         raise TypeError("annotated names are not strings")
+    properties = sorted(
+        [key[1], annotation] for key, annotation in (view[1] or {}).items()
+    )
+    if not all(isinstance(a, str) and isinstance(b, str) for a, b in properties):
+        raise TypeError("property names or annotations are not strings")
+    identities = None if view[0] is None else sorted(
+        [name, _canonical_json(identity)] for name, identity in view[0].items()
+    )
+    foreign_pairs = sorted([name, _canonical_json(origin)] for name, origin in foreign.items())
+    if not all(
+        isinstance(name, str) for name, _value in (identities or []) + foreign_pairs
+    ):
+        raise TypeError("imported names are not strings")
     return {
         "imports": _canonical_json(((view[0], view[4]), foreign)),
+        # The parts of "imports", for telling which names a difference touches.
+        "identities": identities,
+        "foreign": foreign_pairs,
+        "alias": _canonical_json(view[4]),
+        "properties": properties,
         "annotated": sorted(annotated),
         "local": local,
-        "visible": _canonical_json(sorted(
-            _edge_shape(edge) for edge in edges if edge.kind in _IMPORTER_VISIBLE_EDGE_KINDS
-        )),
+        "visible": sorted(
+            _canonical_json(_edge_shape(edge)) for edge in edges
+            if edge.kind in _IMPORTER_VISIBLE_EDGE_KINDS
+        ),
         "nodes": records,
     }
+
+
+def _string_pairs(value: Any) -> bool:
+    return isinstance(value, list) and all(
+        isinstance(entry, list) and len(entry) == 2
+        and all(isinstance(part, str) for part in entry)
+        for entry in value
+    )
 
 
 def _valid_summary(summary: Any) -> bool:
     if not isinstance(summary, dict):
         return False
     if not (
-        isinstance(summary.get("imports"), str) and isinstance(summary.get("visible"), str)
+        isinstance(summary.get("imports"), str) and isinstance(summary.get("visible"), list)
         and isinstance(summary.get("local"), list) and isinstance(summary.get("nodes"), list)
     ):
         return False
     if not all(isinstance(name, str) for name in summary["local"]):
+        return False
+    if not all(isinstance(entry, str) for entry in summary["visible"]):
+        return False
+    if not isinstance(summary.get("alias"), str):
+        return False
+    identities = summary.get("identities")
+    if identities is not None and not _string_pairs(identities):
+        return False
+    if not (_string_pairs(summary.get("foreign")) and _string_pairs(summary.get("properties"))):
         return False
     annotated = summary.get("annotated")
     if not isinstance(annotated, list) or not all(
@@ -3769,16 +3810,66 @@ def _write_summary(
         logger.warning("Keeping the summary of %s in %s failed: %s", file_hash, copy_dir, exc)
 
 
+def _visible_change_unread(old: dict, new: dict, own: str) -> bool:
+    """Whether no importer reads the edges that differ between *old* and *new*.
+
+    Those are a Python import inside a function, which binds nothing at
+    module scope, an import of a module outside the repository, and the
+    inheritance of a class only one side defines,
+    which an importer reaches only by spelling the class, a name that counts
+    as changed with its node.
+    """
+    def defined(summary: dict) -> set[str]:
+        return {
+            f"{parent}.{name}" if parent else name
+            for _kind, name, parent, _line, _shape in summary["nodes"]
+        }
+
+    old_visible, new_visible = set(old["visible"]), set(new["visible"])
+    old_defined, new_defined = defined(old), defined(new)
+    prefix = own + "::"
+    for entry in old_visible ^ new_visible:
+        fields = json.loads(entry)
+        fields = fields.get("t") if isinstance(fields, dict) else None
+        if not (isinstance(fields, list) and len(fields) == 4):
+            return False
+        kind, source, target, extra = fields
+        if not all(isinstance(part, str) for part in (source, target, extra)):
+            return False
+        if kind == "IMPORTS_FROM":
+            context = json.loads(extra)
+            if not (source == own and isinstance(context, dict)):
+                return False
+            if context.get(IMPORT_CONTEXT_KEY) == IMPORT_CONTEXT_DEFERRED:
+                continue
+            # A module from outside the repository: no file of it is in the
+            # graph, and what the import binds is in the compared summary.
+            if os.path.isabs(target) or "/" in target or "\\" in target:
+                return False
+            continue
+        if kind not in ("INHERITS", "IMPLEMENTS") or not source.startswith(prefix):
+            return False
+        qualified = source[len(prefix):]
+        if (qualified in old_defined) == (qualified in new_defined):
+            return False
+    return True
+
+
 def _changed_symbol_names(
     repo_root: Path, rel_path: str, file_hash: str, parser: Any, parsed: dict,
     copy_dir: Path | None = None, stored_commit: str | None = None,
-) -> tuple[set[str], bool, set[str]] | None:
+) -> tuple[set[str], bool, set[str], dict[str, set[str]]] | None:
     """Names whose definitions in *rel_path* changed since the graph stored it.
 
     The flag says whether the module's public names changed, which only a
     wildcard import reads. The last set holds the names of the return and
     property annotations that changed: an importer's parse reads one only
     where its source spells that name, so those importers' parses can change.
+    It also holds the properties whose annotation names a type whose class
+    identity changed, and the re-exported names that changed. Those last make
+    up the final mapping, to the files they came from before and after: an
+    importer that spells one, other than the file that defines it, can pass
+    the change on to its own importers.
     None when another importer's parse could have changed too, or when that
     cannot be told: the file is not an indexed Python module whose stored
     bytes Git (or *copy_dir*) still has, a summary importers read from it
@@ -3815,16 +3906,10 @@ def _changed_symbol_names(
             # cache the update's parser shares with the files it parses next.
             old_parser = _get_code_parser_cls()(repo_root)
             old_view = old_parser.python_importer_view(abs_path, old_source)
-            if _comparison_summary(old_view, [], [], own)["imports"] != (
-                _comparison_summary(new_view, [], [], own)["imports"]
-            ):
-                return None
             old_nodes, old_edges = old_parser.parse_bytes(abs_path, old_source)
             old = json.loads(json.dumps(
                 _comparison_summary(old_view, old_nodes, old_edges, own),
             ))
-        elif old["imports"] != _comparison_summary(new_view, [], [], own)["imports"]:
-            return None
         new_nodes, new_edges = parser.parse_bytes(abs_path, new_source)
         parsed[rel_path] = (new_source, new_nodes, new_edges)
         # Round-tripped, so both sides are compared in the form a saved one has.
@@ -3834,7 +3919,7 @@ def _changed_symbol_names(
         return None
     _write_summary(copy_dir, hashlib.sha256(new_source).hexdigest(), fingerprint, new)
 
-    if old["visible"] != new["visible"]:
+    if old["visible"] != new["visible"] and not _visible_change_unread(old, new, own):
         return None
     names: set[str] = set()
     old_shapes = {record[4]: record for record in old["nodes"]}
@@ -3868,7 +3953,196 @@ def _changed_symbol_names(
     old_annotated = {tuple(entry) for entry in old["annotated"]}
     new_annotated = {tuple(entry) for entry in new["annotated"]}
     spelled = {token for token, _entry in old_annotated ^ new_annotated}
-    return names, old_local != new_local, spelled
+    reexported: dict[str, set[str]] = {}
+    if old["imports"] != new["imports"]:
+        if (
+            old["alias"] != new["alias"]
+            or old["identities"] is None or new["identities"] is None
+        ):
+            return None
+
+        def changed(field: str) -> set[str]:
+            pairs = {tuple(entry) for entry in old[field]} ^ {
+                tuple(entry) for entry in new[field]
+            }
+            return {name for name, _value in pairs}
+
+        # An importer reads a class identity here only for the type a property
+        # annotation of this module names, under the property's spelled name;
+        # a re-exported name it reads under the name it imports.
+        for name in changed("identities"):
+            word = re.compile(rf"(?<![A-Za-z0-9_]){re.escape(name)}(?![A-Za-z0-9_])")
+            for prop, annotation in old["properties"] + new["properties"]:
+                if word.search(annotation):
+                    spelled.add(prop)
+        for name in changed("foreign"):
+            origins = reexported.setdefault(name, set())
+            for entry_name, value in old["foreign"] + new["foreign"]:
+                origin = json.loads(value) if entry_name == name else None
+                if isinstance(origin, str):
+                    origins.add(origin)
+        spelled |= set(reexported)
+    return names, old_local != new_local or bool(reexported), spelled, reexported
+
+
+def _known_dirs(repo_root: Path, store: GraphStore, stored_commit: str | None) -> set[str] | None:
+    """Folders (relative, POSIX) that held a file the graph or the stored commit has."""
+    known: set[str] = set()
+    for stored in store.get_all_files():
+        try:
+            rel = PurePosixPath(Path(stored).relative_to(repo_root).as_posix())
+        except ValueError:
+            continue
+        known.update(str(parent) for parent in rel.parents)
+    if stored_commit and _GIT_COMMIT_RE.fullmatch(stored_commit):
+        try:
+            result = subprocess.run(
+                ["git", "ls-tree", "-r", "-d", "--name-only", "-z", stored_commit],
+                cwd=str(repo_root), capture_output=True, timeout=_GIT_TIMEOUT, check=False,
+            )
+        except (OSError, subprocess.SubprocessError) as exc:
+            logger.debug("Listing the folders of %s failed: %s", stored_commit, exc)
+            return None
+        if result.returncode == 0:
+            known.update(
+                name.decode("utf-8", "surrogateescape")
+                for name in result.stdout.split(b"\0") if name
+            )
+    return known
+
+
+def _unimported_changes_unreachable(
+    repo_root: Path, store: GraphStore, paths: list[str], importers: set[str],
+    stored_commit: str | None,
+) -> bool:
+    """Whether no importer's parse can see the change to *paths*.
+
+    Each path is a file nothing in the graph depends on that is not an
+    indexed Python module still on disk: a new or deleted file, or one in a
+    language other than Python.
+
+    A Python parse reads another file only by resolving an import, which
+    probes a ``.py`` file named after a module's last part, or a folder named
+    after a part for a namespace package, never anything below a folder whose
+    name starts with a dot. So a file added, removed or edited there changes
+    what some module resolves to only where a Python file spells its stem, or
+    the name of a folder that came or went with it. When no Python file on
+    disk spells one (ignored files included, as the parser reads those too),
+    apart from the changed files themselves, no importer's parse can change.
+    A symlink that leads below a dot folder, a package ``__init__.py`` (which
+    also decides where a standard-library name resolves) and this tool's own
+    config folder make it give up.
+    """
+    if not paths:
+        return True
+    if os.name == "nt":
+        return False
+    for rel_path in importers:
+        parts = PurePosixPath(Path(rel_path).as_posix()).parts
+        if not rel_path.endswith(".py") or any(part.startswith(".") for part in parts):
+            return False
+    known: set[str] | None = None
+    tokens: set[str] = set()
+    own: set[str] = set()
+    for rel_path in paths:
+        posix = PurePosixPath(Path(rel_path).as_posix())
+        own.add(str(posix))
+        parts = posix.parts
+        if any(part.startswith(".code-review-graph") for part in parts):
+            return False
+        if any(part.startswith(".") for part in parts):
+            continue
+        if parts[-1] == "__init__.py":
+            return False
+        abs_path = repo_root / rel_path
+        if abs_path.is_symlink():
+            return False
+        if parts[-1].endswith(".py"):
+            tokens.add(parts[-1][: -len(".py")])
+        exists = abs_path.exists()
+        for depth in range(1, len(parts)):
+            folder = "/".join(parts[:depth])
+            if exists:
+                if known is None:
+                    known = _known_dirs(repo_root, store, stored_commit)
+                    if known is None:
+                        return False
+                came_or_went = folder not in known
+            else:
+                came_or_went = not (repo_root / folder).is_dir()
+            if came_or_went:
+                tokens.add(parts[depth - 1])
+    if not tokens:
+        return True
+    if len(tokens) > _MAX_CHANGED_SYMBOL_NAMES:
+        return False
+    grep_cmd = ["git", "grep", "--no-index", "-l", "-z", "-w", "-F"]
+    for token in sorted(tokens):
+        grep_cmd += ["-e", token]
+    grep_cmd += ["--", "*.py", ":!.*", ":!**/.*"]
+    # Git does not follow symlinks here, so each one is checked on its own.
+    find_cmd = [
+        "find", ".", "-mindepth", "1", "-name", ".*", "-prune", "-o", "-type", "l", "-print0",
+    ]
+    try:
+        grep = subprocess.Popen(
+            grep_cmd, cwd=str(repo_root), stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+        )
+        try:
+            links = subprocess.run(
+                find_cmd, cwd=str(repo_root), capture_output=True, timeout=_GIT_TIMEOUT,
+                check=False,
+            )
+            found, _ = grep.communicate(timeout=_GIT_TIMEOUT)
+        finally:
+            if grep.poll() is None:
+                grep.kill()
+                grep.wait()
+    except (OSError, subprocess.SubprocessError) as exc:
+        logger.debug("Looking for files that name %s failed: %s", sorted(tokens), exc)
+        return False
+    if grep.returncode not in (0, 1) or links.returncode != 0:
+        return False
+    for name in found.split(b"\0"):
+        if name and name.decode("utf-8", "surrogateescape") not in own:
+            return False
+    for name in links.stdout.split(b"\0"):
+        if not name:
+            continue
+        try:
+            target = (repo_root / name.decode("utf-8", "surrogateescape")).resolve()
+            inside = target.relative_to(repo_root)
+        except (OSError, RuntimeError, ValueError):
+            continue
+        if any(part.startswith(".") for part in inside.parts):
+            return False
+    return True
+
+
+def _spelling_re(names: set[str]) -> re.Pattern[bytes]:
+    """Any of *names* as a whole word in a file's bytes."""
+    return re.compile(
+        rb"(?<![A-Za-z0-9_])(?:"
+        + b"|".join(re.escape(name.encode("utf-8", "surrogatepass")) for name in sorted(names))
+        + rb")(?![A-Za-z0-9_])",
+    )
+
+
+def _file_scope_import_names(parser: Any, file_path: str, source: bytes) -> set[str] | None:
+    """The names a Python file's file-scope imports bind, as its exports read them.
+
+    None when the file cannot be parsed as Python.
+    """
+    if not file_path.endswith((".py", ".pyi")):
+        return None
+    ts_parser = parser._get_parser("python")
+    if not ts_parser:
+        return None
+    tree = ts_parser.parse(source)
+    import_map, _defined = parser._collect_file_scope(
+        tree.root_node, "python", source, file_path,
+    )
+    return set(import_map)
 
 
 def _importers_to_reparse(
@@ -3878,8 +4152,12 @@ def _importers_to_reparse(
     importers: set[str],
     parser: Any,
     parsed: dict,
+    unimported: list[str] | None = None,
 ) -> set[str] | None:
     """The importers of *changed* (path to stored hash) a re-parse could alter.
+
+    *unimported* are the other changed paths: nothing imports them and no
+    Python parse reads their bytes (see :func:`_unimported_changes_unreachable`).
 
     Used with ``CRG_FAST_ENGINE``. An importer with unchanged bytes parses as
     before when every changed module shows its importers the same summaries
@@ -3890,11 +4168,18 @@ def _importers_to_reparse(
     """
     names: set[str] = set()
     spelled: set[str] = set()
-    exports_changed = False
+    reexported: dict[str, set[str]] = {}
+    # Which changed module each re-exported name changed in.
+    reexported_by: dict[str, set[str]] = {}
+    exports_from: list[str] = []
     copy_dir = _source_copy_dir(store, repo_root)
     # Once a commit lands, the bytes the graph holds are in the commit it was
     # last synced to rather than in HEAD.
     stored_commit = store.get_metadata("git_head_sha")
+    if not _unimported_changes_unreachable(
+        repo_root, store, unimported or [], importers, stored_commit,
+    ):
+        return None
     for rel_path, file_hash in changed.items():
         found = _changed_symbol_names(
             repo_root, rel_path, file_hash, parser, parsed, copy_dir, stored_commit,
@@ -3902,39 +4187,76 @@ def _importers_to_reparse(
         if found is None:
             return None
         names |= found[0]
-        exports_changed = exports_changed or found[1]
+        if found[1]:
+            exports_from.append(rel_path)
         spelled |= found[2]
+        for name, origins in found[3].items():
+            reexported.setdefault(name, set()).update(origins)
+            reexported_by.setdefault(name, set()).add(rel_path)
         if len(names) > _MAX_CHANGED_SYMBOL_NAMES or len(spelled) > _MAX_CHANGED_SYMBOL_NAMES:
             return None
-    if exports_changed:
-        # A wildcard importer, or one that imports through it, reads the
-        # public names themselves rather than an edge that names them.
-        for rel_path in importers:
-            try:
-                if _WILDCARD_IMPORT_RE.search((repo_root / rel_path).read_bytes()):
-                    return None
-            except OSError:
-                return None
     by_stored = {
         normalize_file_path(repo_root / rel_path): rel_path for rel_path in importers
     }
     selected: set[str] = set()
+    # A wildcard importer reads a module's public names themselves rather than
+    # an edge that names them, so it is re-parsed; one that is imported in turn
+    # passes them on, which this update does not compare. Only a file that
+    # imports the module can import it with a wildcard.
+    for rel_path in exports_from:
+        for dependent in find_dependents(store, normalize_file_path(repo_root / rel_path)):
+            try:
+                source = Path(dependent).read_bytes()
+            except OSError:
+                return None
+            if not _WILDCARD_IMPORT_RE.search(source):
+                continue
+            if _single_hop_dependents(store, dependent):
+                return None
+            if dependent in by_stored:
+                selected.add(by_stored[dependent])
     if spelled:
         # Any spelling counts, even in a comment or a string: only an importer
         # whose bytes never hold the name surely parses as before.
-        spelling = re.compile(
-            rb"(?<![A-Za-z0-9_])(?:"
-            + b"|".join(
-                re.escape(name.encode("utf-8", "surrogatepass")) for name in sorted(spelled)
-            )
-            + rb")(?![A-Za-z0-9_])",
-        )
+        spelling = _spelling_re(spelled)
         for rel_path in importers:
             try:
-                if spelling.search((repo_root / rel_path).read_bytes()):
-                    selected.add(rel_path)
+                source = (repo_root / rel_path).read_bytes()
             except OSError:
                 return None
+            if not spelling.search(source):
+                continue
+            selected.add(rel_path)
+            stored_path = normalize_file_path(repo_root / rel_path)
+            # Its own importers can read a re-exported name through its
+            # exports, which this update does not compare, unless it is the
+            # module whose exports changed (its importers are the ones
+            # checked here), or the file that defines the name and does not
+            # rename it on import.
+            # Its exports are the names its file-scope imports bind, so a
+            # name it spells only as an attribute or in a call is not one.
+            passed_on = [
+                name for name, origins in reexported.items()
+                if rel_path not in reexported_by[name]
+                and _spelling_re({name}).search(source)
+            ]
+            bound: set[str] | None = None
+            for name in passed_on:
+                renamed = re.search(
+                    rb"(?<![A-Za-z0-9_])" + re.escape(name.encode("utf-8", "surrogatepass"))
+                    + rb"\s+as(?![A-Za-z0-9_])",
+                    source,
+                )
+                if stored_path in reexported[name] and not renamed:
+                    continue
+                if not renamed:
+                    if bound is None:
+                        bound = _file_scope_import_names(parser, stored_path, source)
+                    if bound is not None and name not in bound:
+                        continue
+                if _single_hop_dependents(store, stored_path):
+                    return None
+                break
     conn = store._conn
     for name in sorted(names):
         for row in conn.execute(
@@ -4156,6 +4478,7 @@ def incremental_update(
     # Changed files whose bytes differ from the stored ones, with the stored
     # hash, or None once one of them cannot take the fast path below.
     content_changed: dict[str, str] | None = {}
+    unimported: list[str] = []
     for rel_path in changed_files:
         full_path = normalize_file_path(repo_root / rel_path)
         # Duplicate watch notifications do not invalidate dependents. A real
@@ -4178,16 +4501,25 @@ def incremental_update(
                 pass
         deps = find_dependents(store, full_path)
         if content_changed is not None:
-            if existing and rel_path not in pending_nested and existing[0].file_hash:
-                content_changed[rel_path] = existing[0].file_hash
-            elif (
-                existing or deps or rel_path in pending_nested
-                or parser.detect_language(repo_root / rel_path) is not None
+            if (
+                not deps and existing and rel_path not in pending_nested
+                and rel_path.endswith(".py") and not (repo_root / rel_path).is_symlink()
+                and (repo_root / rel_path).is_file()
             ):
+                # Edited in place and nothing depends on it: no importer's
+                # parse reads it, and the file itself is re-parsed below.
+                pass
+            elif (
+                deps and existing and rel_path not in pending_nested and existing[0].file_hash
+            ):
+                content_changed[rel_path] = existing[0].file_hash
+            elif deps or rel_path in pending_nested:
                 content_changed = None
-            # Otherwise a file no parser indexes (a changelog, say), with no
-            # rows and nothing importing it: it adds no names an importer
-            # could read, so it leaves the shortcut below as it is.
+            else:
+                # Nothing depends on it and no parse reads its bytes (a new or
+                # deleted module, or a changelog): checked below for a module
+                # or folder an importer's parse could now resolve differently.
+                unimported.append(rel_path)
         for d in deps:
             # Convert back to relative path if needed
             try:
@@ -4213,7 +4545,7 @@ def incremental_update(
     ):
         importers_to_reparse = _importers_to_reparse(
             repo_root, store, content_changed, dependent_files - dependents_pending,
-            parser, preparsed,
+            parser, preparsed, unimported,
         )
         if importers_to_reparse is not None:
             importers_to_reparse |= dependents_pending
