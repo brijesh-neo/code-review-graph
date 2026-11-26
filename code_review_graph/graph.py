@@ -3806,6 +3806,10 @@ class GraphStore:
         Runs before ``_settle_unbound_endpoints`` and also takes up edges that
         pass settled earlier. Returns the number of edges changed. See: #984
         """
+        if self._native_sql:
+            native = self._native_resolver_job("stage_inherited_resolve")
+            if native >= 0:
+                return native
         conn = self._conn
         work: list[tuple[str, sqlite3.Row, dict, str, str, str]] = []
         for kind, column in (
@@ -3940,6 +3944,10 @@ class GraphStore:
 
         Returns the number of edges changed.
         """
+        if self._native_sql:
+            native = self._native_resolver_job("stage_unbound_settle")
+            if native >= 0:
+                return native
         conn = self._conn
         changes: dict[str, list[tuple[str, str, int]]] = {}
         for kind, column, managed_key in _NODE_ENDPOINTS:
@@ -4741,6 +4749,18 @@ class GraphStore:
         if not has_bare:
             return 0
 
+        if self._native_sql:
+            native = self._native_bare_resolve(kind, endpoint)
+            if native >= 0:
+                if native:
+                    logger.info(
+                        "Resolved %d evidence-backed bare %s %s",
+                        native,
+                        kind,
+                        "sources" if endpoint == "source_qualified" else "targets",
+                    )
+                return native
+
         (
             node_lookup,
             parent_lookup,
@@ -5010,6 +5030,57 @@ class GraphStore:
                 endpoint_label,
             )
         return resolved
+
+    def _native_bare_resolve(self, kind: str, endpoint: str) -> int:
+        """``_resolve_bare_endpoints`` as one native pass over every bare edge.
+
+        Same reads, same decisions and the same writes; the resolved count
+        back, or -1. It always reads every bare edge: the scoped read reaches
+        the same answer, and the native pass is cheaper than the scoping.
+        """
+        return self._native_resolver_job("stage_bare_resolve", kind, endpoint)
+
+    def _native_resolver_job(self, stage_name: str, *args: object) -> int:
+        """Run one native resolver pass from ``crg_fast`` in one transaction.
+
+        The pass reads values as the codec's row factory restores them and
+        writes them as ``strip_params`` strips them. -1 when this ``crg_fast``
+        lacks the pass, or the graph holds something the pass does not read
+        the way Python does; it has then written nothing.
+        """
+        import crg_fast
+
+        stage_job = getattr(crg_fast, stage_name, None)
+        if stage_job is None:
+            return -1
+        codec = getattr(self._conn, "codec", None)
+        fields = None
+        if codec is not None:
+            fields = (
+                codec.root,
+                codec._json_root_out,
+                list(codec._prefixes),
+                list(codec._roots),
+                list(codec._json_roots),
+                sorted(codec._leads),
+            )
+        self._begin_immediate()
+        try:
+            token = stage_job(*args, fields)
+            try:
+                row = self._conn.execute("SELECT crg_run(?)", (token,)).fetchone()
+            except BaseException:
+                crg_fast.discard_job(token)
+                raise
+            changed = int(row[0])
+            if changed < 0:
+                self._conn.rollback()
+            else:
+                self._conn.commit()
+        except BaseException:
+            self._conn.rollback()
+            raise
+        return changed
 
     def get_all_files(self) -> list[str]:
         # A partially failed file update can leave Function/Class nodes or

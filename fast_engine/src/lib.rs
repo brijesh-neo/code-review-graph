@@ -26,6 +26,9 @@ mod restore;
 mod identities;
 mod node_rows;
 mod json;
+mod pyjson;
+mod pathcodec;
+mod resolve;
 
 const CAPSULE_NAME: &CStr = c"tree_sitter.Language";
 
@@ -340,5 +343,8 @@ fn crg_fast(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(sqlite_ext::sqlite_extension_loaded, module)?)?;
     module.add_function(wrap_pyfunction!(sqlite_ext::discard_job, module)?)?;
     module.add_function(wrap_pyfunction!(certainty::stage_certainty_refresh, module)?)?;
+    module.add_function(wrap_pyfunction!(resolve::stage_bare_resolve, module)?)?;
+    module.add_function(wrap_pyfunction!(resolve::stage_inherited_resolve, module)?)?;
+    module.add_function(wrap_pyfunction!(resolve::stage_unbound_settle, module)?)?;
     Ok(())
 }
