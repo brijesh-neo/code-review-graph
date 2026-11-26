@@ -266,3 +266,87 @@ def test_flag_on_update_leaves_no_transaction_open(
             assert checkpointed == log_frames
     finally:
         store.close()
+
+
+def _twice_updated_graph(
+    base_repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    label: str, flag: bool,
+) -> Path:
+    """Add a symbol, update, then rename one before committing, and update."""
+    repo = tmp_path / label
+    shutil.copytree(base_repo, repo)
+    data = tmp_path / f"{label}-data"
+    monkeypatch.setenv("CRG_DATA_DIR", str(data))
+    monkeypatch.delenv("CRG_FAST_ENGINE", raising=False)
+    assert build_or_update_graph(full_rebuild=True, repo_root=str(repo))["status"] == "ok"
+    if flag:
+        monkeypatch.setenv("CRG_FAST_ENGINE", "1")
+    _add_symbol(repo)
+    assert build_or_update_graph(repo_root=str(repo))["status"] == "ok"
+    (repo / "lib.py").write_text(
+        (LIB + "\n\ndef later():\n    return 3\n").replace("helper", "helper_two")
+    )
+    assert build_or_update_graph(repo_root=str(repo))["status"] == "ok"
+    monkeypatch.delenv("CRG_FAST_ENGINE", raising=False)
+    return data / "graph.db"
+
+
+def test_second_save_before_a_commit_skips_importers_and_matches_legacy(
+    base_repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The graph holds bytes Git never saw after the first update, so the
+    # second one reads them from the copy the first update kept.
+    selections: list[object] = []
+    original = incremental._importers_to_reparse
+
+    def spy(*args, **kwargs):
+        selected = original(*args, **kwargs)
+        selections.append(selected)
+        return selected
+
+    monkeypatch.setattr(incremental, "_importers_to_reparse", spy)
+    legacy = _twice_updated_graph(base_repo, tmp_path, monkeypatch, "off", False)
+    assert selections == []
+    fast = _twice_updated_graph(base_repo, tmp_path, monkeypatch, "on", True)
+
+    assert _dump(fast) == _dump(legacy)
+    assert len(selections) == 2
+    assert isinstance(selections[1], set)
+    assert {"a.py", "b.py", "c.py", "d.py"} - selections[1]
+    # Only the copy of the bytes the graph now holds is left.
+    stored = (tmp_path / "on" / "lib.py").read_bytes()
+    import hashlib
+
+    copies = sorted(p.name for p in (fast.parent / "source-copies").iterdir())
+    assert copies == [hashlib.sha256(stored).hexdigest()]
+
+
+def test_a_copy_that_does_not_match_its_name_is_not_read(tmp_path: Path) -> None:
+    import hashlib
+
+    data = b"def f():\n    return 1\n"
+    digest = hashlib.sha256(data).hexdigest()
+    (tmp_path / digest).write_bytes(data)
+    assert incremental._read_source_copy(tmp_path, digest) == data
+    (tmp_path / digest).write_bytes(data + b"# changed\n")
+    assert incremental._read_source_copy(tmp_path, digest) is None
+    assert incremental._read_source_copy(tmp_path, "../" + digest) is None
+    assert incremental._read_source_copy(None, digest) is None
+
+
+def test_a_full_build_drops_copies_no_file_holds(
+    base_repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    data = tmp_path / "data"
+    monkeypatch.setenv("CRG_DATA_DIR", str(data))
+    monkeypatch.delenv("CRG_FAST_ENGINE", raising=False)
+    assert build_or_update_graph(full_rebuild=True, repo_root=str(base_repo))["status"] == "ok"
+    copies = data / "source-copies"
+    copies.mkdir()
+    import hashlib
+
+    held = hashlib.sha256((base_repo / "lib.py").read_bytes()).hexdigest()
+    (copies / held).write_bytes((base_repo / "lib.py").read_bytes())
+    (copies / ("0" * 64)).write_bytes(b"gone\n")
+    assert build_or_update_graph(full_rebuild=True, repo_root=str(base_repo))["status"] == "ok"
+    assert sorted(p.name for p in copies.iterdir()) == [held]

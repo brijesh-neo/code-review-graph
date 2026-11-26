@@ -3397,6 +3397,7 @@ def full_build(
     # anchor still describes the commit the stored files were parsed at.
     _store_vcs_metadata(repo_root, store)
     store.commit()
+    _prune_source_copies(store, _source_copy_dir(store, repo_root))
     # A full build rewrites most rows; an incremental update does not move the
     # table sizes enough to need this.
     store.refresh_planner_stats()
@@ -3451,12 +3452,103 @@ _MAX_CHANGED_SYMBOL_NAMES = 64
 _WILDCARD_IMPORT_RE = re.compile(rb"\bimport\s*\*")
 
 
-def _committed_bytes(repo_root: Path, rel_path: str, file_hash: str) -> bytes | None:
+# Copies of the Python sources an update stored, named by their sha256, in
+# this directory next to graph.db. The next update of the same file reads the
+# old bytes back from here when Git does not have them (the file was saved
+# again before a commit), instead of re-parsing every importer.
+_SOURCE_COPY_DIR = "source-copies"
+_SHA256_HEX_RE = re.compile(r"[0-9a-f]{64}")
+
+
+def _source_copy_dir(store: GraphStore, repo_root: Path) -> Path | None:
+    """Where copies are kept, or None when the graph is not in its data dir.
+
+    Only the repository's own data directory (which ignores its contents) may
+    hold them; a database opened anywhere else, perhaps inside the working
+    tree, gets no copies and the update reads old bytes from Git alone.
+    """
+    db_path = Path(store.db_path)
+    try:
+        data_dir = get_data_dir(Path(repo_root), create=False)
+        if db_path.name != "graph.db" or db_path.parent.resolve() != data_dir.resolve():
+            return None
+    except (OSError, ValueError) as exc:
+        logger.debug("No source copies for %s: %s", db_path, exc)
+        return None
+    return db_path.parent / _SOURCE_COPY_DIR
+
+
+def _read_source_copy(copy_dir: Path | None, file_hash: str) -> bytes | None:
+    """The copy of the bytes whose sha256 is *file_hash*, if one is kept."""
+    if copy_dir is None or not _SHA256_HEX_RE.fullmatch(file_hash or ""):
+        return None
+    try:
+        data = (copy_dir / file_hash).read_bytes()
+    except OSError:
+        return None
+    return data if hashlib.sha256(data).hexdigest() == file_hash else None
+
+
+def _save_source_copies(
+    store: GraphStore, repo_root: Path, stored: dict[str, str],
+) -> None:
+    """Keep the bytes of the Python files in *stored* (path to stored hash).
+
+    Then drop every copy whose hash no file in the graph holds any more. A
+    copy only spares a later update work, so a failure here is logged and
+    the update goes on.
+    """
+    copy_dir = _source_copy_dir(store, repo_root)
+    if copy_dir is None:
+        return
+    wanted = {
+        rel_path: file_hash for rel_path, file_hash in stored.items()
+        if rel_path.endswith(".py") and _SHA256_HEX_RE.fullmatch(file_hash or "")
+    }
+    if not wanted and not copy_dir.is_dir():
+        return
+    try:
+        copy_dir.mkdir(exist_ok=True)
+        for rel_path, file_hash in sorted(wanted.items()):
+            target = copy_dir / file_hash
+            if target.is_file():
+                continue
+            data = (repo_root / rel_path).read_bytes()
+            if hashlib.sha256(data).hexdigest() != file_hash:
+                continue  # Changed again since it was parsed.
+            partial_path = copy_dir / f".{file_hash}.{uuid.uuid4().hex}.tmp"
+            partial_path.write_bytes(data)
+            os.replace(partial_path, target)
+        _prune_source_copies(store, copy_dir)
+    except OSError as exc:
+        logger.warning("Keeping source copies in %s failed: %s", copy_dir, exc)
+
+
+def _prune_source_copies(store: GraphStore, copy_dir: Path | None) -> None:
+    """Delete the kept copies whose hash no file in the graph holds."""
+    if copy_dir is None or not copy_dir.is_dir():
+        return
+    held = {
+        row[0] for row in store._conn.execute(
+            "SELECT file_hash FROM nodes WHERE kind = 'File'"
+        )
+    }
+    try:
+        for entry in copy_dir.iterdir():
+            if entry.name not in held:
+                entry.unlink()
+    except OSError as exc:
+        logger.warning("Pruning source copies in %s failed: %s", copy_dir, exc)
+
+
+def _committed_bytes(
+    repo_root: Path, rel_path: str, file_hash: str, copy_dir: Path | None = None,
+) -> bytes | None:
     """The bytes the graph holds for *rel_path*, read back from Git.
 
-    HEAD first, then the index. Only a blob whose sha256 equals the stored
-    *file_hash* counts, so a graph built from bytes Git does not have gets
-    None.
+    HEAD first, then the index, then the copy an update kept in *copy_dir*.
+    Only bytes whose sha256 equals the stored *file_hash* count, so a graph
+    built from bytes none of them has gets None.
     """
     for spec in (f"HEAD:./{rel_path}", f":./{rel_path}"):
         try:
@@ -3473,7 +3565,7 @@ def _committed_bytes(repo_root: Path, rel_path: str, file_hash: str) -> bytes | 
             and hashlib.sha256(result.stdout).hexdigest() == file_hash
         ):
             return result.stdout
-    return None
+    return _read_source_copy(copy_dir, file_hash)
 
 
 def _node_shape(node: Any) -> tuple:
@@ -3494,6 +3586,7 @@ def _edge_shape(edge: Any) -> tuple:
 
 def _changed_symbol_names(
     repo_root: Path, rel_path: str, file_hash: str, parser: Any, parsed: dict,
+    copy_dir: Path | None = None,
 ) -> tuple[set[str], bool] | None:
     """Names whose definitions in *rel_path* changed since the graph stored it.
 
@@ -3514,7 +3607,7 @@ def _changed_symbol_names(
         new_source = abs_path.read_bytes()
     except OSError:
         return None
-    old_source = _committed_bytes(repo_root, rel_path, file_hash)
+    old_source = _committed_bytes(repo_root, rel_path, file_hash, copy_dir)
     if old_source is None:
         return None
     # A parser of its own for the old bytes: they must not reach a cache the
@@ -3593,8 +3686,11 @@ def _importers_to_reparse(
     """
     names: set[str] = set()
     exports_changed = False
+    copy_dir = _source_copy_dir(store, repo_root)
     for rel_path, file_hash in changed.items():
-        found = _changed_symbol_names(repo_root, rel_path, file_hash, parser, parsed)
+        found = _changed_symbol_names(
+            repo_root, rel_path, file_hash, parser, parsed, copy_dir,
+        )
         if found is None:
             return None
         names |= found[0]
@@ -4012,6 +4108,8 @@ def incremental_update(
     # Stored paths of the files re-parsed here. Re-parsing replaces a file's
     # edges, so these are the only files the Jedi step needs to scan again.
     reparsed_paths: list[str] = []
+    # Files stored with new bytes: path to the hash stored for them.
+    stored_sources: dict[str, str] = {}
 
     # Dependents whose bytes did not change only get their edges re-saved,
     # which is most of an update's writes: save them a batch per transaction.
@@ -4040,6 +4138,7 @@ def incremental_update(
         cleared_entry_qns.update(capture_affected_flow_entry_points(store, file_paths))
         flow_node_ids.update(capture_flow_node_ids(store, file_paths))
         store.store_file_nodes_edges(str(repo_root / rel_path), nodes, edges, fhash)
+        stored_sources[rel_path] = fhash
 
     use_serial = os.environ.get("CRG_SERIAL_PARSE", "") == "1"
     parsed_files = 0
@@ -4091,6 +4190,8 @@ def incremental_update(
                 total_edges += len(edges)
 
     flush_edges()
+    if fast_engine_enabled():
+        _save_source_copies(store, repo_root, stored_sources)
 
     failed_dependents = dependent_files & {error["file"] for error in errors}
     if failed_dependents != dependents_pending:
