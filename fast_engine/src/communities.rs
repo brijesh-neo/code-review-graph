@@ -28,33 +28,33 @@ const COMMON_WORDS: &[&str] = &[
     "not",
 ];
 
-struct Node {
-    qualified_name: String,
-    kind: String,
-    name: String,
-    file_path: String,
-    language: String,
-    is_test: bool,
+pub(crate) struct Node {
+    pub(crate) qualified_name: String,
+    pub(crate) kind: String,
+    pub(crate) name: String,
+    pub(crate) file_path: String,
+    pub(crate) language: String,
+    pub(crate) is_test: bool,
 }
 
 impl Node {
-    fn is_test_node(&self) -> bool {
+    pub(crate) fn is_test_node(&self) -> bool {
         self.kind == "Test" || self.is_test
     }
 }
 
 /// Keys in first-seen order with their counts, as `Counter` keeps them.
-struct Counts<'a> {
+pub(crate) struct Counts<'a> {
     order: Vec<(&'a str, usize)>,
     index: HashMap<&'a str, usize>,
 }
 
 impl<'a> Counts<'a> {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Counts { order: Vec::new(), index: HashMap::default() }
     }
 
-    fn add(&mut self, key: &'a str) {
+    pub(crate) fn add(&mut self, key: &'a str) {
         match self.index.get(key) {
             Some(&at) => self.order[at].1 += 1,
             None => {
@@ -65,7 +65,7 @@ impl<'a> Counts<'a> {
     }
 
     /// `most_common(1)[0]`: the first key with the highest count.
-    fn top(&self) -> Option<(&'a str, usize)> {
+    pub(crate) fn top(&self) -> Option<(&'a str, usize)> {
         let mut best: Option<(&'a str, usize)> = None;
         for &(key, count) in &self.order {
             if best.map_or(true, |(_, top)| count > top) {
@@ -111,7 +111,7 @@ fn split_name(name: &str) -> Vec<String> {
 }
 
 /// `_to_slug`.
-fn to_slug(text: &str) -> String {
+pub(crate) fn to_slug(text: &str) -> String {
     let mut normalized = String::with_capacity(text.len());
     let mut in_gap = false;
     for c in text.chars() {
@@ -138,7 +138,7 @@ fn to_slug(text: &str) -> String {
 }
 
 /// `_extract_keywords`. Names were checked to be ASCII when read.
-fn extract_keywords(members: &[&Node]) -> Vec<String> {
+pub(crate) fn extract_keywords(members: &[&Node]) -> Vec<String> {
     let mut words: Vec<String> = Vec::new();
     for member in members {
         if matches!(member.kind.as_str(), "Function" | "Class" | "Test" | "Type") {
@@ -158,7 +158,7 @@ fn extract_keywords(members: &[&Node]) -> Vec<String> {
 }
 
 /// `_naming_members`.
-fn naming_members<'a>(members: &[&'a Node]) -> Vec<&'a Node> {
+pub(crate) fn naming_members<'a>(members: &[&'a Node]) -> Vec<&'a Node> {
     let production: Vec<&Node> =
         members.iter().copied().filter(|m| !m.is_test_node()).collect();
     if production.is_empty() { members.to_vec() } else { production }
@@ -205,7 +205,7 @@ fn file_prefix(members: &[&Node]) -> String {
 }
 
 /// `_generate_community_name`.
-fn community_name(members: &[&Node]) -> String {
+pub(crate) fn community_name(members: &[&Node]) -> String {
     if members.is_empty() {
         return "empty".to_string();
     }
@@ -235,7 +235,7 @@ fn community_name(members: &[&Node]) -> String {
 }
 
 /// `round(value, 4)`: both round the exact binary value half to even.
-fn round4(value: f64) -> f64 {
+pub(crate) fn round4(value: f64) -> f64 {
     format!("{value:.4}").parse().unwrap_or(value)
 }
 
@@ -248,7 +248,7 @@ struct Community {
     members: Vec<usize>,
 }
 
-fn read_nodes(db: *mut ffi::sqlite3, paths: &Paths) -> R<Vec<Node>> {
+pub(crate) fn read_nodes(db: *mut ffi::sqlite3, paths: &Paths) -> R<Vec<Node>> {
     let rows = Rows::new(db, "SELECT * FROM nodes WHERE kind != 'File'", paths)?;
     let qn_at = rows.column_index("qualified_name")?;
     let kind_at = rows.column_index("kind")?;
@@ -453,15 +453,15 @@ fn dedupe_names(communities: &mut [Community], nodes: &[Node]) {
 
 /// `store_communities` for communities the file detector made.
 fn store(db: *mut ffi::sqlite3, paths: &Paths, nodes: &[Node], communities: &[Community]) -> R<i64> {
+    let current = crate::leiden::read_assignments(db, paths)?;
     Stmt::prepare(db, "DELETE FROM communities")?.run()?;
-    Stmt::prepare(db, "UPDATE nodes SET community_id = NULL")?.run()?;
+    let mut wanted: HashMap<String, i64> = HashMap::default();
     let insert = Stmt::prepare(
         db,
         "INSERT INTO communities \
          (name, level, cohesion, size, dominant_language, description) \
          VALUES (?, ?, ?, ?, ?, ?)",
     )?;
-    let assign = Stmt::prepare(db, "UPDATE nodes SET community_id = ? WHERE qualified_name = ?")?;
     for community in communities {
         insert.bind_text(1, &paths.strip(&community.name))?;
         insert.bind_i64(2, 0)?;
@@ -472,11 +472,10 @@ fn store(db: *mut ffi::sqlite3, paths: &Paths, nodes: &[Node], communities: &[Co
         insert.run()?;
         let id = unsafe { ffi::sqlite3_last_insert_rowid(db) };
         for &m in &community.members {
-            assign.bind_i64(1, id)?;
-            assign.bind_text(2, &paths.strip(&nodes[m].qualified_name))?;
-            assign.run()?;
+            wanted.insert(paths.strip(&nodes[m].qualified_name).into_owned(), id);
         }
     }
+    crate::leiden::write_assignments(db, &current, &wanted)?;
     // Metadata values are not translated.
     if communities.is_empty() {
         let delete = Stmt::prepare(db, "DELETE FROM metadata WHERE key = ?")?;

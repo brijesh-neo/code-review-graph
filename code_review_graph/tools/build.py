@@ -431,13 +431,16 @@ def _run_postprocess(
         else:
             from code_review_graph.flows import store_flows as _store_flows
             from code_review_graph.flows import trace_flows as _trace_flows
+            from code_review_graph.flows import trace_flows_native
             from code_review_graph.parser import fast_engine_enabled
 
-            if fast_engine_enabled():
-                # Community detection reads the same node rows, in the
-                # same order, so the adjacency is loaded once for both.
-                shared_adjacency = store.load_flow_adjacency()
-            flows = _trace_flows(store, adjacency=shared_adjacency)
+            flows = trace_flows_native(store) if fast_engine_enabled() else None
+            if flows is None:
+                if fast_engine_enabled():
+                    # Community detection reads the same node rows, in the
+                    # same order, so the adjacency is loaded once for both.
+                    shared_adjacency = store.load_flow_adjacency()
+                flows = _trace_flows(store, adjacency=shared_adjacency)
             count = _store_flows(store, flows)
         build_result["flows_detected"] = count
     except (sqlite3.OperationalError, ImportError) as e:
