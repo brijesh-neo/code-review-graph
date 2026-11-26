@@ -11,14 +11,15 @@ from __future__ import annotations
 import json
 import logging
 import re
+import sqlite3
 from collections import deque
 from pathlib import Path
-from typing import Iterable, Optional
+from typing import Any, Callable, Iterable, Optional
 
 from .constants import SECURITY_KEYWORDS as _SECURITY_KEYWORDS
 from .graph import FlowAdjacency, GraphNode, GraphStore, _sanitize_name
+from .parser import fast_engine_enabled, normalize_file_path
 from .parser import is_test_file as _is_test_file
-from .parser import normalize_file_path
 
 logger = logging.getLogger(__name__)
 
@@ -533,31 +534,265 @@ def detect_entry_points(
     # directory of the checkout. See :func:`code_review_graph.parser.is_test_file`.
     repo_root = store.get_repo_root()
 
-    for node in candidate_nodes:
-        if not include_tests and (
-            node.is_test or _is_test_file(node.file_path, repo_root)
-        ):
-            continue
-        if node.extra.get("verilog_kind"):
-            continue
-
-        # True root: no one calls this function.
+    def is_called(node: GraphNode) -> bool:
         called = (
             called_outside_tests
             if node.language in ("ruby", "java")
             else called_qnames
         )
-        is_entry = (
-            node.qualified_name not in called
-            or _has_framework_decorator(node)
-            or _matches_entry_name(node)
-        )
+        return node.qualified_name in called
 
-        if is_entry and node.qualified_name not in seen_qn:
+    for node in candidate_nodes:
+        if (
+            _is_entry_point(node, repo_root, include_tests, is_called)
+            and node.qualified_name not in seen_qn
+        ):
             entry_points.append(node)
             seen_qn.add(node.qualified_name)
 
     return entry_points
+
+
+def _is_entry_point(
+    node: GraphNode,
+    repo_root: Optional[str],
+    include_tests: bool,
+    is_called: Callable[[GraphNode], bool],
+) -> bool:
+    """Whether :func:`detect_entry_points` keeps candidate *node*.
+
+    *is_called* says whether a caller other than a File node (and, for Ruby
+    and Java, other than test code) calls it.
+    """
+    if not include_tests and (
+        node.is_test or _is_test_file(node.file_path, repo_root)
+    ):
+        return False
+    if node.extra.get("verilog_kind"):
+        return False
+    # True root: no one calls this function.
+    return (
+        not is_called(node)
+        or _has_framework_decorator(node)
+        or _matches_entry_name(node)
+    )
+
+
+# The plans SQLite picks for the whole-graph reads of detect_entry_points and
+# load_flow_adjacency, and the order each returns rows in. The changed-files
+# path reads only the rows it needs, in that same order.
+# The same text and parameters get_nodes_by_kind(["Function", "Test"]) runs.
+_CANDIDATE_SQL = "SELECT * FROM nodes WHERE kind IN (?,?)"
+_CANDIDATE_PARAMS = ("Function", "Test")
+_CANDIDATE_ORDERS = {
+    "SEARCH nodes USING INDEX idx_nodes_kind (kind=?)": "kind",
+    "SCAN nodes": "id",
+}
+_CALLS_SQL = (
+    "SELECT kind, source_qualified, target_qualified FROM edges "
+    "WHERE kind IN ('CALLS', 'TESTED_BY')"
+)
+_CALLS_ORDERS = {
+    "SEARCH edges USING COVERING INDEX idx_edges_composite (kind=?)":
+        "target_qualified, file_path, line, id",
+    "SCAN edges": "id",
+}
+
+
+def _plan_order(
+    conn: Any, sql: str, orders: dict[str, str], params: tuple = (),
+) -> Optional[str]:
+    """The row order of *sql* under the plan SQLite picks, if one of *orders*."""
+    try:
+        plan = [row[3] for row in conn.execute(f"EXPLAIN QUERY PLAN {sql}", params)]
+    except sqlite3.Error as exc:
+        logger.debug("Reading the plan of %s failed: %s", sql, exc)
+        return None
+    if len(plan) != 1:
+        return None
+    return orders.get(plan[0])
+
+
+class _LazyNodesByQn(dict):
+    """``FlowAdjacency.nodes_by_qn`` read one node at a time."""
+
+    def __init__(self, store: GraphStore) -> None:
+        super().__init__()
+        self._store = store
+        self._known: dict[Any, Optional[GraphNode]] = {}
+
+    def remember(self, node: GraphNode) -> None:
+        self._known[node.qualified_name] = node
+
+    def get(self, key: Any, default: Any = None) -> Any:
+        if key not in self._known:
+            row = self._store._conn.execute(
+                "SELECT * FROM nodes WHERE qualified_name = ?", (key,),
+            ).fetchone()
+            self._known[key] = None if row is None else self._store._row_to_node(row)
+        node = self._known[key]
+        return default if node is None else node
+
+    def __contains__(self, key: object) -> bool:
+        return self.get(key) is not None
+
+
+class _LazyNodesById(dict):
+    """``FlowAdjacency.nodes_by_id`` read one node at a time."""
+
+    def __init__(self, store: GraphStore, by_qn: _LazyNodesByQn) -> None:
+        super().__init__()
+        self._store = store
+        self._by_qn = by_qn
+        self._known: dict[Any, Optional[GraphNode]] = {}
+
+    def get(self, key: Any, default: Any = None) -> Any:
+        if key not in self._known:
+            row = self._store._conn.execute(
+                "SELECT * FROM nodes WHERE id = ?", (key,),
+            ).fetchone()
+            node = None if row is None else self._store._row_to_node(row)
+            self._known[key] = node
+            if node is not None:
+                self._by_qn.remember(node)
+        node = self._known[key]
+        return default if node is None else node
+
+    def __contains__(self, key: object) -> bool:
+        return self.get(key) is not None
+
+
+class _LazyCallsOut(dict):
+    """``FlowAdjacency.calls_out`` read one caller at a time, in the order the
+    whole-graph read lists each caller's targets."""
+
+    def __init__(self, store: GraphStore, order: str) -> None:
+        super().__init__()
+        self._store = store
+        # One of the fixed orders in _CALLS_ORDERS; no value reaches the SQL text.
+        self._sql = (
+            "SELECT target_qualified FROM edges "  # nosec B608
+            f"WHERE kind = 'CALLS' AND source_qualified = ? ORDER BY {order}"
+        )
+        self._known: dict[Any, list[str]] = {}
+
+    def get(self, key: Any, default: Any = None) -> Any:
+        if key not in self._known:
+            self._known[key] = [
+                row[0] for row in self._store._conn.execute(self._sql, (key,))
+            ]
+        targets = self._known[key]
+        return targets if targets else default
+
+    def __contains__(self, key: object) -> bool:
+        return self.get(key) is not None
+
+
+class _LazyTestedBy(set):
+    """``FlowAdjacency.has_tested_by`` read one name at a time."""
+
+    def __init__(self, store: GraphStore) -> None:
+        super().__init__()
+        self._store = store
+        self._known: dict[object, bool] = {}
+
+    def __contains__(self, key: object) -> bool:
+        if key not in self._known:
+            self._known[key] = self._store._conn.execute(
+                "SELECT 1 FROM edges WHERE kind = 'TESTED_BY' "
+                "AND source_qualified = ? LIMIT 1",
+                (key,),
+            ).fetchone() is not None
+        return self._known[key]
+
+
+def _lazy_flow_adjacency(store: GraphStore) -> Optional[FlowAdjacency]:
+    """A :class:`FlowAdjacency` that reads only what a trace asks for.
+
+    It answers every lookup as :meth:`GraphStore.load_flow_adjacency` would.
+    None when SQLite would read the whole graph in an order this does not
+    reproduce.
+    """
+    order = _plan_order(store._conn, _CALLS_SQL, _CALLS_ORDERS)
+    if order is None:
+        return None
+    by_qn = _LazyNodesByQn(store)
+    return FlowAdjacency(
+        calls_out=_LazyCallsOut(store, order),
+        has_tested_by=_LazyTestedBy(store),
+        nodes_by_qn=by_qn,
+        nodes_by_id=_LazyNodesById(store, by_qn),
+    )
+
+
+def _entry_points_among(
+    store: GraphStore,
+    file_paths: Iterable[str],
+    node_ids: Iterable[int],
+    qualified_names: Iterable[str],
+) -> Optional[list[GraphNode]]:
+    """``detect_entry_points(store)`` narrowed to the given files, ids and names.
+
+    Only the candidates in them are read, and each is checked for a caller on
+    its own. None when SQLite would list candidates in an order this does not
+    reproduce.
+    """
+    order = _plan_order(store._conn, _CANDIDATE_SQL, _CANDIDATE_ORDERS, _CANDIDATE_PARAMS)
+    if order is None:
+        return None
+    conn = store._conn
+    ids: set[int] = set()
+    for column, values in (
+        ("file_path", sorted(set(file_paths))),
+        ("id", sorted(set(node_ids))),
+        ("qualified_name", sorted(set(qualified_names))),
+    ):
+        for i in range(0, len(values), _SQL_BATCH):
+            batch = values[i:i + _SQL_BATCH]
+            placeholders = ",".join("?" * len(batch))
+            # Only a fixed column name and placeholders reach the SQL text.
+            ids.update(
+                row[0] for row in conn.execute(
+                    f"SELECT id FROM nodes WHERE kind IN ('Function', 'Test') "  # nosec B608
+                    f"AND {column} IN ({placeholders})",
+                    batch,
+                )
+            )
+    wanted = sorted(ids)
+    candidates: list[GraphNode] = []
+    for i in range(0, len(wanted), _SQL_BATCH):
+        batch = wanted[i:i + _SQL_BATCH]
+        placeholders = ",".join("?" * len(batch))
+        candidates.extend(
+            store._row_to_node(row) for row in conn.execute(
+                f"SELECT * FROM nodes WHERE id IN ({placeholders})",  # nosec B608
+                batch,
+            )
+        )
+    if order == "kind":
+        candidates.sort(key=lambda node: (node.kind, node.id))
+    else:
+        candidates.sort(key=lambda node: node.id)
+
+    def is_called(node: GraphNode) -> bool:
+        caller_filter = (
+            "(n.kind IS NULL OR (n.kind != 'File' AND n.is_test = 0))"
+            if node.language in ("ruby", "java")
+            else "(n.kind IS NULL OR n.kind != 'File')"
+        )
+        return conn.execute(
+            "SELECT 1 FROM edges e "  # nosec B608
+            "LEFT JOIN nodes n ON n.qualified_name = e.source_qualified "
+            f"WHERE e.kind = 'CALLS' AND e.target_qualified = ? AND {caller_filter} "
+            "LIMIT 1",
+            (node.qualified_name,),
+        ).fetchone() is not None
+
+    repo_root = store.get_repo_root()
+    return [
+        node for node in candidates
+        if _is_entry_point(node, repo_root, False, is_called)
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -927,22 +1162,31 @@ def incremental_trace_flows(
     # ------------------------------------------------------------------
     # 4. Re-detect entry points and filter to relevant ones
     # ------------------------------------------------------------------
-    entry_points = detect_entry_points(store)
-    relevant_eps = [
-        ep for ep in entry_points
-        if (
-            ep.file_path in changed_file_set
-            or ep.id in entry_point_ids
-            or ep.qualified_name in preserved_entry_qns
-        )
-    ]
+    narrowed = (
+        _entry_points_among(store, changed_file_set, entry_point_ids, preserved_entry_qns)
+        if fast_engine_enabled() else None
+    )
+    if narrowed is not None:
+        relevant_eps = narrowed
+    else:
+        entry_points = detect_entry_points(store)
+        relevant_eps = [
+            ep for ep in entry_points
+            if (
+                ep.file_path in changed_file_set
+                or ep.id in entry_point_ids
+                or ep.qualified_name in preserved_entry_qns
+            )
+        ]
 
     # ------------------------------------------------------------------
     # 5. BFS-trace each relevant entry point
     # ------------------------------------------------------------------
     new_flows: list[dict] = []
     if relevant_eps:
-        adj = store.load_flow_adjacency()
+        adj = (_lazy_flow_adjacency(store) if fast_engine_enabled() else None) or (
+            store.load_flow_adjacency()
+        )
         for ep in relevant_eps:
             flow = _trace_single_flow(adj, ep, max_depth)
             if flow is not None:
