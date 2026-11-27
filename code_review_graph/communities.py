@@ -963,20 +963,17 @@ def remap_community_assignments(
         return 0
 
     conn = store._conn
-    updated = 0
     items = list(community_by_qn.items())
     if conn.in_transaction:
         logger.warning("Rolling back uncommitted transaction before BEGIN IMMEDIATE")
         conn.rollback()
     conn.execute("BEGIN IMMEDIATE")
     try:
-        for qn, cid in items:
-            cur = conn.execute(
-                "UPDATE nodes SET community_id = ? WHERE qualified_name = ?",
-                (cid, qn),
-            )
-            if cur.rowcount:
-                updated += cur.rowcount
+        cur = conn.executemany(
+            "UPDATE nodes SET community_id = ? WHERE qualified_name = ?",
+            [(cid, qn) for qn, cid in items],
+        )
+        updated = max(cur.rowcount, 0)
         conn.commit()
     except BaseException:
         conn.rollback()

@@ -21,6 +21,38 @@ def is_fast_node(node) -> bool:
     return type(node).__module__ == "crg_fast"
 
 
+def module_property_return_annotations(
+    parser: CodeParser, root,
+) -> dict[tuple[str, str], str]:
+    """``CodeParser._read_python_property_return_annotations`` on a native tree.
+
+    The declaration scan of the receiver pass finds the same properties: it
+    skips only error-free statement and expression subtrees, which hold no
+    class or function definition.
+    """
+    import crg_fast
+
+    def ignore(_node) -> None:
+        return None
+
+    class_names: set[str] = set()
+    ambiguous: set[str] = set()
+    properties: dict[tuple[str, str], str] = {}
+    crg_fast.python_scan_declarations(
+        root,
+        SimpleNamespace(plain_import=ignore, from_import=ignore),
+        parser._MAX_AST_DEPTH,
+        class_names, ambiguous, properties, {}, set(),
+    )
+    if ambiguous:
+        properties = {
+            key: annotation
+            for key, annotation in properties.items()
+            if key[0] not in ambiguous
+        }
+    return properties
+
+
 def collect_python_receiver_evidence(
     parser: CodeParser, root, file_path: str, source: bytes,
 ) -> tuple[dict[tuple[int, str], tuple[str, str]], list[EdgeInfo]]:

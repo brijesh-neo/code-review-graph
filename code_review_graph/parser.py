@@ -4040,6 +4040,11 @@ class CodeParser:
         self._repo_root = Path(repo_root).resolve() if repo_root is not None else None
         self._dbt_model_paths_cache: dict[Path, tuple[Path, ...]] = {}
         self._parsers: dict[str, object] = {}
+        # Recent Python trees keyed by their source bytes. The importer view,
+        # its readers and the parse itself each need a tree of the same bytes;
+        # trees are never edited, so one parse serves them all.
+        self._python_tree_cache: dict[bytes, object] = {}
+        self._python_tree_lock = threading.Lock()
         self._module_file_cache: dict[str, Optional[str]] = {}
         # Ignore patterns per repository boundary, so a resolver never names
         # a path the build will not index; see :meth:`_path_is_indexed`.
@@ -4129,6 +4134,22 @@ class CodeParser:
             self._parsers[language] = parser
         return self._parsers[language]
 
+    _PYTHON_TREE_CACHE_SIZE = 4
+
+    def _python_tree(self, parser, source: bytes):
+        """Parse *source* as Python with *parser*, reusing a recent tree of the same bytes."""
+        with self._python_tree_lock:
+            tree = self._python_tree_cache.get(source)
+        if tree is not None:
+            return tree
+        tree = parser.parse(source)
+        with self._python_tree_lock:
+            cache = self._python_tree_cache
+            cache[source] = tree
+            while len(cache) > self._PYTHON_TREE_CACHE_SIZE:
+                del cache[next(iter(cache))]
+        return tree
+
     def clear_caches(
         self, include_parsers: bool = False, release_memory: bool = True
     ) -> None:
@@ -4145,6 +4166,8 @@ class CodeParser:
         self._dart_pubspec_cache.clear()
         self._rust_project_cache.clear()
         self._tsconfig_resolver = TsconfigResolver()
+        with self._python_tree_lock:
+            self._python_tree_cache.clear()
         if include_parsers:
             self._parsers.clear()
         with _PYTHON_STAR_EXPORT_CACHE_LOCK:
@@ -4448,7 +4471,10 @@ class CodeParser:
             return [], []
 
         if tree is None:
-            tree = parser.parse(parse_source)
+            if language == "python":
+                tree = self._python_tree(parser, parse_source)
+            else:
+                tree = parser.parse(parse_source)
         nodes: list[NodeInfo] = []
         edges: list[EdgeInfo] = []
         file_path_str = normalize_file_path(path)
@@ -10047,7 +10073,7 @@ class CodeParser:
         if not parser:
             return None
         try:
-            tree = parser.parse(source)  # type: ignore[union-attr]
+            tree = self._python_tree(parser, source)  # type: ignore[union-attr]
         except (RecursionError, ValueError):  # pragma: no cover
             return None
 
@@ -10111,10 +10137,12 @@ class CodeParser:
         if not parser:
             return {}
         try:
-            tree = parser.parse(source)  # type: ignore[union-attr]
+            tree = self._python_tree(parser, source)  # type: ignore[union-attr]
         except (RecursionError, ValueError) as exc:  # pragma: no cover
             logger.debug("Property-annotation parse failed for %s: %s", module_path, exc)
             return {}
+        if fast_parser.is_fast_node(tree.root_node):
+            return fast_parser.module_property_return_annotations(self, tree.root_node)
 
         properties: dict[tuple[str, str], str] = {}
         class_names: set[str] = set()
@@ -10682,7 +10710,7 @@ class CodeParser:
         if not parser:
             return {}
         try:
-            tree = parser.parse(source)  # type: ignore[union-attr]
+            tree = self._python_tree(parser, source)  # type: ignore[union-attr]
         except (RecursionError, ValueError) as exc:  # pragma: no cover
             logger.debug("Return-annotation parse failed for %s: %s", module_path, exc)
             return {}
@@ -20533,7 +20561,7 @@ class CodeParser:
             parser = self._get_parser("python")
             if not parser:
                 return {}
-            tree = parser.parse(source)  # type: ignore[union-attr]
+            tree = self._python_tree(parser, source)  # type: ignore[union-attr]
             import_map, defined_names = self._collect_file_scope(
                 tree.root_node, "python", source, resolved_module,
             )
