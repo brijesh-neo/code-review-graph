@@ -3914,33 +3914,49 @@ class GraphStore:
         """
         # The inherited walk first: it needs the name the parser wrote, and it
         # takes up edges an earlier pass settled.
-        self._resolve_inherited_endpoints()
-        self._settle_unbound_endpoints()
-        self._begin_immediate()
         try:
-            changed = self._native_certainty_refresh() if self._native_sql else -1
-            if changed < 0:
-                changed = self._certainty_refresh_sql()
-            self._conn.commit()
-        except BaseException:
-            self._conn.rollback()
-            raise
+            self._resolve_inherited_endpoints()
+            self._settle_unbound_endpoints()
+            # Read before the refresh's own writes; triggers off before them.
+            scope_floor = getattr(self, "_certainty_scope_floor", None)
+            if scope_floor is not None:
+                self._drop_certainty_triggers()
+            self._begin_immediate()
+            try:
+                changed = (
+                    self._native_certainty_refresh(scope_floor) if self._native_sql else -1
+                )
+                if changed < 0:
+                    changed = self._certainty_refresh_sql()
+                self._conn.commit()
+            except BaseException:
+                self._conn.rollback()
+                raise
+        finally:
+            if getattr(self, "_certainty_scope_floor", None) is not None:
+                self._end_certainty_scope()
         self._settle_collision_endpoints()
         return changed
 
-    def _native_certainty_refresh(self) -> int:
+    def _native_certainty_refresh(self, scope_floor: Optional[int] = None) -> int:
         """The four UPDATEs of ``_certainty_refresh_sql`` in one native pass.
 
         Same rows, same values, and the same count back. -1 when a row holds
         a value the native pass does not read the way SQLite does; it has then
-        written nothing.
+        written nothing. With *scope_floor* it reads only the rows the
+        certainty capture says can change (see ``_begin_certainty_scope``);
+        every other row is already at the answer.
         """
         import crg_fast
 
-        token = crg_fast.stage_certainty_refresh(
+        args: tuple = (
             list(_RESOLVER_BOUND_KEYS),
             (_SCORE_UNRESOLVED, _SCORE_AMBIGUOUS, _SCORE_INFERRED, _SCORE_EXTRACTED),
         )
+        if scope_floor is None:
+            token = crg_fast.stage_certainty_refresh(*args)
+        else:
+            token = crg_fast.stage_certainty_refresh(*args, scope_floor=scope_floor)
         try:
             row = self._conn.execute("SELECT crg_run(?)", (token,)).fetchone()
         except BaseException:
@@ -4577,7 +4593,71 @@ class GraphStore:
             self.end_change_capture()
             return False
         self._change_capture_active = True
+        self._begin_certainty_scope(floor)
         return True
+
+    # -- Change capture for a scoped certainty refresh -----------------------
+
+    _CERTAINTY_TRIGGERS = (
+        "crg_cert_edge_upd", "crg_cert_node_ins", "crg_cert_node_del", "crg_cert_node_upd",
+    )
+
+    def _begin_certainty_scope(self, floor: int) -> None:
+        """Record what the certainty refresh reads, from now until it runs.
+
+        The refresh is a function of each row and of whether its endpoint
+        names a node, and the graph is at its fixed point when the capture
+        starts. So only rows inserted since (ids above *floor*), rows updated
+        since, and rows whose endpoint is a name a node gained or lost can
+        come out different. Unlike the bare capture this one stays on through
+        every resolver, up to the refresh, which drops it.
+        """
+        conn = self._conn
+        node_ins = "INSERT OR IGNORE INTO temp.crg_cert_qn VALUES"
+        statements = [
+            "CREATE TEMP TABLE IF NOT EXISTS crg_cert_edge (id INTEGER PRIMARY KEY)",
+            "CREATE TEMP TABLE IF NOT EXISTS crg_cert_qn (qn TEXT PRIMARY KEY)",
+            "DELETE FROM temp.crg_cert_edge",
+            "DELETE FROM temp.crg_cert_qn",
+            "CREATE TEMP TRIGGER IF NOT EXISTS crg_cert_edge_upd AFTER UPDATE OF "
+            "kind, source_qualified, target_qualified, extra, confidence_tier, "
+            f"target_resolution, confidence ON main.edges WHEN OLD.id <= {floor} "
+            "BEGIN INSERT OR IGNORE INTO temp.crg_cert_edge VALUES (OLD.id); END",
+            "CREATE TEMP TRIGGER IF NOT EXISTS crg_cert_node_ins AFTER INSERT ON main.nodes "
+            f"BEGIN {node_ins} (NEW.qualified_name); END",
+            "CREATE TEMP TRIGGER IF NOT EXISTS crg_cert_node_del AFTER DELETE ON main.nodes "
+            f"BEGIN {node_ins} (OLD.qualified_name); END",
+            "CREATE TEMP TRIGGER IF NOT EXISTS crg_cert_node_upd AFTER UPDATE OF "
+            "qualified_name ON main.nodes "
+            f"BEGIN {node_ins} (OLD.qualified_name); {node_ins} (NEW.qualified_name); END",
+        ]
+        try:
+            for statement in statements:
+                conn.execute(statement)
+        except sqlite3.Error as exc:
+            logger.debug("Certainty capture unavailable: %s", exc)
+            self._end_certainty_scope()
+            return
+        self._certainty_scope_floor: Optional[int] = floor
+
+    def _drop_certainty_triggers(self) -> None:
+        for trigger in self._CERTAINTY_TRIGGERS:
+            try:
+                self._conn.execute(f"DROP TRIGGER IF EXISTS temp.{trigger}")
+            except sqlite3.Error as exc:  # pragma: no cover - defensive
+                logger.debug("Could not drop %s: %s", trigger, exc)
+
+    def _end_certainty_scope(self) -> None:
+        """Drop the certainty capture; the next refresh reads every row."""
+        self._certainty_scope_floor = None
+        conn = self._conn
+        try:
+            for trigger in self._CERTAINTY_TRIGGERS:
+                conn.execute(f"DROP TRIGGER IF EXISTS temp.{trigger}")
+            for table in ("crg_cert_edge", "crg_cert_qn"):
+                conn.execute(f"DROP TABLE IF EXISTS temp.{table}")
+        except sqlite3.Error as exc:  # pragma: no cover - defensive
+            logger.debug("Could not drop the certainty capture: %s", exc)
 
     def end_change_capture(self) -> bool:
         """Stop recording; prepare the dirty sets when a scoped pass is safe.
@@ -4599,7 +4679,7 @@ class GraphStore:
             logger.debug("Change capture could not be read: %s", exc)
             scoped = False
         if not scoped:
-            self.drop_change_scope()
+            self.drop_bare_scope()
         return scoped
 
     def _prepare_change_scope(self, conn: sqlite3.Connection) -> bool:
@@ -4684,7 +4764,15 @@ class GraphStore:
         return True
 
     def drop_change_scope(self) -> None:
-        """Forget the dirty sets of the last capture."""
+        """Forget the last capture: its dirty sets and the certainty scope."""
+        self.drop_bare_scope()
+        self._end_certainty_scope()
+
+    def drop_bare_scope(self) -> None:
+        """Forget the dirty sets of the last capture, which only the bare passes read.
+
+        The certainty scope stays: the refresh after the bare passes reads it.
+        """
         for table in ("crg_dirty_name", "crg_dirty_qn", "crg_dirty_edge", "crg_dirty_file"):
             try:
                 self._conn.execute(f"DROP TABLE IF EXISTS temp.{table}")
@@ -4942,7 +5030,9 @@ class GraphStore:
             return 0
 
         if self._native_sql:
-            native = self._native_bare_resolve(kind, endpoint)
+            native = self._native_bare_resolve(
+                kind, endpoint, self._scope_edge_floor if scoped else None,
+            )
             if native >= 0:
                 if native:
                     logger.info(
@@ -5223,14 +5313,20 @@ class GraphStore:
             )
         return resolved
 
-    def _native_bare_resolve(self, kind: str, endpoint: str) -> int:
-        """``_resolve_bare_endpoints`` as one native pass over every bare edge.
+    def _native_bare_resolve(
+        self, kind: str, endpoint: str, scope_floor: Optional[int] = None,
+    ) -> int:
+        """``_resolve_bare_endpoints`` as one native pass over the bare edges.
 
         Same reads, same decisions and the same writes; the resolved count
-        back, or -1. It always reads every bare edge: the scoped read reaches
-        the same answer, and the native pass is cheaper than the scoping.
+        back, or -1. With *scope_floor* (the change capture's edge id floor)
+        it reads only the edges the scoped Python read reads.
         """
-        return self._native_resolver_job("stage_bare_resolve", kind, endpoint)
+        if scope_floor is None:
+            return self._native_resolver_job("stage_bare_resolve", kind, endpoint)
+        return self._native_resolver_job(
+            "stage_bare_resolve", kind, endpoint, scope_floor=scope_floor,
+        )
 
     def _codec_fields(self) -> Optional[tuple]:
         """The path codec's settings as native passes take them, or None."""
@@ -5246,7 +5342,9 @@ class GraphStore:
             sorted(codec._leads),
         )
 
-    def _native_resolver_job(self, stage_name: str, *args: object) -> int:
+    def _native_resolver_job(
+        self, stage_name: str, *args: object, **kwargs: object,
+    ) -> int:
         """Run one native resolver pass from ``crg_fast`` in one transaction.
 
         The pass reads values as the codec's row factory restores them and
@@ -5262,7 +5360,7 @@ class GraphStore:
         fields = self._codec_fields()
         self._begin_immediate()
         try:
-            token = stage_job(*args, fields)
+            token = stage_job(*args, fields, **kwargs)
             try:
                 row = self._conn.execute("SELECT crg_run(?)", (token,)).fetchone()
             except BaseException:

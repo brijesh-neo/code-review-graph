@@ -310,7 +310,7 @@ def _run_postprocess(
                     resolved = store.resolve_bare_call_targets(scoped=scoped)
                     resolved += store.resolve_bare_tested_by_sources(scoped=scoped)
                 finally:
-                    store.drop_change_scope()
+                    store.drop_bare_scope()
                 build_result["bare_edges_resolved"] = resolved
                 build_result["cpp_scoped_edges_resolved"] = (
                     store.resolve_cpp_scoped_call_targets()
@@ -334,8 +334,7 @@ def _run_postprocess(
             warnings.append(
                 f"Target-resolution refresh failed: {type(e).__name__}: {e}"
             )
-    if scoped:
-        store.drop_change_scope()
+    store.drop_change_scope()
 
     # -- Signatures + FTS (fast, always run unless "none") --
     timing: dict[str, float] = {}
@@ -676,6 +675,9 @@ def build_or_update_graph(
                 )
                 refresh_owed = bool(result.pop("target_refresh_owed", False))
             except RuntimeError as exc:
+                # Nothing was written: stop the capture this update started.
+                store.end_change_capture()
+                store.drop_change_scope()
                 # Change discovery or root validation failed before anything was
                 # stored; report it the way every other failure is reported.
                 # Nothing was written, so the previous completeness verdict

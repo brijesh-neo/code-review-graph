@@ -1068,8 +1068,9 @@ fn plan_pass(
     inheritance: &Inheritance,
     kind: &str,
     target_endpoint: bool,
+    scope_floor: Option<i64>,
 ) -> R<Plan> {
-    let (raw_key, sql, endpoint_index, caller_index): (&str, &str, c_int, c_int) =
+    let (raw_key, base_sql, endpoint_index, caller_index): (&str, &str, c_int, c_int) =
         if target_endpoint {
             (
                 "bare_call_target",
@@ -1089,8 +1090,31 @@ fn plan_pass(
                 2,
             )
         };
-    let rows = Rows::new(db, sql, paths)?;
+    // `_resolve_bare_endpoints(scoped=True)`: only the edges the last change
+    // capture can have moved; the rest are already at the answer.
+    let mut sql = base_sql.to_string();
+    if scope_floor.is_some() {
+        let (endpoint_column, caller_column) = if target_endpoint {
+            ("target_qualified", "source_qualified")
+        } else {
+            ("source_qualified", "target_qualified")
+        };
+        sql.push_str(&format!(
+            " AND (id > ? \
+             OR id IN (SELECT id FROM temp.crg_dirty_edge) \
+             OR file_path IN (SELECT path FROM temp.crg_dirty_file) \
+             OR {endpoint_column} IN (SELECT name FROM temp.crg_dirty_name) \
+             OR {caller_column} IN (SELECT qn FROM temp.crg_dirty_qn) \
+             OR (extra LIKE '%\"{raw_key}\"%' AND CASE WHEN json_valid(extra) \
+             THEN json_extract(extra, '$.{raw_key}') END \
+             IN (SELECT name FROM temp.crg_dirty_name)))"
+        ));
+    }
+    let rows = Rows::new(db, &sql, paths)?;
     rows.bind_text(1, kind)?;
+    if let Some(floor) = scope_floor {
+        rows.bind_int(2, floor)?;
+    }
     let empty_set: HashSet<String> = HashSet::default();
     let mut updates = Vec::new();
     let mut resolved = 0i64;
@@ -1329,7 +1353,13 @@ where
 /// Stages `_resolve_bare_endpoints(kind, endpoint)`. The job returns the
 /// resolved count, or -1 having written nothing.
 #[pyfunction]
-pub fn stage_bare_resolve(kind: String, endpoint: String, codec: CodecFields) -> PyResult<i64> {
+#[pyo3(signature = (kind, endpoint, codec, scope_floor=None))]
+pub fn stage_bare_resolve(
+    kind: String,
+    endpoint: String,
+    codec: CodecFields,
+    scope_floor: Option<i64>,
+) -> PyResult<i64> {
     let target_endpoint = match endpoint.as_str() {
         "target_qualified" => true,
         "source_qualified" => false,
@@ -1343,7 +1373,9 @@ pub fn stage_bare_resolve(kind: String, endpoint: String, codec: CodecFields) ->
                 db, &paths, &context.import_targets, &context.raw_imports,
             )?;
             let (updates, resolved) =
-                plan_pass(db, &paths, &context, &inheritance, &kind, target_endpoint)?;
+                plan_pass(
+                    db, &paths, &context, &inheritance, &kind, target_endpoint, scope_floor,
+                )?;
             write_pass(db, &paths, target_endpoint, &updates)?;
             Ok(resolved)
         })

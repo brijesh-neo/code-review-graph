@@ -179,6 +179,9 @@ def test_scoped_pass_stores_what_the_full_pass_stores(
         assert store.resolve_bare_call_targets() == 0
         before = _dump(scoped)
         store.resolve_bare_tested_by_sources()
+        # Nor does a full certainty refresh: the scoped one reached every row
+        # the update could move.
+        store.refresh_target_resolution()
     finally:
         store.close()
     assert _dump(scoped) == before
@@ -255,6 +258,31 @@ def test_a_row_that_leaves_and_returns_unchanged_cancels_out(tmp_path: Path) -> 
         assert conn.execute(
             "SELECT COUNT(*) FROM sqlite_temp_master WHERE name LIKE 'crg_%'"
         ).fetchone()[0] == 0
+    finally:
+        store.close()
+
+
+def test_the_certainty_scope_outlives_the_bare_scope_until_the_refresh(
+    tmp_path: Path,
+) -> None:
+    store = _store(tmp_path)
+    try:
+        conn = store._conn
+
+        def temp_names() -> set[str]:
+            return {
+                row[0] for row in conn.execute(
+                    "SELECT name FROM sqlite_temp_master WHERE name LIKE 'crg_cert_%'"
+                )
+            }
+
+        assert store.begin_change_capture()
+        assert store.end_change_capture() in (True, False)
+        store.drop_bare_scope()
+        assert "crg_cert_edge" in temp_names()
+        store.refresh_target_resolution()
+        assert temp_names() == set()
+        assert store._certainty_scope_floor is None
     finally:
         store.close()
 

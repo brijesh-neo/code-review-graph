@@ -4044,6 +4044,7 @@ class CodeParser:
         # its readers and the parse itself each need a tree of the same bytes;
         # trees are never edited, so one parse serves them all.
         self._python_tree_cache: dict[bytes, object] = {}
+        self._python_tree_bytes = 0
         self._python_tree_lock = threading.Lock()
         self._module_file_cache: dict[str, Optional[str]] = {}
         # Ignore patterns per repository boundary, so a resolver never names
@@ -4134,20 +4135,34 @@ class CodeParser:
             self._parsers[language] = parser
         return self._parsers[language]
 
-    _PYTHON_TREE_CACHE_SIZE = 4
+    # Recent Python trees, least recently used first. An update reads one
+    # imported module several times (star exports, then annotations) with
+    # small modules read in between, so the bound is on source bytes: about
+    # 25 bytes of tree per byte of source, so 2 MB of source is ~50 MB.
+    _PYTHON_TREE_CACHE_SIZE = 16
+    _PYTHON_TREE_CACHE_BYTES = 2_000_000
 
     def _python_tree(self, parser, source: bytes):
         """Parse *source* as Python with *parser*, reusing a recent tree of the same bytes."""
         with self._python_tree_lock:
-            tree = self._python_tree_cache.get(source)
-        if tree is not None:
-            return tree
+            cache = self._python_tree_cache
+            tree = cache.pop(source, None)
+            if tree is not None:
+                cache[source] = tree
+                return tree
         tree = parser.parse(source)
         with self._python_tree_lock:
             cache = self._python_tree_cache
-            cache[source] = tree
-            while len(cache) > self._PYTHON_TREE_CACHE_SIZE:
-                del cache[next(iter(cache))]
+            if source not in cache:
+                cache[source] = tree
+                self._python_tree_bytes += len(source)
+            while len(cache) > 1 and (
+                len(cache) > self._PYTHON_TREE_CACHE_SIZE
+                or self._python_tree_bytes > self._PYTHON_TREE_CACHE_BYTES
+            ):
+                oldest = next(iter(cache))
+                del cache[oldest]
+                self._python_tree_bytes -= len(oldest)
         return tree
 
     def clear_caches(
@@ -4168,6 +4183,7 @@ class CodeParser:
         self._tsconfig_resolver = TsconfigResolver()
         with self._python_tree_lock:
             self._python_tree_cache.clear()
+            self._python_tree_bytes = 0
         if include_parsers:
             self._parsers.clear()
         with _PYTHON_STAR_EXPORT_CACHE_LOCK:
