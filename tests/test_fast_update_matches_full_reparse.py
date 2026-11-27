@@ -492,6 +492,68 @@ def test_a_summary_another_code_version_wrote_is_not_read(
     assert selected is None
 
 
+def _first_update_after_a_build(
+    repo: Path, data: Path, monkeypatch: pytest.MonkeyPatch, fast_build: bool,
+) -> tuple[Path, list[str], list[object]]:
+    """Build *repo*, rename a symbol, update under the flag; the stored bytes read."""
+    reads: list[str] = []
+    selections: list[object] = []
+    read_original = incremental._committed_bytes
+    select_original = incremental._importers_to_reparse
+
+    def read_spy(*args, **kwargs):
+        reads.append(args[1])
+        return read_original(*args, **kwargs)
+
+    def select_spy(*args, **kwargs):
+        selected = select_original(*args, **kwargs)
+        selections.append(selected)
+        return selected
+
+    monkeypatch.setattr(incremental, "_committed_bytes", read_spy)
+    monkeypatch.setattr(incremental, "_importers_to_reparse", select_spy)
+    monkeypatch.setenv("CRG_DATA_DIR", str(data))
+    if fast_build:
+        monkeypatch.setenv("CRG_FAST_ENGINE", "1")
+    else:
+        monkeypatch.delenv("CRG_FAST_ENGINE", raising=False)
+    assert build_or_update_graph(full_rebuild=True, repo_root=str(repo))["status"] == "ok"
+    _rename_symbol(repo)
+    monkeypatch.setenv("CRG_FAST_ENGINE", "1")
+    assert build_or_update_graph(repo_root=str(repo))["status"] == "ok"
+    monkeypatch.delenv("CRG_FAST_ENGINE", raising=False)
+    return data / "graph.db", reads, selections
+
+
+@pytest.mark.parametrize("padding", [0, 4], ids=["serial-build", "parallel-build"])
+def test_a_flag_on_build_saves_the_summaries_the_first_update_reads(
+    padding: int, base_repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Eight files or more take the build's parallel parse.
+    for index in range(padding):
+        (base_repo / f"pad{index}.py").write_text(f"def pad{index}():\n    return {index}\n")
+    if padding:
+        _git(base_repo, "add", "-A")
+        _git(base_repo, "commit", "-qm", "pad")
+    without, read_without, _ = _first_update_after_a_build(
+        shutil.copytree(base_repo, tmp_path / "off"), tmp_path / "off-data",
+        monkeypatch, fast_build=False,
+    )
+    with_summaries, read_with, selections = _first_update_after_a_build(
+        shutil.copytree(base_repo, tmp_path / "on"), tmp_path / "on-data",
+        monkeypatch, fast_build=True,
+    )
+    copies = tmp_path / "on-data" / "source-copies"
+    py_files = sum(1 for path in (tmp_path / "on").glob("*.py"))
+    # One summary per Python file the graph holds, renamed lib.py's new one included.
+    assert len(list(copies.glob("*.summary"))) == py_files
+    # A build without the flag saves none, so its first update reads lib.py's bytes.
+    assert read_without == ["lib.py"]
+    assert read_with == []
+    assert isinstance(selections[-1], set)
+    assert _dump(with_summaries) == _dump(without)
+
+
 def test_canonical_json_tells_apart_values_python_tells_apart() -> None:
     values = [
         None, "1", 1, 1.0, True, (1,), [1], {1}, {"1": 1}, {1: 1}, ("a", ("b",)),

@@ -3036,15 +3036,21 @@ def find_dependents(
 
 
 def _parse_single_file(
-    args: tuple[str, str],
+    args: tuple[str, ...],
 ) -> tuple[str, list, list, str | None, str]:
     """Parse one file in a process- or thread-pool worker.
+
+    *args* is ``(rel_path, repo_root)``, optionally followed by the directory
+    and fingerprint a build saves comparison summaries under (see
+    :func:`_save_build_summary`).
 
     Returns ``(rel_path, nodes, edges, error_or_none, file_hash)``.
     Must be a module-level function so ``ProcessPoolExecutor`` can
     serialise it across processes.
     """
-    rel_path, repo_root_str = args
+    rel_path, repo_root_str = args[0], args[1]
+    summary_dir = args[2] if len(args) > 2 else None
+    fingerprint = args[3] if len(args) > 3 else None
     abs_path = Path(repo_root_str) / rel_path
     try:
         raw = abs_path.read_bytes()
@@ -3056,14 +3062,40 @@ def _parse_single_file(
             _PARSE_WORKER_STATE.parser = parser
             _PARSE_WORKER_STATE.repo_root = repo_root_str
         nodes, edges = parser.parse_bytes(abs_path, raw)
+        if summary_dir is not None:
+            _save_build_summary(
+                parser, abs_path, raw, fhash, Path(summary_dir), fingerprint, nodes, edges,
+            )
         return (rel_path, nodes, edges, None, fhash)
     except Exception as e:
         return (rel_path, [], [], str(e), "")
 
 
+def _save_build_summary(
+    parser: Any, abs_path: Path, source: bytes, file_hash: str,
+    copy_dir: Path, fingerprint: str | None, nodes: list, edges: list,
+) -> None:
+    """Save the comparison summary of a Python file a build just parsed.
+
+    It is what :func:`_changed_symbol_names` computes for these bytes, so the
+    first update of the file after the build reads it instead of parsing the
+    stored bytes again. Only the summary is lost on failure.
+    """
+    if not abs_path.name.endswith(".py") or fingerprint is None or abs_path.is_symlink():
+        return
+    try:
+        view = parser.python_importer_view(abs_path, source)
+        own = normalize_file_path(abs_path.resolve())
+        summary = json.loads(json.dumps(_comparison_summary(view, nodes, edges, own)))
+    except Exception as exc:  # noqa: BLE001 - the update parses the bytes instead
+        logger.debug("No build summary for %s: %s", abs_path, exc)
+        return
+    _write_summary(copy_dir, file_hash, fingerprint, summary)
+
+
 
 def _parse_chunk_sharing_caches(
-    args_chunk: list[tuple[str, str]],
+    args_chunk: list[tuple[str, ...]],
     seed: list,
 ) -> tuple[list, int, list]:
     """Parse *args_chunk* in a process worker that shares its module caches.
@@ -3084,25 +3116,25 @@ def _parse_chunk_sharing_caches(
 
 
 def _shared_parse_chunks(
-    args_list: list[tuple[str, str]],
+    args_list: list[tuple[str, ...]],
     chunksize: int,
     workers: int,
-) -> tuple[list[list[tuple[str, str]]], list[int]]:
+) -> tuple[list[list[tuple[str, ...]]], list[int]]:
     """Split *args_list* into ordered chunks; a very large file gets its own.
 
     Returns the chunks and the indexes of the single-file chunks whose file
     holds more than a ``workers * 4``-th of all the bytes.
     """
     sizes = []
-    for rel_path, repo_root_str in args_list:
+    for args in args_list:
         try:
-            sizes.append((Path(repo_root_str) / rel_path).stat().st_size)
+            sizes.append((Path(args[1]) / args[0]).stat().st_size)
         except OSError:
             sizes.append(0)
     limit = max(1, sum(sizes) // (workers * 4))
-    chunks: list[list[tuple[str, str]]] = []
+    chunks: list[list[tuple[str, ...]]] = []
     heavy: list[int] = []
-    current: list[tuple[str, str]] = []
+    current: list[tuple[str, ...]] = []
     for args, size in zip(args_list, sizes):
         if size > limit:
             if current:
@@ -3122,7 +3154,7 @@ def _shared_parse_chunks(
 
 def _parse_sharing_caches(
     executor: concurrent.futures.Executor,
-    args_list: list[tuple[str, str]],
+    args_list: list[tuple[str, ...]],
     chunksize: int,
     workers: int,
 ) -> Iterator[tuple[str, list, list, str | None, str]]:
@@ -3205,7 +3237,7 @@ def _parse_sharing_caches(
 
 def _parse_results(
     executor: concurrent.futures.Executor,
-    args_list: list[tuple[str, str]],
+    args_list: list[tuple[str, ...]],
     chunksize: int,
 ) -> Iterator[tuple[str, list, list, str | None, str]]:
     """Parse *args_list* on *executor*, sharing module caches under the fast engine."""
@@ -3300,6 +3332,16 @@ def full_build(
     # indexes dropped and rebuilds them once at the end.
     from .parser import fast_engine_enabled
 
+    # Under the native engine the build saves the comparison summary of each
+    # Python file it parses, so the first update of that file reads it instead
+    # of parsing the stored bytes again.
+    summary_args: tuple[str, ...] = ()
+    copy_dir = _source_copy_dir(store, repo_root) if fast_engine_enabled() else None
+    if copy_dir is not None:
+        fingerprint = _summary_fingerprint(repo_root)
+        if fingerprint is not None:
+            summary_args = (str(copy_dir), fingerprint)
+
     with store.bulk_edge_load() if fast_engine_enabled() else nullcontext():
         if use_serial or file_count < 8:
             # Serial fallback (for debugging or tiny repos)
@@ -3310,6 +3352,11 @@ def full_build(
                     source = full_path.read_bytes()
                     fhash = hashlib.sha256(source).hexdigest()
                     nodes, edges = parser.parse_bytes(full_path, source)
+                    if summary_args:
+                        _save_build_summary(
+                            parser, full_path, source, fhash, Path(summary_args[0]),
+                            summary_args[1], nodes, edges,
+                        )
                     _relink_edges(edges, repo_root, followed_dirs)
                     parsed = (nodes, edges, fhash)
                 except (OSError, PermissionError) as e:
@@ -3344,7 +3391,7 @@ def full_build(
             # orphan workers (issues #46, #136, PR #615). Override via
             # CRG_PARSE_EXECUTOR env.
             _prewarm_parser_probes(parser, files)
-            args_list = [(rel_path, str(repo_root)) for rel_path in files]
+            args_list = [(rel_path, str(repo_root), *summary_args) for rel_path in files]
             with _make_executor(_MAX_PARSE_WORKERS) as executor:
                 for i, (rel_path, nodes, edges, error, fhash) in enumerate(
                     _parse_results(executor, args_list, 4),
@@ -4770,7 +4817,7 @@ def incremental_update(
         else:
             # See full-build comment above for executor kind rationale.
             _prewarm_parser_probes(parser, to_parse)
-            args_list = [(rel_path, str(repo_root)) for rel_path in to_parse]
+            args_list: list[tuple[str, ...]] = [(rel_path, str(repo_root)) for rel_path in to_parse]
             with _make_executor(_MAX_PARSE_WORKERS) as executor:
                 for rel_path, nodes, edges, error, fhash in _parse_results(
                     executor, args_list, 20,
