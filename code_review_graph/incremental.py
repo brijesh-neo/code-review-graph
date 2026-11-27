@@ -22,7 +22,7 @@ import unicodedata
 import uuid
 from collections import deque
 from contextlib import nullcontext
-from functools import partial, wraps
+from functools import lru_cache, partial, wraps
 from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING, Any, Callable, Iterable, Iterator, NamedTuple, Optional
 
@@ -873,22 +873,41 @@ def _load_ignore_patterns(repo_root: Path) -> list[str]:
     return patterns
 
 
-def _should_ignore(path: str, patterns: list[str]) -> bool:
-    """Check if a path matches any ignore pattern.
+def _relative_posix(path: Path, root: Path) -> str:
+    """``path.relative_to(root).as_posix()``, raising ``ValueError`` alike.
 
-    ``**/<dir>/**`` and unanchored single-directory patterns match at any
-    depth. A leading slash anchors a pattern to the repository root.
+    ``str`` of a path is already normalised, so on POSIX a path below *root*
+    is spelled as *root*, a slash and the rest; anything else is left to
+    pathlib.
     """
-    normalized = path.replace("\\", "/").lstrip("/")
-    parts = PurePosixPath(normalized).parts
+    if os.name == "posix":
+        text, base = str(path), str(root)
+        if base != "/" and text.startswith(base) and text[len(base):len(base) + 1] == "/":
+            return text[len(base) + 1:]
+    return path.relative_to(root).as_posix()
+
+
+class _IgnoreMatcher(NamedTuple):
+    segments: frozenset[str]
+    prefixes: tuple[tuple[str, ...], ...]
+    globs: tuple[str, ...]
+    glob_match: Callable[[str], Any] | None
+
+
+@lru_cache(maxsize=64)
+def _ignore_matcher(patterns: tuple[str, ...]) -> _IgnoreMatcher:
+    """*patterns* sorted by kind once, for :func:`_should_ignore`."""
+    segments: set[str] = set()
+    prefixes: list[tuple[str, ...]] = []
+    globs: list[str] = []
     for pattern in patterns:
         anchored = pattern.startswith("/")
         candidate = pattern[1:] if anchored else pattern
 
         if candidate.startswith("**/") and candidate.endswith("/**"):
             segment = candidate[3:-3]
-            if segment and segment in parts:
-                return True
+            if segment:
+                segments.add(segment)
             continue
 
         if candidate.endswith("/**"):
@@ -896,15 +915,43 @@ def _should_ignore(path: str, patterns: list[str]) -> bool:
             if not prefix:
                 continue
             if anchored or len(prefix) > 1:
-                if parts[: len(prefix)] == prefix:
-                    return True
-            elif prefix[0] in parts:
-                return True
+                prefixes.append(prefix)
+            else:
+                segments.add(prefix[0])
             continue
 
-        if fnmatch.fnmatch(normalized, candidate):
+        globs.append(candidate)
+    # ``fnmatch`` matches each translated pattern whole; on POSIX it does not
+    # change the case or the separators, so one alternation answers for all.
+    glob_match = None
+    if globs and os.name == "posix":
+        glob_match = re.compile(
+            "|".join(f"(?:{fnmatch.translate(glob)})" for glob in globs)
+        ).match
+    return _IgnoreMatcher(frozenset(segments), tuple(prefixes), tuple(globs), glob_match)
+
+
+def _should_ignore(path: str, patterns: list[str]) -> bool:
+    """Check if a path matches any ignore pattern.
+
+    ``**/<dir>/**`` and unanchored single-directory patterns match at any
+    depth. A leading slash anchors a pattern to the repository root.
+    """
+    matcher = _ignore_matcher(tuple(patterns))
+    normalized = path.replace("\\", "/").lstrip("/")
+    split = normalized.split("/")
+    parts = (
+        tuple(split) if "" not in split and "." not in split
+        else PurePosixPath(normalized).parts
+    )
+    if matcher.segments and not matcher.segments.isdisjoint(parts):
+        return True
+    for prefix in matcher.prefixes:
+        if parts[: len(prefix)] == prefix:
             return True
-    return False
+    if matcher.glob_match is not None:
+        return matcher.glob_match(normalized) is not None
+    return any(fnmatch.fnmatch(normalized, glob) for glob in matcher.globs)
 
 
 def _child_directories(directory: Path) -> list[tuple[str, bool]]:
@@ -1488,7 +1535,7 @@ def _find_content_mismatches(
         if not path.is_absolute():
             path = repo_root / path
         try:
-            relative_path = path.relative_to(repo_root).as_posix()
+            relative_path = _relative_posix(path, repo_root)
             raw = path.read_bytes()
             current_hash = hashlib.sha256(raw).hexdigest()
             current_hashes[relative_path] = current_hash
@@ -2735,7 +2782,10 @@ def _reconcile_stale_files(
         for stored_file in stored_files:
             path = Path(stored_file)
             try:
-                relative = str(path.relative_to(repo_root))
+                relative = (
+                    _relative_posix(path, repo_root) if os.name == "posix"
+                    else str(path.relative_to(repo_root))
+                )
             except ValueError:
                 continue
             parent = os.path.dirname(relative)
