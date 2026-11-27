@@ -1100,25 +1100,42 @@ def store_communities(
     # sequence is atomic — no partial community data on crash.
     conn.execute("BEGIN IMMEDIATE")
     try:
-        conn.execute("DELETE FROM communities")
+        # The ids the table holds are reused in ascending order before new
+        # ones are taken, so detecting the same communities again leaves each
+        # one, and every node's ``community_id``, where it was. The native
+        # engine writes the table the same way.
+        reusable = [
+            row[0] for row in conn.execute("SELECT id FROM communities ORDER BY id")
+        ]
         conn.execute("UPDATE nodes SET community_id = NULL")
 
         count = 0
         for comm in communities:
-            cursor = conn.execute(
-                """INSERT INTO communities
-                   (name, level, cohesion, size, dominant_language, description)
-                   VALUES (?, ?, ?, ?, ?, ?)""",
-                (
-                    comm["name"],
-                    comm.get("level", 0),
-                    comm.get("cohesion", 0.0),
-                    comm["size"],
-                    comm.get("dominant_language", ""),
-                    comm.get("description", ""),
-                ),
+            fields = (
+                comm["name"],
+                comm.get("level", 0),
+                comm.get("cohesion", 0.0),
+                comm["size"],
+                comm.get("dominant_language", ""),
+                comm.get("description", ""),
             )
-            community_id = cursor.lastrowid
+            if count < len(reusable):
+                community_id = reusable[count]
+                conn.execute(
+                    """UPDATE communities SET name = ?, level = ?, parent_id = NULL,
+                       cohesion = ?, size = ?, dominant_language = ?, description = ?,
+                       created_at = datetime('now')
+                       WHERE id = ?""",
+                    (*fields, community_id),
+                )
+            else:
+                cursor = conn.execute(
+                    """INSERT INTO communities
+                       (name, level, cohesion, size, dominant_language, description)
+                       VALUES (?, ?, ?, ?, ?, ?)""",
+                    fields,
+                )
+                community_id = cursor.lastrowid
 
             # Batch update community_id on member nodes
             member_qns = comm.get("members", [])
@@ -1130,6 +1147,13 @@ def store_communities(
                     [community_id] + batch,
                 )
             count += 1
+        if count < len(reusable):
+            if count:
+                conn.execute(
+                    "DELETE FROM communities WHERE id > ?", (reusable[count - 1],),
+                )
+            else:
+                conn.execute("DELETE FROM communities")
 
         # Recorded in the same transaction as the communities it describes,
         # so the two cannot disagree. Communities from a caller that does not

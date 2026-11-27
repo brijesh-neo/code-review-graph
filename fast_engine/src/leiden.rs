@@ -526,29 +526,103 @@ pub(crate) fn write_assignments(
     Ok(())
 }
 
+/// Writes the communities table row by row, reusing the ids it already holds
+/// in ascending order before taking new ones. Each community keeps the id the
+/// previous detection gave the community in its position, so an update that
+/// finds the same communities leaves every node's `community_id` as it was
+/// instead of moving all of them to fresh ids. Ids stay ascending in the
+/// order the communities are written, as with `DELETE` and `INSERT`.
+pub(crate) struct CommunityTable {
+    ids: Vec<i64>,
+    used: usize,
+    update: Stmt,
+    insert: Stmt,
+}
+
+impl CommunityTable {
+    pub(crate) fn open(db: *mut ffi::sqlite3, paths: &Paths) -> R<CommunityTable> {
+        let rows = Rows::new(db, "SELECT id FROM communities ORDER BY id", paths)?;
+        let mut ids = Vec::new();
+        while rows.step()? {
+            ids.push(rows.int(0)?);
+        }
+        let update = Stmt::prepare(
+            db,
+            "UPDATE communities SET name = ?, level = ?, parent_id = NULL, cohesion = ?, \
+             size = ?, dominant_language = ?, description = ?, created_at = datetime('now') \
+             WHERE id = ?",
+        )?;
+        let insert = Stmt::prepare(
+            db,
+            "INSERT INTO communities \
+             (name, level, cohesion, size, dominant_language, description) \
+             VALUES (?, ?, ?, ?, ?, ?)",
+        )?;
+        Ok(CommunityTable { ids, used: 0, update, insert })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn put(
+        &mut self,
+        db: *mut ffi::sqlite3,
+        name: &str,
+        level: i64,
+        cohesion: f64,
+        size: i64,
+        language: &str,
+        description: &str,
+    ) -> R<i64> {
+        let reused = self.ids.get(self.used).copied();
+        let stmt = if reused.is_some() { &self.update } else { &self.insert };
+        stmt.bind_text(1, name)?;
+        stmt.bind_i64(2, level)?;
+        stmt.bind_f64(3, cohesion)?;
+        stmt.bind_i64(4, size)?;
+        stmt.bind_text(5, language)?;
+        stmt.bind_text(6, description)?;
+        if let Some(id) = reused {
+            stmt.bind_i64(7, id)?;
+        }
+        stmt.run()?;
+        self.used += 1;
+        Ok(reused.unwrap_or_else(|| unsafe { ffi::sqlite3_last_insert_rowid(db) }))
+    }
+
+    /// Drops the rows no community was written to.
+    pub(crate) fn finish(self, db: *mut ffi::sqlite3) -> R<()> {
+        if self.used >= self.ids.len() {
+            return Ok(());
+        }
+        if self.used == 0 {
+            Stmt::prepare(db, "DELETE FROM communities")?.run()?;
+        } else {
+            let delete = Stmt::prepare(db, "DELETE FROM communities WHERE id > ?")?;
+            delete.bind_i64(1, self.ids[self.used - 1])?;
+            delete.run()?;
+        }
+        Ok(())
+    }
+}
+
 fn store(db: *mut ffi::sqlite3, paths: &Paths, nodes: &[Node], communities: &[Community]) -> R<i64> {
     let current = read_assignments(db, paths)?;
-    Stmt::prepare(db, "DELETE FROM communities")?.run()?;
+    let mut table = CommunityTable::open(db, paths)?;
     let mut wanted: HashMap<String, i64> = HashMap::default();
-    let insert = Stmt::prepare(
-        db,
-        "INSERT INTO communities \
-         (name, level, cohesion, size, dominant_language, description) \
-         VALUES (?, ?, ?, ?, ?, ?)",
-    )?;
     for community in communities {
-        insert.bind_text(1, &paths.strip(&community.name))?;
-        insert.bind_i64(2, community.level)?;
-        insert.bind_f64(3, community.cohesion)?;
-        insert.bind_i64(4, community.size as i64)?;
-        insert.bind_text(5, &paths.strip(&community.dominant_language))?;
-        insert.bind_text(6, &paths.strip(&community.description))?;
-        insert.run()?;
-        let id = unsafe { ffi::sqlite3_last_insert_rowid(db) };
+        let id = table.put(
+            db,
+            &paths.strip(&community.name),
+            community.level,
+            community.cohesion,
+            community.size as i64,
+            &paths.strip(&community.dominant_language),
+            &paths.strip(&community.description),
+        )?;
         for &m in &community.members {
             wanted.insert(paths.strip(&nodes[m].qualified_name).into_owned(), id);
         }
     }
+    table.finish(db)?;
     write_assignments(db, &current, &wanted)?;
     // Metadata values are not translated.
     if communities.is_empty() {

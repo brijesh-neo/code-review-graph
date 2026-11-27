@@ -454,27 +454,23 @@ fn dedupe_names(communities: &mut [Community], nodes: &[Node]) {
 /// `store_communities` for communities the file detector made.
 fn store(db: *mut ffi::sqlite3, paths: &Paths, nodes: &[Node], communities: &[Community]) -> R<i64> {
     let current = crate::leiden::read_assignments(db, paths)?;
-    Stmt::prepare(db, "DELETE FROM communities")?.run()?;
+    let mut table = crate::leiden::CommunityTable::open(db, paths)?;
     let mut wanted: HashMap<String, i64> = HashMap::default();
-    let insert = Stmt::prepare(
-        db,
-        "INSERT INTO communities \
-         (name, level, cohesion, size, dominant_language, description) \
-         VALUES (?, ?, ?, ?, ?, ?)",
-    )?;
     for community in communities {
-        insert.bind_text(1, &paths.strip(&community.name))?;
-        insert.bind_i64(2, 0)?;
-        insert.bind_f64(3, community.cohesion)?;
-        insert.bind_i64(4, community.size as i64)?;
-        insert.bind_text(5, &paths.strip(&community.dominant_language))?;
-        insert.bind_text(6, &paths.strip(&community.description))?;
-        insert.run()?;
-        let id = unsafe { ffi::sqlite3_last_insert_rowid(db) };
+        let id = table.put(
+            db,
+            &paths.strip(&community.name),
+            0,
+            community.cohesion,
+            community.size as i64,
+            &paths.strip(&community.dominant_language),
+            &paths.strip(&community.description),
+        )?;
         for &m in &community.members {
             wanted.insert(paths.strip(&nodes[m].qualified_name).into_owned(), id);
         }
     }
+    table.finish(db)?;
     crate::leiden::write_assignments(db, &current, &wanted)?;
     // Metadata values are not translated.
     if communities.is_empty() {
