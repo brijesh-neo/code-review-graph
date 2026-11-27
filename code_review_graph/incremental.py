@@ -1057,6 +1057,22 @@ _RECURSE_SUBMODULES = os.environ.get("CRG_RECURSE_SUBMODULES", "").lower() in ("
 
 def _git_branch_info(repo_root: Path) -> tuple[str, str]:
     """Return (branch_name, head_sha) for the current repo state."""
+    # One process answers both when HEAD names a commit; anything else (an
+    # unborn branch, a failure) falls back to asking for each on its own.
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "HEAD", "--abbrev-ref", "HEAD"],
+            capture_output=True,
+            text=True, encoding='utf-8', errors='replace',
+            cwd=str(repo_root),
+            timeout=_GIT_TIMEOUT,
+            stdin=subprocess.DEVNULL,
+        )
+        lines = result.stdout.split("\n")
+        if result.returncode == 0 and len(lines) == 3 and lines[2] == "":
+            return lines[1].strip(), lines[0].strip()
+    except (subprocess.TimeoutExpired, FileNotFoundError, UnicodeDecodeError):
+        pass
     branch = ""
     sha = ""
     try:

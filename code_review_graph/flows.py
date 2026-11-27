@@ -8,10 +8,13 @@ and persists results to the ``flows`` / ``flow_memberships`` tables.
 
 from __future__ import annotations
 
+import errno
 import json
 import logging
+import os
 import re
 import sqlite3
+import stat
 from collections import deque
 from pathlib import Path
 from typing import Any, Callable, Iterable, Optional
@@ -33,6 +36,40 @@ def _escape_like_literal(value: str) -> str:
         .replace("%", "\\%")
         .replace("_", "\\_")
     )
+
+
+def _resolver() -> Callable[[Path], Path]:
+    """``Path.resolve`` for many paths, resolving each directory once.
+
+    The real path of ``dir/name`` is the real path of ``dir`` joined with
+    ``name``, unless ``name`` is a link (resolved in full then) or a ``.`` or
+    ``..`` step. Every changed file shares its directories with the others,
+    so this spares most of the ``lstat`` calls, which were most of the time
+    an update spent here. POSIX only; elsewhere each path is resolved as is.
+    """
+    if os.name != "posix":
+        return Path.resolve
+    directories: dict[str, str] = {}
+
+    def resolve(path: Path) -> Path:
+        directory, name = os.path.split(str(path))
+        if name in ("", ".", "..") or not directory:
+            return path.resolve()
+        real = directories.get(directory)
+        if real is None:
+            real = directories[directory] = os.path.realpath(directory)
+        joined = os.path.join(real, name)
+        try:
+            if stat.S_ISLNK(os.lstat(joined).st_mode):
+                return path.resolve()
+            os.stat(joined)
+        except OSError as exc:
+            # ``resolve`` reports a link loop on the way; let it.
+            if exc.errno == errno.ELOOP:
+                return path.resolve()
+        return Path(joined)
+
+    return resolve
 
 
 def expand_changed_file_paths(
@@ -60,6 +97,7 @@ def expand_changed_file_paths(
             seen.add(normalized)
             variants.append(normalized)
 
+    resolve = _resolver()
     for raw in changed_files:
         text = normalize_file_path(raw)
         _add(text)
@@ -67,7 +105,7 @@ def expand_changed_file_paths(
         if path.is_absolute():
             _add(str(path))
             try:
-                resolved = path.resolve()
+                resolved = resolve(path)
                 _add(str(resolved))
                 if root is not None:
                     _add(str(resolved.relative_to(root)))
@@ -78,7 +116,7 @@ def expand_changed_file_paths(
             if root is not None:
                 _add(str(root / path))
                 try:
-                    _add(str((root / path).resolve()))
+                    _add(str(resolve(root / path)))
                 except OSError:
                     pass
 
