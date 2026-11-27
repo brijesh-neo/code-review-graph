@@ -3915,6 +3915,7 @@ class GraphStore:
         # The inherited walk first: it needs the name the parser wrote, and it
         # takes up edges an earlier pass settled.
         try:
+            self._collect_endpoint_rows()
             self._resolve_inherited_endpoints()
             self._settle_unbound_endpoints()
             # Read before the refresh's own writes; triggers off before them.
@@ -4015,7 +4016,12 @@ class GraphStore:
         pass settled earlier. Returns the number of edges changed. See: #984
         """
         if self._native_sql:
-            native = self._native_resolver_job("stage_inherited_resolve")
+            scope_floor = getattr(self, "_certainty_scope_floor", None)
+            native = (
+                self._native_resolver_job("stage_inherited_resolve", scope_floor=scope_floor)
+                if scope_floor is not None and getattr(self, "_endpoint_rows_kept", False)
+                else self._native_resolver_job("stage_inherited_resolve")
+            )
             if native >= 0:
                 return native
         conn = self._conn
@@ -4158,7 +4164,7 @@ class GraphStore:
             scope_floor = getattr(self, "_certainty_scope_floor", None)
             native = (
                 self._native_resolver_job("stage_unbound_settle")
-                if scope_floor is None
+                if scope_floor is None or not getattr(self, "_endpoint_rows_kept", False)
                 else self._native_resolver_job("stage_unbound_settle", scope_floor=scope_floor)
             )
             if native >= 0:
@@ -4647,6 +4653,34 @@ class GraphStore:
             return
         self._certainty_scope_floor: Optional[int] = floor
 
+    def _collect_endpoint_rows(self) -> None:
+        """Keep, for the native passes, the rows that may hold a moved endpoint.
+
+        The inherited and the unbound passes each read the rows whose
+        ``extra`` names a claimed or an inherited endpoint. One scan for
+        ``endpoint"`` (a superset of both, LIKE being case-blind alike) into
+        ``temp.crg_endpoint_rows`` replaces their full scans. Only for a
+        native update with the certainty capture on: rows the passes write
+        later are in the capture.
+        """
+        self._endpoint_rows_kept = False
+        if not self._native_sql or getattr(self, "_certainty_scope_floor", None) is None:
+            return
+        conn = self._conn
+        try:
+            conn.execute(
+                "CREATE TEMP TABLE IF NOT EXISTS crg_endpoint_rows (id INTEGER PRIMARY KEY)"
+            )
+            conn.execute("DELETE FROM temp.crg_endpoint_rows")
+            conn.execute(
+                "INSERT INTO temp.crg_endpoint_rows "
+                "SELECT id FROM edges WHERE extra LIKE ?", ('%endpoint"%',),
+            )
+        except sqlite3.Error as exc:
+            logger.debug("Endpoint rows unavailable: %s", exc)
+            return
+        self._endpoint_rows_kept = True
+
     def _drop_certainty_triggers(self) -> None:
         for trigger in self._CERTAINTY_TRIGGERS:
             try:
@@ -4657,11 +4691,12 @@ class GraphStore:
     def _end_certainty_scope(self) -> None:
         """Drop the certainty capture; the next refresh reads every row."""
         self._certainty_scope_floor = None
+        self._endpoint_rows_kept = False
         conn = self._conn
         try:
             for trigger in self._CERTAINTY_TRIGGERS:
                 conn.execute(f"DROP TRIGGER IF EXISTS temp.{trigger}")
-            for table in ("crg_cert_edge", "crg_cert_qn"):
+            for table in ("crg_cert_edge", "crg_cert_qn", "crg_endpoint_rows"):
                 conn.execute(f"DROP TABLE IF EXISTS temp.{table}")
         except sqlite3.Error as exc:  # pragma: no cover - defensive
             logger.debug("Could not drop the certainty capture: %s", exc)

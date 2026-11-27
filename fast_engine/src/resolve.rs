@@ -1442,24 +1442,57 @@ enum Change {
     Revert { target_column: bool, endpoint: String, extra: String, tier: String, score: f64, id: i64 },
 }
 
-fn plan_inherited(db: *mut ffi::sqlite3, paths: &Paths) -> R<Vec<Change>> {
+/// The rows of *kind* (`?1`) the certainty capture holds, with `{column}`
+/// read as `endpoint`: written since the edge id floor (`?{floor}`), rewritten
+/// since, or naming a name a node gained or lost. Whether a row is unbound
+/// turns on nothing else.
+fn captured_unbound_sql(column: &str, floor: u8) -> String {
+    format!(
+        "SELECT u.id, u.endpoint, u.extra FROM (\
+         SELECT id, {column} AS endpoint, extra FROM edges \
+         WHERE kind = ?1 AND id > ?{floor} \
+         UNION SELECT id, {column}, extra FROM edges \
+         WHERE kind = ?1 AND id IN (SELECT id FROM temp.crg_cert_edge) \
+         UNION SELECT id, {column}, extra FROM edges \
+         WHERE kind = ?1 AND {column} IN (SELECT qn FROM temp.crg_cert_qn)) u \
+         WHERE u.endpoint LIKE '%::%' AND NOT EXISTS (\
+         SELECT 1 FROM nodes n WHERE n.qualified_name = u.endpoint)"
+    )
+}
+
+/// Every row whose `extra` matched `LIKE '%endpoint"%'` when the update's
+/// refresh began, kept by `refresh_target_resolution` in
+/// `temp.crg_endpoint_rows`: a superset of both LIKEs the passes use.
+const ENDPOINT_ROWS: &str = "SELECT id FROM temp.crg_endpoint_rows";
+
+fn plan_inherited(db: *mut ffi::sqlite3, paths: &Paths, scope: Option<i64>) -> R<Vec<Change>> {
     let mut work: Vec<InheritedWork> = Vec::new();
     for (kind, target_column) in [("CALLS", true), ("TESTED_BY", false)] {
-        let sql = if target_column {
-            "SELECT e.id, e.target_qualified AS endpoint, e.extra FROM edges e \
-             WHERE e.kind = ? AND (e.extra LIKE ? OR e.extra LIKE ? OR (\
-             e.target_qualified LIKE '%::%' AND NOT EXISTS (\
-             SELECT 1 FROM nodes n WHERE n.qualified_name = e.target_qualified)))"
-        } else {
-            "SELECT e.id, e.source_qualified AS endpoint, e.extra FROM edges e \
-             WHERE e.kind = ? AND (e.extra LIKE ? OR e.extra LIKE ? OR (\
-             e.source_qualified LIKE '%::%' AND NOT EXISTS (\
-             SELECT 1 FROM nodes n WHERE n.qualified_name = e.source_qualified)))"
+        let column = if target_column { "target_qualified" } else { "source_qualified" };
+        let sql = match scope {
+            None => format!(
+                "SELECT e.id, e.{column} AS endpoint, e.extra FROM edges e \
+                 WHERE e.kind = ?1 AND (e.extra LIKE ?2 OR e.extra LIKE ?3 OR (\
+                 e.{column} LIKE '%::%' AND NOT EXISTS (\
+                 SELECT 1 FROM nodes n WHERE n.qualified_name = e.{column})))"
+            ),
+            // A row is read for its claimed or inherited endpoint, or for
+            // being unbound; the update's unbound rows are the captured ones.
+            Some(_) => format!(
+                "SELECT e.id, e.{column} AS endpoint, e.extra FROM edges e \
+                 WHERE e.kind = ?1 AND e.id IN ({ENDPOINT_ROWS}) \
+                 AND (e.extra LIKE ?2 OR e.extra LIKE ?3) \
+                 UNION {} ORDER BY 1",
+                captured_unbound_sql(column, 4),
+            ),
         };
-        let rows = Rows::new(db, sql, paths)?;
+        let rows = Rows::new(db, &sql, paths)?;
         rows.bind_text(1, kind)?;
         rows.bind_text(2, "%\"claimed_endpoint\"%")?;
         rows.bind_text(3, "%\"inherited_endpoint\"%")?;
+        if let Some(floor) = scope {
+            rows.bind_int(4, floor)?;
+        }
         while rows.step()? {
             let id = rows.int(0)?;
             let endpoint = rows.text(1)?;
@@ -1607,12 +1640,15 @@ fn write_changes(db: *mut ffi::sqlite3, paths: &Paths, changes: &[Change]) -> Re
 
 /// Stages `_resolve_inherited_endpoints`: edges changed, or -1 having
 /// written nothing.
+/// With *scope_floor* it reads the rows `temp.crg_endpoint_rows` and the
+/// certainty capture hold.
 #[pyfunction]
-pub fn stage_inherited_resolve(codec: CodecFields) -> PyResult<i64> {
+#[pyo3(signature = (codec, scope_floor=None))]
+pub fn stage_inherited_resolve(codec: CodecFields, scope_floor: Option<i64>) -> PyResult<i64> {
     let paths = paths_from(codec);
     stage(Box::new(move |db| {
         run_job(|| {
-            let changes = plan_inherited(db, &paths)?;
+            let changes = plan_inherited(db, &paths, scope_floor)?;
             write_changes(db, &paths, &changes)?;
             Ok(changes.len() as i64)
         })
@@ -1676,20 +1712,7 @@ fn plan_unbound(db: *mut ffi::sqlite3, paths: &Paths, scope: Option<i64>) -> R<V
                  WHERE e.kind = ?1 AND e.{column} LIKE '%::%' AND NOT EXISTS (\
                  SELECT 1 FROM nodes n WHERE n.qualified_name = e.{column})"
             ),
-            // Whether a row is unbound turns on the row and on whether a node
-            // has its name, so only rows the certainty capture holds (new,
-            // updated, or naming a name a node gained or lost) can change.
-            Some(_) => format!(
-                "SELECT u.id, u.endpoint, u.extra FROM (\
-                 SELECT id, {column} AS endpoint, extra FROM edges \
-                 WHERE kind = ?1 AND id > ?2 \
-                 UNION SELECT id, {column}, extra FROM edges \
-                 WHERE kind = ?1 AND id IN (SELECT id FROM temp.crg_cert_edge) \
-                 UNION SELECT id, {column}, extra FROM edges \
-                 WHERE kind = ?1 AND {column} IN (SELECT qn FROM temp.crg_cert_qn)) u \
-                 WHERE u.endpoint LIKE '%::%' AND NOT EXISTS (\
-                 SELECT 1 FROM nodes n WHERE n.qualified_name = u.endpoint) ORDER BY u.id"
-            ),
+            Some(_) => format!("{} ORDER BY 1", captured_unbound_sql(column, 2)),
         };
         let rows = Rows::new(db, &unbound_sql, paths)?;
         rows.bind_text(1, kind)?;
@@ -1716,13 +1739,24 @@ fn plan_unbound(db: *mut ffi::sqlite3, paths: &Paths, scope: Option<i64>) -> R<V
             push(updates, plain, &extra, id);
         }
         drop(rows);
-        let claimed_sql = format!(
-            "SELECT e.id, e.{column} AS endpoint, e.extra FROM edges e \
-             WHERE e.kind = ? AND e.extra LIKE ?"
-        );
+        let claimed_sql = match scope {
+            None => format!(
+                "SELECT e.id, e.{column} AS endpoint, e.extra FROM edges e \
+                 WHERE e.kind = ? AND e.extra LIKE ?"
+            ),
+            // Rows the inherited pass rewrote are in the capture.
+            Some(_) => format!(
+                "SELECT e.id, e.{column} AS endpoint, e.extra FROM edges e \
+                 WHERE e.kind = ?1 AND e.extra LIKE ?2 AND (e.id IN ({ENDPOINT_ROWS}) \
+                 OR e.id > ?3 OR e.id IN (SELECT id FROM temp.crg_cert_edge)) ORDER BY e.id"
+            ),
+        };
         let rows = Rows::new(db, &claimed_sql, paths)?;
         rows.bind_text(1, kind)?;
         rows.bind_text(2, "%\"claimed_endpoint\"%")?;
+        if let Some(floor) = scope {
+            rows.bind_int(3, floor)?;
+        }
         while rows.step()? {
             let id = rows.int(0)?;
             let endpoint = rows.text(1)?;
@@ -1748,7 +1782,7 @@ fn plan_unbound(db: *mut ffi::sqlite3, paths: &Paths, scope: Option<i64>) -> R<V
 /// Stages `_settle_unbound_endpoints`: edges changed, or -1 having written
 /// nothing.
 /// With *scope_floor* the unbound scans read only what the certainty
-/// capture holds; the claimed scans always read every row.
+/// capture holds, and the claimed scans what `temp.crg_endpoint_rows` holds.
 #[pyfunction]
 #[pyo3(signature = (codec, scope_floor=None))]
 pub fn stage_unbound_settle(codec: CodecFields, scope_floor: Option<i64>) -> PyResult<i64> {
