@@ -4153,7 +4153,14 @@ class GraphStore:
         Returns the number of edges changed.
         """
         if self._native_sql:
-            native = self._native_resolver_job("stage_unbound_settle")
+            # The certainty capture is still on here: the unbound scans need
+            # only read what it holds.
+            scope_floor = getattr(self, "_certainty_scope_floor", None)
+            native = (
+                self._native_resolver_job("stage_unbound_settle")
+                if scope_floor is None
+                else self._native_resolver_job("stage_unbound_settle", scope_floor=scope_floor)
+            )
             if native >= 0:
                 return native
         conn = self._conn

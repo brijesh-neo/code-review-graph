@@ -1651,7 +1651,7 @@ impl NodeExists {
     }
 }
 
-fn plan_unbound(db: *mut ffi::sqlite3, paths: &Paths) -> R<Vec<Change>> {
+fn plan_unbound(db: *mut ffi::sqlite3, paths: &Paths, scope: Option<i64>) -> R<Vec<Change>> {
     let exists = NodeExists::new(db)?;
     let mut targets: Vec<Change> = Vec::new();
     let mut sources: Vec<Change> = Vec::new();
@@ -1670,13 +1670,32 @@ fn plan_unbound(db: *mut ffi::sqlite3, paths: &Paths) -> R<Vec<Change>> {
                 id,
             });
         };
-        let unbound_sql = format!(
-            "SELECT e.id, e.{column} AS endpoint, e.extra FROM edges e \
-             WHERE e.kind = ? AND e.{column} LIKE '%::%' AND NOT EXISTS (\
-             SELECT 1 FROM nodes n WHERE n.qualified_name = e.{column})"
-        );
+        let unbound_sql = match scope {
+            None => format!(
+                "SELECT e.id, e.{column} AS endpoint, e.extra FROM edges e \
+                 WHERE e.kind = ?1 AND e.{column} LIKE '%::%' AND NOT EXISTS (\
+                 SELECT 1 FROM nodes n WHERE n.qualified_name = e.{column})"
+            ),
+            // Whether a row is unbound turns on the row and on whether a node
+            // has its name, so only rows the certainty capture holds (new,
+            // updated, or naming a name a node gained or lost) can change.
+            Some(_) => format!(
+                "SELECT u.id, u.endpoint, u.extra FROM (\
+                 SELECT id, {column} AS endpoint, extra FROM edges \
+                 WHERE kind = ?1 AND id > ?2 \
+                 UNION SELECT id, {column}, extra FROM edges \
+                 WHERE kind = ?1 AND id IN (SELECT id FROM temp.crg_cert_edge) \
+                 UNION SELECT id, {column}, extra FROM edges \
+                 WHERE kind = ?1 AND {column} IN (SELECT qn FROM temp.crg_cert_qn)) u \
+                 WHERE u.endpoint LIKE '%::%' AND NOT EXISTS (\
+                 SELECT 1 FROM nodes n WHERE n.qualified_name = u.endpoint) ORDER BY u.id"
+            ),
+        };
         let rows = Rows::new(db, &unbound_sql, paths)?;
         rows.bind_text(1, kind)?;
+        if let Some(floor) = scope {
+            rows.bind_int(2, floor)?;
+        }
         while rows.step()? {
             let id = rows.int(0)?;
             let endpoint = rows.req(1)?;
@@ -1728,12 +1747,15 @@ fn plan_unbound(db: *mut ffi::sqlite3, paths: &Paths) -> R<Vec<Change>> {
 
 /// Stages `_settle_unbound_endpoints`: edges changed, or -1 having written
 /// nothing.
+/// With *scope_floor* the unbound scans read only what the certainty
+/// capture holds; the claimed scans always read every row.
 #[pyfunction]
-pub fn stage_unbound_settle(codec: CodecFields) -> PyResult<i64> {
+#[pyo3(signature = (codec, scope_floor=None))]
+pub fn stage_unbound_settle(codec: CodecFields, scope_floor: Option<i64>) -> PyResult<i64> {
     let paths = paths_from(codec);
     stage(Box::new(move |db| {
         run_job(|| {
-            let changes = plan_unbound(db, &paths)?;
+            let changes = plan_unbound(db, &paths, scope_floor)?;
             write_changes(db, &paths, &changes)?;
             Ok(changes.len() as i64)
         })
