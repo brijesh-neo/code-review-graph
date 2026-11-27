@@ -243,6 +243,7 @@ def _run_postprocess(
     entry_point_qns: list[str] | None = None,
     communities_were_affected: bool = False,
     skip_resolvers: bool = False,
+    refresh_owed: bool = False,
 ) -> list[str]:
     """Run post-build steps based on *postprocess* level.
 
@@ -251,6 +252,9 @@ def _run_postprocess(
 
     *skip_resolvers* leaves call-target resolution out, for a no-op update on a
     graph whose edges are already resolved.
+
+    *refresh_owed* says the build left the target-resolution refresh to this
+    step, which then runs it even where it resolves nothing.
 
     Records structured stage durations in ``build_result["postprocess_timing"]``.
     Minimal processing reports ``signatures_s`` and ``fts_s``; full processing
@@ -294,6 +298,7 @@ def _run_postprocess(
     # Resolve bare and C++ scoped call targets before derived graph steps.
     # A capture started by the update ends here, before the writes below.
     scoped = store.end_change_capture()
+    refreshed = False
     if not skip_resolvers:
         try:
             if noop_incremental and not store.get_nodes_without_signature():
@@ -313,11 +318,21 @@ def _run_postprocess(
                 # Resolvers rewrite bare targets into qualified ones, so the stored
                 # certainty column is only correct once they have all run.
                 store.refresh_target_resolution()
+                refreshed = True
         except sqlite3.OperationalError as e:
             logger.warning("Call-target resolution failed: %s", e)
             _note_contention(build_result, e)
             warnings.append(
                 f"Call-target resolution failed: {type(e).__name__}: {e}"
+            )
+    if refresh_owed and not refreshed:
+        try:
+            store.refresh_target_resolution()
+        except sqlite3.OperationalError as e:
+            logger.warning("Target-resolution refresh failed: %s", e)
+            _note_contention(build_result, e)
+            warnings.append(
+                f"Target-resolution refresh failed: {type(e).__name__}: {e}"
             )
     if scoped:
         store.drop_change_scope()
@@ -623,8 +638,9 @@ def build_or_update_graph(
         if full_rebuild:
             result = full_build(
                 root, store, recurse_submodules, enrich=enrich,
-                follow_symlinks=follow_symlinks,
+                follow_symlinks=follow_symlinks, defer_target_refresh=True,
             )
+            refresh_owed = bool(result.pop("target_refresh_owed", False))
             failed = [str(item.get("file", "?")) for item in result["errors"]]
             summary = (
                 f"Full build complete: parsed {result['files_parsed']} files, "
@@ -656,8 +672,9 @@ def build_or_update_graph(
             try:
                 result = incremental_update(
                     root, store, base=base_resolved, enrich=enrich,
-                    follow_symlinks=follow_symlinks,
+                    follow_symlinks=follow_symlinks, defer_target_refresh=True,
                 )
+                refresh_owed = bool(result.pop("target_refresh_owed", False))
             except RuntimeError as exc:
                 # Change discovery or root validation failed before anything was
                 # stored; report it the way every other failure is reported.
@@ -685,6 +702,11 @@ def build_or_update_graph(
                     else "No graph changes detected. Freshness metadata was not advanced."
                 )
                 if postprocess == "none":
+                    if refresh_owed:
+                        try:
+                            store.refresh_target_resolution()
+                        except sqlite3.OperationalError as e:
+                            logger.warning("Target-resolution refresh failed: %s", e)
                     # An explicit skip should not turn an existing state into
                     # a claim that derived data was checked. No source rows
                     # changed, so restore the state that was present before
@@ -738,6 +760,7 @@ def build_or_update_graph(
                     embedding_provider=embedding_provider if pending else None,
                     embedding_model=embedding_model if pending else None,
                     skip_resolvers=not pending,
+                    refresh_owed=refresh_owed,
                 )
                 if warnings:
                     build_result["warnings"] = warnings
@@ -811,6 +834,7 @@ def build_or_update_graph(
             embedding_model=embedding_model,
             entry_point_qns=entry_qns,
             communities_were_affected=communities_affected,
+            refresh_owed=refresh_owed,
         )
         if warnings:
             build_result["warnings"] = warnings

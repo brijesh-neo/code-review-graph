@@ -3243,8 +3243,14 @@ def full_build(
     recurse_submodules: bool | None = None,
     enrich: bool | None = None,
     follow_symlinks: bool | None = None,
+    *,
+    defer_target_refresh: bool = False,
 ) -> dict:
     """Full rebuild of the entire graph.
+
+    *defer_target_refresh* leaves the target-resolution refresh to a caller
+    that runs it after its own resolver passes, and says so with
+    ``target_refresh_owed`` in the result.
 
     Args:
         repo_root: Repository root directory.
@@ -3394,7 +3400,8 @@ def full_build(
     scoped_stats = _run_scoped_resolver(store, repo_root)
     jedi_stats = _run_jedi_enrichment(store, repo_root, enrich=enrich)
     _relink_stored_edges(store, repo_root, followed_dirs)
-    _refresh_target_resolution(store)
+    if not defer_target_refresh:
+        _refresh_target_resolution(store)
     store.set_metadata(_DEPENDENTS_PENDING_KEY, "[]")
     # Storing is over: every file that could be parsed has its rows. Recorded
     # before the anchor and before post-processing, so a process killed from
@@ -3411,6 +3418,7 @@ def full_build(
     store.refresh_planner_stats()
 
     return {
+        "target_refresh_owed": defer_target_refresh,
         "files_parsed": len(files),
         "stale_files_removed": len(stale_files),
         "total_nodes": total_nodes,
@@ -4287,8 +4295,11 @@ def incremental_update(
     follow_symlinks: bool | None = None,
     *,
     reconcile_followed: bool = False,
+    defer_target_refresh: bool = False,
 ) -> dict:
     """Incremental update: re-parse changed + dependent files only.
+
+    *defer_target_refresh* is as for ``full_build``.
 
     *enrich* is as for :func:`full_build`.
 
@@ -4343,8 +4354,12 @@ def incremental_update(
             logger.info(
                 "C++ identity format changed; rebuilding the graph before incremental update",
             )
-        rebuilt = full_build(repo_root, store, enrich=enrich, follow_symlinks=follow)
+        rebuilt = full_build(
+            repo_root, store, enrich=enrich, follow_symlinks=follow,
+            defer_target_refresh=defer_target_refresh,
+        )
         return {
+            "target_refresh_owed": rebuilt["target_refresh_owed"],
             "files_updated": rebuilt["files_parsed"],
             "total_nodes": rebuilt["total_nodes"],
             "total_edges": rebuilt["total_edges"],
@@ -4870,8 +4885,12 @@ def incremental_update(
     )
     if files_updated and followed_dirs:
         _relink_stored_edges(store, repo_root, followed_dirs)
+    target_refresh_owed = False
     if has_graph_changes or scoped_changed:
-        _refresh_target_resolution(store)
+        if defer_target_refresh:
+            target_refresh_owed = True
+        else:
+            _refresh_target_resolution(store)
 
     # Freshness follows what was stored. A file that failed to parse is
     # reported in ``errors`` and keeps its previous rows; it must not stop the
@@ -4900,6 +4919,7 @@ def incremental_update(
         store._invalidate_cache()
 
     return {
+        "target_refresh_owed": target_refresh_owed,
         "files_updated": files_updated,
         "total_nodes": total_nodes,
         "total_edges": total_edges,
