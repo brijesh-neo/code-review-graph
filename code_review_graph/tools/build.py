@@ -335,8 +335,7 @@ def _run_postprocess(
             else:
                 noop_incremental = False
                 try:
-                    resolved = store.resolve_bare_call_targets(scoped=scoped)
-                    resolved += store.resolve_bare_tested_by_sources(scoped=scoped)
+                    resolved = store.resolve_bare_endpoints(scoped=scoped)
                 finally:
                     store.drop_bare_scope()
                 build_result["bare_edges_resolved"] = resolved
@@ -1018,8 +1017,7 @@ def run_postprocess(
         graph_complete = graph_contents_are_complete(state_before)
 
         try:
-            resolved = store.resolve_bare_call_targets()
-            resolved += store.resolve_bare_tested_by_sources()
+            resolved = store.resolve_bare_endpoints()
             result["bare_edges_resolved"] = resolved
             result["cpp_scoped_edges_resolved"] = (
                 store.resolve_cpp_scoped_call_targets()

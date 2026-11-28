@@ -87,8 +87,7 @@ def _resolve_bare_endpoints(
 ) -> None:
     """Resolve bare and C++ scoped call targets before derived graph steps."""
     try:
-        resolved = store.resolve_bare_call_targets()
-        resolved += store.resolve_bare_tested_by_sources()
+        resolved = store.resolve_bare_endpoints()
         result["bare_edges_resolved"] = resolved
         result["cpp_scoped_edges_resolved"] = (
             store.resolve_cpp_scoped_call_targets()

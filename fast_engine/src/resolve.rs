@@ -1382,6 +1382,38 @@ pub fn stage_bare_resolve(
     }))
 }
 
+/// Stages the CALLS pass then the TESTED_BY pass of `_resolve_bare_endpoints`
+/// on one evidence context. The CALLS pass writes only CALLS edges, and the
+/// context reads nodes and IMPORTS_FROM and INHERITS edges, so the second pass
+/// sees the context a job of its own would build. The job returns the CALLS
+/// count shifted 32 bits left plus the TESTED_BY count, or -1 having written
+/// nothing.
+#[pyfunction]
+#[pyo3(signature = (codec, scope_floor=None))]
+pub fn stage_bare_resolve_pair(codec: CodecFields, scope_floor: Option<i64>) -> PyResult<i64> {
+    let paths = paths_from(codec);
+    stage(Box::new(move |db| {
+        run_job(|| {
+            let context = Context::build(db, &paths)?;
+            let inheritance = Inheritance::build(
+                db, &paths, &context.import_targets, &context.raw_imports,
+            )?;
+            let (updates, calls) = plan_pass(
+                db, &paths, &context, &inheritance, "CALLS", true, scope_floor,
+            )?;
+            write_pass(db, &paths, true, &updates)?;
+            let (updates, tested) = plan_pass(
+                db, &paths, &context, &inheritance, "TESTED_BY", false, scope_floor,
+            )?;
+            write_pass(db, &paths, false, &updates)?;
+            if !(0..1 << 31).contains(&calls) || !(0..1 << 31).contains(&tested) {
+                return Err(Fail::Back);
+            }
+            Ok((calls << 32) | tested)
+        })
+    }))
+}
+
 // -- _resolve_inherited_endpoints ------------------------------------------------
 
 const RESOLVER_BOUND_KEYS: &[&str] = &[

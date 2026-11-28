@@ -2850,6 +2850,17 @@ class GraphStore:
     def get_nodes_by_file(self, file_path: str) -> list[GraphNode]:
         return list(self.iter_nodes_by_file(file_path))
 
+    def first_file_hash(self, file_path: str) -> tuple[bool, Optional[str]]:
+        """Whether *file_path* has nodes, and the ``file_hash`` of its first one.
+
+        The first node of :meth:`get_nodes_by_file`, read without loading the rest.
+        """
+        row = self._conn.execute(
+            "SELECT file_hash FROM nodes WHERE file_path = ? LIMIT 1",
+            (normalize_file_path(file_path),),
+        ).fetchone()
+        return (False, None) if row is None else (True, row[0])
+
     def iter_nodes_by_file(self, file_path: str) -> Iterator[GraphNode]:
         """Yield file nodes without first materializing the complete row set."""
         rows = self._conn.execute(
@@ -2907,6 +2918,31 @@ class GraphStore:
         dependents = {row[0] for row in rows}
         dependents.discard(file_path)
         dependents.discard(norm_fp)
+        return dependents
+
+    def get_direct_dependent_files_of_all(self, file_paths: list[str]) -> set[str]:
+        """The union of :meth:`get_direct_dependent_files` over *file_paths*.
+
+        For paths already in normal form, so each one's own spelling is the
+        only one to drop. A few chunked queries instead of one per file.
+        """
+        dependents: set[str] = set()
+        for start in range(0, len(file_paths), 400):
+            chunk = file_paths[start:start + 400]
+            marks = ",".join("?" * len(chunk))
+            rows = self._conn.execute(
+                "SELECT file_path FROM edges INDEXED BY idx_edges_target_kind "  # nosec B608
+                f"WHERE target_qualified IN ({marks}) AND kind = 'IMPORTS_FROM' "
+                "UNION "
+                "SELECT e.file_path FROM nodes n "
+                "JOIN edges e INDEXED BY idx_edges_target_kind "
+                "ON e.target_qualified = n.qualified_name "
+                f"WHERE n.file_path IN ({marks}) "
+                "AND e.kind IN ('CALLS', 'IMPORTS_FROM', 'INHERITS', 'IMPLEMENTS')",
+                (*chunk, *chunk),
+            ).fetchall()
+            dependents.update(row[0] for row in rows)
+        dependents.difference_update(file_paths)
         return dependents
 
     def iter_edges_by_target(self, qualified_name: str) -> Iterator[GraphEdge]:
@@ -4513,6 +4549,53 @@ class GraphStore:
             # for the rest of the store's life (watch mode keeps one open).
             self._drop_bare_endpoint_context()
 
+    def resolve_bare_endpoints(self, *, scoped: bool = False) -> int:
+        """``resolve_bare_call_targets`` then ``resolve_bare_tested_by_sources``.
+
+        The native engine runs both passes as one job on one evidence context,
+        which is what the two calls do in Python. Returns the sum of their
+        counts.
+        """
+        if self._native_sql and self._bare_kinds_pending() == ("CALLS", "TESTED_BY"):
+            import crg_fast
+
+            if getattr(crg_fast, "stage_bare_resolve_pair", None) is not None:
+                floor = self._scope_edge_floor if scoped else None
+                try:
+                    packed = (
+                        self._native_resolver_job("stage_bare_resolve_pair")
+                        if floor is None
+                        else self._native_resolver_job(
+                            "stage_bare_resolve_pair", scope_floor=floor,
+                        )
+                    )
+                finally:
+                    self._drop_bare_endpoint_context()
+                if packed >= 0:
+                    for count, kind, side in (
+                        (packed >> 32, "CALLS", "targets"),
+                        (packed & 0xFFFFFFFF, "TESTED_BY", "sources"),
+                    ):
+                        if count:
+                            logger.info(
+                                "Resolved %d evidence-backed bare %s %s", count, kind, side,
+                            )
+                    return (packed >> 32) + (packed & 0xFFFFFFFF)
+        resolved = self.resolve_bare_call_targets(scoped=scoped)
+        return resolved + self.resolve_bare_tested_by_sources(scoped=scoped)
+
+    def _bare_kinds_pending(self) -> tuple[str, ...]:
+        """The kinds among CALLS and TESTED_BY with an edge the bare pass reads."""
+        row = self._conn.execute(
+            "SELECT EXISTS(SELECT 1 FROM edges WHERE kind = 'CALLS' AND ("
+            "target_qualified NOT LIKE '%::%' "
+            "OR extra LIKE '%\"bare_call_target\"%')), "
+            "EXISTS(SELECT 1 FROM edges WHERE kind = 'TESTED_BY' AND ("
+            "source_qualified NOT LIKE '%::%' "
+            "OR extra LIKE '%\"bare_tested_by_source\"%'))"
+        ).fetchone()
+        return tuple(kind for kind, hit in zip(("CALLS", "TESTED_BY"), row) if hit)
+
     def _drop_bare_endpoint_context(self) -> None:
         with self._cache_lock:
             self._cache_epoch += 1
@@ -5580,7 +5663,19 @@ class GraphStore:
         # get_all_files. json_valid gates the extraction, and the truthiness
         # comparison keeps extra='{"virtual": false}' visible instead of
         # making the node immortal to reconciliation (#864).
-        rows = self._conn.execute(
+        # The answer stands while no connection wrote: an update reads it
+        # twice (the partial-graph check, then stale-file reconciliation).
+        conn = self._conn
+        codec = getattr(conn, "codec", None)
+        key = (
+            conn.total_changes,
+            conn.execute("PRAGMA data_version").fetchone()[0],
+            id(codec), getattr(codec, "root", None),
+        )
+        memo = getattr(self, "_all_files_memo", None)
+        if memo is not None and memo[0] == key:
+            return list(memo[1])
+        rows = conn.execute(
             "SELECT file_path FROM nodes "
             "WHERE extra IS NULL "
             "OR json_valid(extra) = 0 "
@@ -5591,7 +5686,9 @@ class GraphStore:
         ).fetchall()
         # Sorted again after restoring: stored ``./`` paths order apart from
         # absolute ones.
-        return sorted(r["file_path"] for r in rows)
+        files = sorted(r["file_path"] for r in rows)
+        self._all_files_memo = (key, files)
+        return list(files)
 
     def get_file_hashes(self) -> dict[str, str]:
         """Return indexed file paths mapped to the hash last stored for each file."""

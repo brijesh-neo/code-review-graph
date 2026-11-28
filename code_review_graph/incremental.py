@@ -3079,11 +3079,17 @@ def find_dependents(
     frontier: set[str] = {file_path}
     for _hop in range(max_hops):
         next_frontier: set[str] = set()
-        for fp in frontier:
-            deps = _single_hop_dependents(store, fp)
-            new_deps = deps - visited
-            all_dependents.update(new_deps)
-            next_frontier.update(new_deps)
+        if len(frontier) > 1 and all(normalize_file_path(fp) == fp for fp in frontier):
+            # Each path is its own normal form, so the per-file answers drop
+            # only spellings already visited: their union is the batch's.
+            next_frontier = store.get_direct_dependent_files_of_all(sorted(frontier)) - visited
+            all_dependents.update(next_frontier)
+        else:
+            for fp in frontier:
+                deps = _single_hop_dependents(store, fp)
+                new_deps = deps - visited
+                all_dependents.update(new_deps)
+                next_frontier.update(new_deps)
         visited.update(next_frontier)
         frontier = next_frontier
         if not frontier:
@@ -4656,7 +4662,7 @@ def incremental_update(
         # refer to the old export identity, so its own hash is not sufficient.
         # A path with no rows has no stored hash to compare, and may be a large
         # file the graph never indexes, so it is not read here.
-        existing = store.get_nodes_by_file(full_path)
+        existing, existing_hash = store.first_file_hash(full_path)
         # A nested-scope upgrade renames this file's members, so whoever
         # resolved a call to the old names must be re-resolved too.
         if existing and rel_path not in pending_nested:
@@ -4665,7 +4671,7 @@ def incremental_update(
                 if current_hash is None:
                     current_hash = hashlib.sha256((repo_root / rel_path).read_bytes()).hexdigest()
                     current_hashes[normalize_file_path(rel_path)] = current_hash
-                if existing[0].file_hash == current_hash:
+                if existing_hash == current_hash:
                     continue
             except (OSError, PermissionError):
                 pass
@@ -4680,9 +4686,9 @@ def incremental_update(
                 # parse reads it, and the file itself is re-parsed below.
                 pass
             elif (
-                deps and existing and rel_path not in pending_nested and existing[0].file_hash
+                deps and existing and rel_path not in pending_nested and existing_hash
             ):
-                content_changed[rel_path] = existing[0].file_hash
+                content_changed[rel_path] = existing_hash
             elif deps or rel_path in pending_nested:
                 content_changed = None
             else:
@@ -4743,7 +4749,7 @@ def incremental_update(
                 ignored_path = repo_root / rel_path
                 if (
                     normalize_file_path(ignored_path) in stale_files
-                    or not store.get_nodes_by_file(str(ignored_path))
+                    or not store.first_file_hash(str(ignored_path))[0]
                 ):
                     # Nothing of this file is in the graph (it was removed as
                     # stale, or never parsed), so there is nothing to migrate.
@@ -4779,14 +4785,14 @@ def incremental_update(
             except (OSError, PermissionError):
                 fhash = None
         try:
-            existing_nodes = store.get_nodes_by_file(str(abs_path))
+            existing_nodes, existing_hash = store.first_file_hash(str(abs_path))
             if (
                 rel_path not in pending_csharp
                 and rel_path not in pending_nested
                 and rel_path not in remaining_identity
                 and fhash is not None
                 and existing_nodes
-                and existing_nodes[0].file_hash == fhash
+                and existing_hash == fhash
             ):
                 if rel_path not in dependent_files:
                     continue
