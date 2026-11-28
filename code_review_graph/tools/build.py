@@ -231,6 +231,29 @@ def _fts_file_hint(
     return [normalize_file_path(root / path) for path in changed_files]
 
 
+def _files_flows_reach(
+    store: Any,
+    changed_files: list[str],
+    kept_files: list[str] | None,
+    repo_root: str | None,
+) -> list[str]:
+    """*changed_files* less the kept importers no write of the update reached.
+
+    A kept importer's own rows are as stored, so a flow through it traces
+    differently only where an edge or node the flow reads was written, and
+    the flow scope names those files. Without a scope every file is kept.
+    """
+    if not kept_files or repo_root is None:
+        return changed_files
+    root = Path(repo_root)
+    stored = {normalize_file_path(root / rel): rel for rel in kept_files}
+    hits = store.flow_scope_hits(list(stored))
+    if hits is None:
+        return changed_files
+    unreached = {rel for path, rel in stored.items() if path not in hits}
+    return [path for path in changed_files if path not in unreached]
+
+
 def _run_postprocess(
     store: Any,
     build_result: dict[str, Any],
@@ -244,6 +267,7 @@ def _run_postprocess(
     communities_were_affected: bool = False,
     skip_resolvers: bool = False,
     refresh_owed: bool = False,
+    kept_files: list[str] | None = None,
 ) -> list[str]:
     """Run post-build steps based on *postprocess* level.
 
@@ -255,6 +279,10 @@ def _run_postprocess(
 
     *refresh_owed* says the build left the target-resolution refresh to this
     step, which then runs it even where it resolves nothing.
+
+    *kept_files* are the importers among *changed_files* that the update left
+    as stored. Their flows are traced again only where the update's writes
+    reach them (see ``GraphStore.flow_scope_hits``).
 
     Records structured stage durations in ``build_result["postprocess_timing"]``.
     Minimal processing reports ``signatures_s`` and ``fts_s``; full processing
@@ -438,7 +466,7 @@ def _run_postprocess(
 
             count = incremental_trace_flows(
                 store,
-                changed_files or [],
+                _files_flows_reach(store, changed_files or [], kept_files, repo_root),
                 repo_root=repo_root,
                 entry_point_qns=entry_point_qns,
             )
@@ -461,6 +489,7 @@ def _run_postprocess(
         logger.warning("Flow detection failed: %s", e)
         _note_contention(build_result, e)
         warnings.append(f"Flow detection failed: {type(e).__name__}: {e}")
+    store.end_flow_scope()
     timing["flows_s"] = max(
         0.0,
         round(time.perf_counter() - stage_started, 6),
@@ -597,6 +626,7 @@ def build_or_update_graph(
     store = None
     try:
         recovery_reason: str | None = None
+        kept_importers: list[str] = []
         _prepare_db_path(root, db_path)
         store, root = _get_store(
             str(root), db_path=db_path, recover_corrupt=full_rebuild and recover_corrupt
@@ -668,16 +698,22 @@ def build_or_update_graph(
                 # The graph is at the resolvers' fixed point, so the bare
                 # pass after this update only has to revisit what it changes.
                 store.begin_change_capture()
+                if store.get_metadata("postprocess_level") == "full":
+                    # And its flows are traced, so only those the update
+                    # reaches need tracing again.
+                    store.begin_flow_scope()
             try:
                 result = incremental_update(
                     root, store, base=base_resolved, enrich=enrich,
                     follow_symlinks=follow_symlinks, defer_target_refresh=True,
                 )
                 refresh_owed = bool(result.pop("target_refresh_owed", False))
+                kept_importers = result.pop("kept_importers", None) or []
             except RuntimeError as exc:
                 # Nothing was written: stop the capture this update started.
                 store.end_change_capture()
                 store.drop_change_scope()
+                store.end_flow_scope()
                 # Change discovery or root validation failed before anything was
                 # stored; report it the way every other failure is reported.
                 # Nothing was written, so the previous completeness verdict
@@ -837,6 +873,7 @@ def build_or_update_graph(
             entry_point_qns=entry_qns,
             communities_were_affected=communities_affected,
             refresh_owed=refresh_owed,
+            kept_files=kept_importers if changed is not None else None,
         )
         if warnings:
             build_result["warnings"] = warnings

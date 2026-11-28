@@ -4705,6 +4705,153 @@ class GraphStore:
         except sqlite3.Error as exc:  # pragma: no cover - defensive
             logger.debug("Could not drop the certainty capture: %s", exc)
 
+    # -- Which kept files an update reached, for incremental flows -----------
+
+    _FLOW_SCOPE_TRIGGERS = (
+        "crg_flow_edge_del", "crg_flow_edge_upd",
+        "crg_flow_node_ins", "crg_flow_node_del", "crg_flow_node_upd",
+    )
+    _FLOW_SCOPE_TABLES = (
+        "crg_flow_file", "crg_flow_end", "crg_flow_qn", "crg_flow_moved", "crg_flow_kept",
+    )
+
+    def begin_flow_scope(self) -> bool:
+        """Record what the update writes that a stored flow is traced from.
+
+        A flow is a function of the ``CALLS`` and ``TESTED_BY`` edges it walks
+        and of its nodes' names, kinds, files, test flags and decorators.
+        :meth:`flow_scope_hits` later names the files, of a given set, that
+        those writes reached, so an update can leave the flows of the others
+        as stored. Like the bare capture, rows inserted on edges are read by
+        id at the end (a trigger there slows the bulk insert), and the
+        triggers see rows that existed before.
+        """
+        self._flow_scope_floor: Optional[int] = None
+        conn = self._conn
+        try:
+            row = conn.execute(
+                "SELECT seq FROM sqlite_sequence WHERE name = 'edges'"
+            ).fetchone()
+        except sqlite3.Error as exc:
+            logger.debug("Flow scope unavailable: %s", exc)
+            return False
+        floor = int(row[0]) if row else 0
+        file_ins = "INSERT OR IGNORE INTO temp.crg_flow_file VALUES"
+        end_ins = "INSERT OR IGNORE INTO temp.crg_flow_end VALUES"
+
+        def count(ref: str, step: int) -> str:
+            return (
+                f"INSERT INTO temp.crg_flow_qn VALUES ({ref}.qualified_name, {step}) "
+                f"ON CONFLICT(qn) DO UPDATE SET n = n + {step}"
+            )
+
+        statements = [
+            "CREATE TEMP TABLE IF NOT EXISTS crg_flow_file (file_path TEXT PRIMARY KEY)",
+            "CREATE TEMP TABLE IF NOT EXISTS crg_flow_end (qn TEXT PRIMARY KEY)",
+            "CREATE TEMP TABLE IF NOT EXISTS crg_flow_qn "
+            "(qn TEXT PRIMARY KEY, n INTEGER NOT NULL)",
+            "CREATE TEMP TABLE IF NOT EXISTS crg_flow_moved (qn TEXT PRIMARY KEY)",
+            "DELETE FROM temp.crg_flow_file",
+            "DELETE FROM temp.crg_flow_end",
+            "DELETE FROM temp.crg_flow_qn",
+            "DELETE FROM temp.crg_flow_moved",
+            "CREATE TEMP TRIGGER IF NOT EXISTS crg_flow_edge_del AFTER DELETE ON main.edges "
+            f"WHEN OLD.id <= {floor} BEGIN {file_ins} (OLD.file_path); "
+            f"{end_ins} (OLD.source_qualified); {end_ins} (OLD.target_qualified); END",
+            "CREATE TEMP TRIGGER IF NOT EXISTS crg_flow_edge_upd AFTER UPDATE OF "
+            "kind, source_qualified, target_qualified, file_path ON main.edges "
+            f"WHEN OLD.id <= {floor} BEGIN {file_ins} (OLD.file_path); "
+            f"{file_ins} (NEW.file_path); "
+            f"{end_ins} (OLD.source_qualified); {end_ins} (OLD.target_qualified); "
+            f"{end_ins} (NEW.source_qualified); {end_ins} (NEW.target_qualified); END",
+            "CREATE TEMP TRIGGER IF NOT EXISTS crg_flow_node_ins AFTER INSERT ON main.nodes "
+            f"BEGIN {count('NEW', 1)}; END",
+            "CREATE TEMP TRIGGER IF NOT EXISTS crg_flow_node_del AFTER DELETE ON main.nodes "
+            f"BEGIN {count('OLD', -1)}; END",
+            "CREATE TEMP TRIGGER IF NOT EXISTS crg_flow_node_upd AFTER UPDATE OF "
+            "kind, name, qualified_name, file_path, is_test, extra ON main.nodes "
+            f"BEGIN {file_ins} (OLD.file_path); {file_ins} (NEW.file_path); "
+            "INSERT OR IGNORE INTO temp.crg_flow_moved VALUES (OLD.qualified_name); "
+            "INSERT OR IGNORE INTO temp.crg_flow_moved VALUES (NEW.qualified_name); END",
+        ]
+        try:
+            for statement in statements:
+                conn.execute(statement)
+        except sqlite3.Error as exc:
+            logger.debug("Flow scope unavailable: %s", exc)
+            self.end_flow_scope()
+            return False
+        self._flow_scope_floor = floor
+        return True
+
+    def flow_scope_hits(self, file_paths: list[str]) -> Optional[set[str]]:
+        """The *file_paths* whose flows the writes since :meth:`begin_flow_scope` reach.
+
+        A file is reached when an edge it holds was written, or a node it
+        holds is an endpoint of a written edge, or the partner, across any
+        edge, of a node that appeared, disappeared or changed. Flows that
+        touch none of those files trace as stored. None: no scope is on.
+        """
+        floor = getattr(self, "_flow_scope_floor", None)
+        if floor is None:
+            return None
+        conn = self._conn
+        partners = (
+            "SELECT qn FROM temp.crg_flow_qn WHERE n != 0 "
+            "UNION SELECT qn FROM temp.crg_flow_moved"
+        )
+        end_ins = "INSERT OR IGNORE INTO temp.crg_flow_end"
+        try:
+            conn.execute(
+                "CREATE TEMP TABLE IF NOT EXISTS crg_flow_kept (file_path TEXT PRIMARY KEY)"
+            )
+            conn.execute("DELETE FROM temp.crg_flow_kept")
+            conn.executemany(
+                "INSERT OR IGNORE INTO temp.crg_flow_kept VALUES (?)",
+                [(path,) for path in file_paths],
+            )
+            conn.execute(f"{end_ins} {partners}")  # nosec B608
+            conn.execute(
+                f"{end_ins} SELECT source_qualified FROM edges "  # nosec B608
+                f"WHERE target_qualified IN ({partners})"
+            )
+            conn.execute(
+                f"{end_ins} SELECT target_qualified FROM edges "  # nosec B608
+                f"WHERE source_qualified IN ({partners})"
+            )
+            conn.execute(
+                f"{end_ins} SELECT source_qualified FROM edges WHERE id > ? "
+                "UNION SELECT target_qualified FROM edges WHERE id > ?",
+                (floor, floor),
+            )
+            conn.execute(
+                "INSERT OR IGNORE INTO temp.crg_flow_file "
+                "SELECT file_path FROM edges WHERE id > ?",
+                (floor,),
+            )
+            rows = conn.execute(
+                "SELECT k.file_path FROM temp.crg_flow_kept k "
+                "WHERE k.file_path IN (SELECT file_path FROM temp.crg_flow_file) "
+                "OR EXISTS (SELECT 1 FROM nodes n JOIN temp.crg_flow_end q "
+                "ON q.qn = n.qualified_name WHERE n.file_path = k.file_path)"
+            ).fetchall()
+        except sqlite3.Error as exc:
+            logger.debug("Flow scope unreadable: %s", exc)
+            return None
+        return {row[0] for row in rows}
+
+    def end_flow_scope(self) -> None:
+        """Drop the flow scope's triggers and tables."""
+        self._flow_scope_floor = None
+        conn = self._conn
+        try:
+            for trigger in self._FLOW_SCOPE_TRIGGERS:
+                conn.execute(f"DROP TRIGGER IF EXISTS temp.{trigger}")
+            for table in self._FLOW_SCOPE_TABLES:
+                conn.execute(f"DROP TABLE IF EXISTS temp.{table}")
+        except sqlite3.Error as exc:  # pragma: no cover - defensive
+            logger.debug("Could not drop the flow scope: %s", exc)
+
     def end_change_capture(self) -> bool:
         """Stop recording; prepare the dirty sets when a scoped pass is safe.
 

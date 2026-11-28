@@ -492,6 +492,15 @@ _LANGUAGE_ENTRY_NAME_PATTERNS: dict[str, tuple[re.Pattern[str], ...]] = {
 }
 
 
+# The patterns above joined into one alternation each: a name matches the
+# joined pattern exactly when it matches one of them, in one scan.
+_ENTRY_NAME_RE = re.compile("|".join(f"(?:{p.pattern})" for p in _ENTRY_NAME_PATTERNS))
+_LANGUAGE_ENTRY_NAME_RE: dict[str, re.Pattern[str]] = {
+    language: re.compile("|".join(f"(?:{p.pattern})" for p in patterns))
+    for language, patterns in _LANGUAGE_ENTRY_NAME_PATTERNS.items()
+}
+
+
 # ---------------------------------------------------------------------------
 # Entry-point detection
 # ---------------------------------------------------------------------------
@@ -523,13 +532,10 @@ def _has_override_decorator(node: GraphNode) -> bool:
 
 def _matches_entry_name(node: GraphNode) -> bool:
     """Return True if *node*'s name matches a conventional entry-point pattern."""
-    for pat in _ENTRY_NAME_PATTERNS:
-        if pat.search(node.name):
-            return True
-    for pat in _LANGUAGE_ENTRY_NAME_PATTERNS.get(node.language, ()):
-        if pat.search(node.name):
-            return True
-    return False
+    if _ENTRY_NAME_RE.search(node.name):
+        return True
+    language = _LANGUAGE_ENTRY_NAME_RE.get(node.language)
+    return language is not None and language.search(node.name) is not None
 
 
 def detect_entry_points(
@@ -1154,9 +1160,12 @@ def compute_criticality(flow: dict, adj: FlowAdjacency) -> float:
 
 def _security_sensitive(name: str, qualified_name: str) -> bool:
     """Whether a security keyword is in a node's name or qualified name."""
-    name_lower = name.lower()
-    qn_lower = qualified_name.lower()
-    return any(kw in name_lower or kw in qn_lower for kw in _SECURITY_KEYWORDS)
+    search = _SECURITY_KEYWORD_RE.search
+    return search(name.lower()) is not None or search(qualified_name.lower()) is not None
+
+
+# One alternation of the keywords answers "is any keyword a substring" in one scan.
+_SECURITY_KEYWORD_RE = re.compile("|".join(sorted(map(re.escape, _SECURITY_KEYWORDS))))
 
 
 def _criticality_score(
@@ -1250,7 +1259,9 @@ def store_flows(store: GraphStore, flows: list[dict]) -> int:
             )
             count += 1
         if membership_rows:
-            conn.executemany(
+            # The rows are integers only, so the path translation has nothing to do.
+            sqlite3.Connection.executemany(
+                conn,
                 "INSERT OR IGNORE INTO flow_memberships (flow_id, node_id, position) "
                 "VALUES (?, ?, ?)",
                 membership_rows,
@@ -1451,7 +1462,9 @@ def incremental_trace_flows(
                 )
                 count += 1
             if membership_rows:
-                conn.executemany(
+                # The rows are integers only, so the path translation has nothing to do.
+                sqlite3.Connection.executemany(
+                    conn,
                     "INSERT OR IGNORE INTO flow_memberships (flow_id, node_id, position) "
                     "VALUES (?, ?, ?)",
                     membership_rows,

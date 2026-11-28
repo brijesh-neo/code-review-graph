@@ -1047,27 +1047,35 @@ def incremental_detect_communities(
 
     from .flows import expand_changed_file_paths
 
-    expanded = expand_changed_file_paths(store, changed_files, repo_root=repo_root)
     conn = store._conn
 
-    # Check if any communities are affected (batch to stay under SQLite limit)
-    affected_count = 0
-    unassigned_count = 0
-    for i in range(0, len(expanded), _SQL_BATCH):
-        batch = expanded[i:i + _SQL_BATCH]
-        placeholders = ",".join("?" * len(batch))
-        row = conn.execute(
-            f"SELECT COUNT(DISTINCT community_id), "  # nosec B608
-            f"SUM(CASE WHEN community_id IS NULL AND kind != 'File' "
-            f"THEN 1 ELSE 0 END) FROM nodes "
-            f"WHERE file_path IN ({placeholders})",
-            batch,
-        ).fetchone()
-        if row:
-            affected_count += row[0] or 0
-            unassigned_count += row[1] or 0
+    # Check if any communities are affected. The paths are expanded and
+    # checked a slice at a time, the changed files (listed first) before their
+    # dependents, and the first slice that holds a community answers.
+    affected = force
+    paths = list(changed_files)
+    step = 64
+    for start in range(0, len(paths), step):
+        if affected:
+            break
+        expanded = expand_changed_file_paths(
+            store, paths[start:start + step], repo_root=repo_root,
+        )
+        for i in range(0, len(expanded), _SQL_BATCH):
+            batch = expanded[i:i + _SQL_BATCH]
+            placeholders = ",".join("?" * len(batch))
+            row = conn.execute(
+                f"SELECT COUNT(DISTINCT community_id), "  # nosec B608
+                f"SUM(CASE WHEN community_id IS NULL AND kind != 'File' "
+                f"THEN 1 ELSE 0 END) FROM nodes "
+                f"WHERE file_path IN ({placeholders})",
+                batch,
+            ).fetchone()
+            if row and (row[0] or row[1]):
+                affected = True
+                break
 
-    if not force and affected_count == 0 and unassigned_count == 0:
+    if not affected:
         return 0  # No communities affected, skip
 
     # Re-run full community detection (correct and fast enough)

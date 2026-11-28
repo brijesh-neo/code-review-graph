@@ -5074,6 +5074,8 @@ def incremental_update(
         "total_edges": total_edges,
         "changed_files": list(changed_files),
         "dependent_files": list(dependent_files),
+        # Internal: importers left as stored, which ``build`` pops.
+        "kept_importers": kept_importers,
         "stale_files_removed": len(stale_files),
         "flow_entry_point_qns": flow_entry_point_qns,
         "communities_were_affected": communities_were_affected,
