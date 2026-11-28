@@ -341,12 +341,15 @@ def test_three_level_reexport_chain_keeps_callers(tmp_path):
         store.close()
 
 
-def test_python_reexport_rename_matches_full_build(tmp_path):
+def test_python_reexport_rename_matches_full_build(tmp_path, monkeypatch):
     """Neighbouring language: Python aliases resolve through the same update.
 
     Python resolves ``charge`` to ``pkg/barrel.py::charge``, so parity alone
-    holds even without the fix; the re-parse count is what pins it here.
+    holds even without the fix; the re-parse count is what pins it here. The
+    count is the legacy update's: with ``CRG_FAST_ENGINE`` an importer whose
+    parse cannot change keeps its rows.
     """
+    monkeypatch.delenv('CRG_FAST_ENGINE', raising=False)
     files = {
         'pkg/__init__.py': '',
         'pkg/fee.py': 'def calculate_fee(n):\n    return n + 2\n',

@@ -22,7 +22,7 @@ import unicodedata
 import uuid
 from collections import deque
 from contextlib import nullcontext
-from functools import partial, wraps
+from functools import lru_cache, partial, wraps
 from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING, Any, Callable, Iterable, Iterator, NamedTuple, Optional
 
@@ -30,6 +30,8 @@ from . import install_plan
 from .build_state import advance_to_postprocess_pending
 from .constants import GIT_TIMEOUT as _GIT_TIMEOUT
 from .constants import (
+    IMPORT_CONTEXT_DEFERRED,
+    IMPORT_CONTEXT_KEY,
     discovery_timeout,
     env_float,
     env_int,
@@ -871,22 +873,41 @@ def _load_ignore_patterns(repo_root: Path) -> list[str]:
     return patterns
 
 
-def _should_ignore(path: str, patterns: list[str]) -> bool:
-    """Check if a path matches any ignore pattern.
+def _relative_posix(path: Path, root: Path) -> str:
+    """``path.relative_to(root).as_posix()``, raising ``ValueError`` alike.
 
-    ``**/<dir>/**`` and unanchored single-directory patterns match at any
-    depth. A leading slash anchors a pattern to the repository root.
+    ``str`` of a path is already normalised, so on POSIX a path below *root*
+    is spelled as *root*, a slash and the rest; anything else is left to
+    pathlib.
     """
-    normalized = path.replace("\\", "/").lstrip("/")
-    parts = PurePosixPath(normalized).parts
+    if os.name == "posix":
+        text, base = str(path), str(root)
+        if base != "/" and text.startswith(base) and text[len(base):len(base) + 1] == "/":
+            return text[len(base) + 1:]
+    return path.relative_to(root).as_posix()
+
+
+class _IgnoreMatcher(NamedTuple):
+    segments: frozenset[str]
+    prefixes: tuple[tuple[str, ...], ...]
+    globs: tuple[str, ...]
+    glob_match: Callable[[str], Any] | None
+
+
+@lru_cache(maxsize=64)
+def _ignore_matcher(patterns: tuple[str, ...]) -> _IgnoreMatcher:
+    """*patterns* sorted by kind once, for :func:`_should_ignore`."""
+    segments: set[str] = set()
+    prefixes: list[tuple[str, ...]] = []
+    globs: list[str] = []
     for pattern in patterns:
         anchored = pattern.startswith("/")
         candidate = pattern[1:] if anchored else pattern
 
         if candidate.startswith("**/") and candidate.endswith("/**"):
             segment = candidate[3:-3]
-            if segment and segment in parts:
-                return True
+            if segment:
+                segments.add(segment)
             continue
 
         if candidate.endswith("/**"):
@@ -894,15 +915,43 @@ def _should_ignore(path: str, patterns: list[str]) -> bool:
             if not prefix:
                 continue
             if anchored or len(prefix) > 1:
-                if parts[: len(prefix)] == prefix:
-                    return True
-            elif prefix[0] in parts:
-                return True
+                prefixes.append(prefix)
+            else:
+                segments.add(prefix[0])
             continue
 
-        if fnmatch.fnmatch(normalized, candidate):
+        globs.append(candidate)
+    # ``fnmatch`` matches each translated pattern whole; on POSIX it does not
+    # change the case or the separators, so one alternation answers for all.
+    glob_match = None
+    if globs and os.name == "posix":
+        glob_match = re.compile(
+            "|".join(f"(?:{fnmatch.translate(glob)})" for glob in globs)
+        ).match
+    return _IgnoreMatcher(frozenset(segments), tuple(prefixes), tuple(globs), glob_match)
+
+
+def _should_ignore(path: str, patterns: list[str]) -> bool:
+    """Check if a path matches any ignore pattern.
+
+    ``**/<dir>/**`` and unanchored single-directory patterns match at any
+    depth. A leading slash anchors a pattern to the repository root.
+    """
+    matcher = _ignore_matcher(tuple(patterns))
+    normalized = path.replace("\\", "/").lstrip("/")
+    split = normalized.split("/")
+    parts = (
+        tuple(split) if "" not in split and "." not in split
+        else PurePosixPath(normalized).parts
+    )
+    if matcher.segments and not matcher.segments.isdisjoint(parts):
+        return True
+    for prefix in matcher.prefixes:
+        if parts[: len(prefix)] == prefix:
             return True
-    return False
+    if matcher.glob_match is not None:
+        return matcher.glob_match(normalized) is not None
+    return any(fnmatch.fnmatch(normalized, glob) for glob in matcher.globs)
 
 
 def _child_directories(directory: Path) -> list[tuple[str, bool]]:
@@ -1055,6 +1104,22 @@ _RECURSE_SUBMODULES = os.environ.get("CRG_RECURSE_SUBMODULES", "").lower() in ("
 
 def _git_branch_info(repo_root: Path) -> tuple[str, str]:
     """Return (branch_name, head_sha) for the current repo state."""
+    # One process answers both when HEAD names a commit; anything else (an
+    # unborn branch, a failure) falls back to asking for each on its own.
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "HEAD", "--abbrev-ref", "HEAD"],
+            capture_output=True,
+            text=True, encoding='utf-8', errors='replace',
+            cwd=str(repo_root),
+            timeout=_GIT_TIMEOUT,
+            stdin=subprocess.DEVNULL,
+        )
+        lines = result.stdout.split("\n")
+        if result.returncode == 0 and len(lines) == 3 and lines[2] == "":
+            return lines[1].strip(), lines[0].strip()
+    except (subprocess.TimeoutExpired, FileNotFoundError, UnicodeDecodeError):
+        pass
     branch = ""
     sha = ""
     try:
@@ -1470,7 +1535,7 @@ def _find_content_mismatches(
         if not path.is_absolute():
             path = repo_root / path
         try:
-            relative_path = path.relative_to(repo_root).as_posix()
+            relative_path = _relative_posix(path, repo_root)
             raw = path.read_bytes()
             current_hash = hashlib.sha256(raw).hexdigest()
             current_hashes[relative_path] = current_hash
@@ -2717,7 +2782,10 @@ def _reconcile_stale_files(
         for stored_file in stored_files:
             path = Path(stored_file)
             try:
-                relative = str(path.relative_to(repo_root))
+                relative = (
+                    _relative_posix(path, repo_root) if os.name == "posix"
+                    else str(path.relative_to(repo_root))
+                )
             except ValueError:
                 continue
             parent = os.path.dirname(relative)
@@ -2842,6 +2910,12 @@ _MAX_DEPENDENT_FILES = 500
 # Dependents whose edges are re-saved per transaction. Each commit holds the
 # write lock only for its own batch, so other writers still get turns.
 _EDGE_WRITE_BATCH = 64
+# Files grouped_writes() commits together during an update (CRG_FAST_ENGINE).
+_GROUPED_WRITE_FILES = 256
+# Share of the edge rows an update must replace before it writes them with the
+# edge indexes dropped (CRG_FAST_ENGINE): rebuilding the indexes costs about
+# what updating them for 40% of the rows does.
+_BULK_EDGE_SHARE = 0.5
 
 
 def _single_hop_dependents(store: GraphStore, file_path: str) -> set[str]:
@@ -2989,6 +3063,7 @@ def find_dependents(
     store: GraphStore,
     file_path: str,
     max_hops: int = _MAX_DEPENDENT_HOPS,
+    _batched: bool = True,
 ) -> DependentList:
     """Find files that import from or depend on the given file.
 
@@ -2999,22 +3074,39 @@ def find_dependents(
     carries a ``.truncated`` flag.  When ``truncated is True`` the
     returned list is capped at ``_MAX_DEPENDENT_FILES`` and the full
     set of dependents was not explored.  See issue #261.
+
+    A hop over several files asks the store once for all of them. That gives
+    the same set as one query per file, but the set keeps its members in
+    another order, and a capped list is the first ``_MAX_DEPENDENT_FILES``
+    of that order. So a walk that reaches the cap is run again one file at a
+    time, which keeps the files it returns.
     """
     all_dependents: set[str] = set()
     visited: set[str] = {file_path}
     frontier: set[str] = {file_path}
     for _hop in range(max_hops):
         next_frontier: set[str] = set()
-        for fp in frontier:
-            deps = _single_hop_dependents(store, fp)
-            new_deps = deps - visited
-            all_dependents.update(new_deps)
-            next_frontier.update(new_deps)
+        if (
+            _batched and len(frontier) > 1
+            and all(normalize_file_path(fp) == fp for fp in frontier)
+        ):
+            # Each path is its own normal form, so the per-file answers drop
+            # only spellings already visited: their union is the batch's.
+            next_frontier = store.get_direct_dependent_files_of_all(sorted(frontier)) - visited
+            all_dependents.update(next_frontier)
+        else:
+            for fp in frontier:
+                deps = _single_hop_dependents(store, fp)
+                new_deps = deps - visited
+                all_dependents.update(new_deps)
+                next_frontier.update(new_deps)
         visited.update(next_frontier)
         frontier = next_frontier
         if not frontier:
             break
         if len(all_dependents) > _MAX_DEPENDENT_FILES:
+            if _batched:
+                return find_dependents(store, file_path, max_hops, _batched=False)
             logger.warning(
                 "Dependent expansion capped at %d files for %s",
                 len(all_dependents),
@@ -3028,15 +3120,21 @@ def find_dependents(
 
 
 def _parse_single_file(
-    args: tuple[str, str],
+    args: tuple[str, ...],
 ) -> tuple[str, list, list, str | None, str]:
     """Parse one file in a process- or thread-pool worker.
+
+    *args* is ``(rel_path, repo_root)``, optionally followed by the directory
+    and fingerprint a build saves comparison summaries under (see
+    :func:`_save_build_summary`).
 
     Returns ``(rel_path, nodes, edges, error_or_none, file_hash)``.
     Must be a module-level function so ``ProcessPoolExecutor`` can
     serialise it across processes.
     """
-    rel_path, repo_root_str = args
+    rel_path, repo_root_str = args[0], args[1]
+    summary_dir = args[2] if len(args) > 2 else None
+    fingerprint = args[3] if len(args) > 3 else None
     abs_path = Path(repo_root_str) / rel_path
     try:
         raw = abs_path.read_bytes()
@@ -3047,15 +3145,49 @@ def _parse_single_file(
             parser = _get_code_parser_cls()(Path(repo_root_str))
             _PARSE_WORKER_STATE.parser = parser
             _PARSE_WORKER_STATE.repo_root = repo_root_str
+            if summary_dir is not None and fingerprint is not None:
+                parser.use_python_skeletons(
+                    Path(summary_dir).parent / _MODULE_FACT_DIR, fingerprint,
+                )
+            if summary_dir is not None:
+                from .parser import use_parser_probe_record
+
+                use_parser_probe_record(Path(summary_dir).parent / _PARSER_PROBE_RECORD_NAME)
         nodes, edges = parser.parse_bytes(abs_path, raw)
+        if summary_dir is not None:
+            _save_build_summary(
+                parser, abs_path, raw, fhash, Path(summary_dir), fingerprint, nodes, edges,
+            )
         return (rel_path, nodes, edges, None, fhash)
     except Exception as e:
         return (rel_path, [], [], str(e), "")
 
 
+def _save_build_summary(
+    parser: Any, abs_path: Path, source: bytes, file_hash: str,
+    copy_dir: Path, fingerprint: str | None, nodes: list, edges: list,
+) -> None:
+    """Save the comparison summary of a Python file a build just parsed.
+
+    It is what :func:`_changed_symbol_names` computes for these bytes, so the
+    first update of the file after the build reads it instead of parsing the
+    stored bytes again. Only the summary is lost on failure.
+    """
+    if not abs_path.name.endswith(".py") or fingerprint is None or abs_path.is_symlink():
+        return
+    try:
+        view = parser.python_importer_view(abs_path, source)
+        own = normalize_file_path(abs_path.resolve())
+        summary = json.loads(json.dumps(_comparison_summary(view, nodes, edges, own)))
+    except Exception as exc:  # noqa: BLE001 - the update parses the bytes instead
+        logger.debug("No build summary for %s: %s", abs_path, exc)
+        return
+    _write_summary(copy_dir, file_hash, fingerprint, summary)
+
+
 
 def _parse_chunk_sharing_caches(
-    args_chunk: list[tuple[str, str]],
+    args_chunk: list[tuple[str, ...]],
     seed: list,
 ) -> tuple[list, int, list]:
     """Parse *args_chunk* in a process worker that shares its module caches.
@@ -3076,25 +3208,25 @@ def _parse_chunk_sharing_caches(
 
 
 def _shared_parse_chunks(
-    args_list: list[tuple[str, str]],
+    args_list: list[tuple[str, ...]],
     chunksize: int,
     workers: int,
-) -> tuple[list[list[tuple[str, str]]], list[int]]:
+) -> tuple[list[list[tuple[str, ...]]], list[int]]:
     """Split *args_list* into ordered chunks; a very large file gets its own.
 
     Returns the chunks and the indexes of the single-file chunks whose file
     holds more than a ``workers * 4``-th of all the bytes.
     """
     sizes = []
-    for rel_path, repo_root_str in args_list:
+    for args in args_list:
         try:
-            sizes.append((Path(repo_root_str) / rel_path).stat().st_size)
+            sizes.append((Path(args[1]) / args[0]).stat().st_size)
         except OSError:
             sizes.append(0)
     limit = max(1, sum(sizes) // (workers * 4))
-    chunks: list[list[tuple[str, str]]] = []
+    chunks: list[list[tuple[str, ...]]] = []
     heavy: list[int] = []
-    current: list[tuple[str, str]] = []
+    current: list[tuple[str, ...]] = []
     for args, size in zip(args_list, sizes):
         if size > limit:
             if current:
@@ -3114,7 +3246,7 @@ def _shared_parse_chunks(
 
 def _parse_sharing_caches(
     executor: concurrent.futures.Executor,
-    args_list: list[tuple[str, str]],
+    args_list: list[tuple[str, ...]],
     chunksize: int,
     workers: int,
 ) -> Iterator[tuple[str, list, list, str | None, str]]:
@@ -3197,7 +3329,7 @@ def _parse_sharing_caches(
 
 def _parse_results(
     executor: concurrent.futures.Executor,
-    args_list: list[tuple[str, str]],
+    args_list: list[tuple[str, ...]],
     chunksize: int,
 ) -> Iterator[tuple[str, list, list, str | None, str]]:
     """Parse *args_list* on *executor*, sharing module caches under the fast engine."""
@@ -3235,8 +3367,14 @@ def full_build(
     recurse_submodules: bool | None = None,
     enrich: bool | None = None,
     follow_symlinks: bool | None = None,
+    *,
+    defer_target_refresh: bool = False,
 ) -> dict:
     """Full rebuild of the entire graph.
+
+    *defer_target_refresh* leaves the target-resolution refresh to a caller
+    that runs it after its own resolver passes, and says so with
+    ``target_refresh_owed`` in the result.
 
     Args:
         repo_root: Repository root directory.
@@ -3286,6 +3424,20 @@ def full_build(
     # indexes dropped and rebuilds them once at the end.
     from .parser import fast_engine_enabled
 
+    # Under the native engine the build saves the comparison summary of each
+    # Python file it parses, so the first update of that file reads it instead
+    # of parsing the stored bytes again.
+    summary_args: tuple[str, ...] = ()
+    copy_dir = _source_copy_dir(store, repo_root) if fast_engine_enabled() else None
+    if copy_dir is not None:
+        fingerprint = _summary_fingerprint(repo_root)
+        if fingerprint is not None:
+            summary_args = (str(copy_dir), fingerprint)
+            parser.use_python_skeletons(copy_dir.parent / _MODULE_FACT_DIR, fingerprint)
+        from .parser import use_parser_probe_record
+
+        use_parser_probe_record(copy_dir.parent / _PARSER_PROBE_RECORD_NAME)
+
     with store.bulk_edge_load() if fast_engine_enabled() else nullcontext():
         if use_serial or file_count < 8:
             # Serial fallback (for debugging or tiny repos)
@@ -3296,6 +3448,11 @@ def full_build(
                     source = full_path.read_bytes()
                     fhash = hashlib.sha256(source).hexdigest()
                     nodes, edges = parser.parse_bytes(full_path, source)
+                    if summary_args:
+                        _save_build_summary(
+                            parser, full_path, source, fhash, Path(summary_args[0]),
+                            summary_args[1], nodes, edges,
+                        )
                     _relink_edges(edges, repo_root, followed_dirs)
                     parsed = (nodes, edges, fhash)
                 except (OSError, PermissionError) as e:
@@ -3330,7 +3487,7 @@ def full_build(
             # orphan workers (issues #46, #136, PR #615). Override via
             # CRG_PARSE_EXECUTOR env.
             _prewarm_parser_probes(parser, files)
-            args_list = [(rel_path, str(repo_root)) for rel_path in files]
+            args_list = [(rel_path, str(repo_root), *summary_args) for rel_path in files]
             with _make_executor(_MAX_PARSE_WORKERS) as executor:
                 for i, (rel_path, nodes, edges, error, fhash) in enumerate(
                     _parse_results(executor, args_list, 4),
@@ -3386,7 +3543,8 @@ def full_build(
     scoped_stats = _run_scoped_resolver(store, repo_root)
     jedi_stats = _run_jedi_enrichment(store, repo_root, enrich=enrich)
     _relink_stored_edges(store, repo_root, followed_dirs)
-    _refresh_target_resolution(store)
+    if not defer_target_refresh:
+        _refresh_target_resolution(store)
     store.set_metadata(_DEPENDENTS_PENDING_KEY, "[]")
     # Storing is over: every file that could be parsed has its rows. Recorded
     # before the anchor and before post-processing, so a process killed from
@@ -3397,11 +3555,13 @@ def full_build(
     # anchor still describes the commit the stored files were parsed at.
     _store_vcs_metadata(repo_root, store)
     store.commit()
+    _prune_source_copies(store, _source_copy_dir(store, repo_root))
     # A full build rewrites most rows; an incremental update does not move the
     # table sizes enough to need this.
     store.refresh_planner_stats()
 
     return {
+        "target_refresh_owed": defer_target_refresh,
         "files_parsed": len(files),
         "stale_files_removed": len(stale_files),
         "total_nodes": total_nodes,
@@ -3446,19 +3606,131 @@ _IMPORTER_VISIBLE_EDGE_KINDS = frozenset({
 # Past this many changed symbol names, matching them against the importers'
 # edges stops paying off; every importer is re-parsed instead.
 _MAX_CHANGED_SYMBOL_NAMES = 64
-# A wildcard import anywhere in the text, comments included: such a file reads
-# every public name of the module it imports from.
-_WILDCARD_IMPORT_RE = re.compile(rb"\bimport\s*\*")
+# A wildcard import statement: such a file reads every public name of the
+# module it imports from. One that starts a line, or follows ``:`` or ``;``,
+# counts, even inside a comment or a string; ``from`` mid-sentence does not.
+_WILDCARD_IMPORT_RE = re.compile(
+    rb"(?:^|[:;])[ \t\f]*from[\s\\]+[^\s\\]+[\s\\]+import[\s\\]*\*", re.MULTILINE,
+)
 
 
-def _committed_bytes(repo_root: Path, rel_path: str, file_hash: str) -> bytes | None:
+# Copies of the Python sources an update stored, named by their sha256, in
+# this directory next to graph.db. The next update of the same file reads the
+# old bytes back from here when Git does not have them (the file was saved
+# again before a commit), instead of re-parsing every importer.
+_SOURCE_COPY_DIR = "source-copies"
+# In the data dir: the grammar loads whose crash probe passed (see
+# ``parser.use_parser_probe_record``).
+_PARSER_PROBE_RECORD_NAME = "parser-probes.json"
+# In the data dir, beside the copies: facts read from Python modules (their
+# skeleton, property and return annotations) keyed by the module's sha256, so
+# an update reads them instead of parsing every module a changed file imports.
+_MODULE_FACT_DIR = "module-facts"
+_SHA256_HEX_RE = re.compile(r"[0-9a-f]{64}")
+_GIT_COMMIT_RE = re.compile(r"[0-9a-f]{40}|[0-9a-f]{64}")
+
+
+def _source_copy_dir(store: GraphStore, repo_root: Path) -> Path | None:
+    """Where copies are kept, or None when the graph is not in its data dir.
+
+    Only the repository's own data directory (which ignores its contents) may
+    hold them; a database opened anywhere else, perhaps inside the working
+    tree, gets no copies and the update reads old bytes from Git alone.
+    """
+    db_path = Path(store.db_path)
+    try:
+        data_dir = get_data_dir(Path(repo_root), create=False)
+        if db_path.name != "graph.db" or db_path.parent.resolve() != data_dir.resolve():
+            return None
+    except (OSError, ValueError) as exc:
+        logger.debug("No source copies for %s: %s", db_path, exc)
+        return None
+    return db_path.parent / _SOURCE_COPY_DIR
+
+
+def _read_source_copy(copy_dir: Path | None, file_hash: str) -> bytes | None:
+    """The copy of the bytes whose sha256 is *file_hash*, if one is kept."""
+    if copy_dir is None or not _SHA256_HEX_RE.fullmatch(file_hash or ""):
+        return None
+    try:
+        data = (copy_dir / file_hash).read_bytes()
+    except OSError:
+        return None
+    return data if hashlib.sha256(data).hexdigest() == file_hash else None
+
+
+def _save_source_copies(
+    store: GraphStore, repo_root: Path, stored: dict[str, str],
+) -> None:
+    """Keep the bytes of the Python files in *stored* (path to stored hash).
+
+    Then drop every copy whose hash no file in the graph holds any more. A
+    copy only spares a later update work, so a failure here is logged and
+    the update goes on.
+    """
+    copy_dir = _source_copy_dir(store, repo_root)
+    if copy_dir is None:
+        return
+    wanted = {
+        rel_path: file_hash for rel_path, file_hash in stored.items()
+        if rel_path.endswith(".py") and _SHA256_HEX_RE.fullmatch(file_hash or "")
+    }
+    if not wanted and not copy_dir.is_dir():
+        return
+    try:
+        copy_dir.mkdir(exist_ok=True)
+        for rel_path, file_hash in sorted(wanted.items()):
+            target = copy_dir / file_hash
+            if target.is_file():
+                continue
+            data = (repo_root / rel_path).read_bytes()
+            if hashlib.sha256(data).hexdigest() != file_hash:
+                continue  # Changed again since it was parsed.
+            partial_path = copy_dir / f".{file_hash}.{uuid.uuid4().hex}.tmp"
+            partial_path.write_bytes(data)
+            os.replace(partial_path, target)
+        _prune_source_copies(store, copy_dir)
+    except OSError as exc:
+        logger.warning("Keeping source copies in %s failed: %s", copy_dir, exc)
+
+
+def _prune_source_copies(store: GraphStore, copy_dir: Path | None) -> None:
+    """Delete the kept copies and module facts whose hash no file holds."""
+    if copy_dir is None:
+        return
+    dirs = [d for d in (copy_dir, copy_dir.parent / _MODULE_FACT_DIR) if d.is_dir()]
+    if not dirs:
+        return
+    held = {
+        row[0] for row in store._conn.execute(
+            "SELECT file_hash FROM nodes WHERE kind = 'File'"
+        )
+    }
+    for directory in dirs:
+        try:
+            for entry in directory.iterdir():
+                # ``<hash>`` and ``<hash>.<kind>`` go with the file that holds it.
+                if entry.name.split(".", 1)[0] not in held:
+                    entry.unlink()
+        except OSError as exc:
+            logger.warning("Pruning kept files in %s failed: %s", directory, exc)
+
+
+def _committed_bytes(
+    repo_root: Path, rel_path: str, file_hash: str, copy_dir: Path | None = None,
+    stored_commit: str | None = None,
+) -> bytes | None:
     """The bytes the graph holds for *rel_path*, read back from Git.
 
-    HEAD first, then the index. Only a blob whose sha256 equals the stored
-    *file_hash* counts, so a graph built from bytes Git does not have gets
-    None.
+    The commit the graph was last synced to (*stored_commit*, which holds them
+    once a new commit lands), then HEAD, then the index, then the copy an
+    update kept in *copy_dir*. Only bytes whose sha256 equals the stored
+    *file_hash* count, so a graph built from bytes none of them has gets None.
     """
-    for spec in (f"HEAD:./{rel_path}", f":./{rel_path}"):
+    specs = [f"HEAD:./{rel_path}", f":./{rel_path}"]
+    if stored_commit and _GIT_COMMIT_RE.fullmatch(stored_commit):
+        specs.insert(0, f"{stored_commit}:./{rel_path}")
+    for spec in specs:
         try:
             result = subprocess.run(
                 ["git", "cat-file", "blob", spec],
@@ -3473,7 +3745,7 @@ def _committed_bytes(repo_root: Path, rel_path: str, file_hash: str) -> bytes | 
             and hashlib.sha256(result.stdout).hexdigest() == file_hash
         ):
             return result.stdout
-    return None
+    return _read_source_copy(copy_dir, file_hash)
 
 
 def _node_shape(node: Any) -> tuple:
@@ -3492,18 +3764,288 @@ def _edge_shape(edge: Any) -> tuple:
     )
 
 
+# What a comparison reads of one version of a module, saved beside its source
+# copy as ``<sha256>.summary`` so the next update of the file need not parse
+# the stored bytes again. Only a summary written by this very code (and this
+# repository's custom-language config) is read back.
+_SUMMARY_SUFFIX = ".summary"
+_SUMMARY_VERSION = 4
+_CODE_FINGERPRINT: str | None = None
+_CODE_FINGERPRINT_LOCK = threading.Lock()
+
+
+def _code_fingerprint() -> str:
+    """sha256 of this package's Python sources and the native extension."""
+    global _CODE_FINGERPRINT
+    with _CODE_FINGERPRINT_LOCK:
+        if _CODE_FINGERPRINT is None:
+            digest = hashlib.sha256()
+            package = Path(__file__).resolve().parent
+            files = sorted(package.rglob("*.py"))
+            try:
+                import importlib.util
+
+                spec = importlib.util.find_spec("crg_fast")
+                if spec is not None and spec.origin:
+                    files += sorted(Path(spec.origin).parent.glob("*.so"))
+                    files += sorted(Path(spec.origin).parent.glob("*.pyd"))
+            except (ImportError, ValueError) as exc:
+                logger.debug("Locating crg_fast failed: %s", exc)
+            for path in files:
+                digest.update(str(path).encode("utf-8", "surrogatepass") + b"\0")
+                digest.update(hashlib.sha256(path.read_bytes()).digest())
+            _CODE_FINGERPRINT = digest.hexdigest()
+        return _CODE_FINGERPRINT
+
+
+def _summary_fingerprint(repo_root: Path) -> str | None:
+    try:
+        digest = hashlib.sha256(_code_fingerprint().encode())
+        config = Path(repo_root) / ".code-review-graph" / "languages.toml"
+        digest.update(config.read_bytes() if config.is_file() else b"\0none")
+    except OSError as exc:
+        logger.debug("No summary fingerprint for %s: %s", repo_root, exc)
+        return None
+    return digest.hexdigest()
+
+
+def _tagged(value: Any) -> Any:
+    """*value* as JSON that two values share only when they are equal."""
+    if value is None or isinstance(value, str):
+        return value
+    if isinstance(value, bool):
+        return {"b": value}
+    if isinstance(value, int):
+        return {"i": value}
+    if isinstance(value, float):
+        return {"f": repr(value)}
+    if isinstance(value, tuple):
+        return {"t": [_tagged(item) for item in value]}
+    if isinstance(value, list):
+        return {"l": [_tagged(item) for item in value]}
+    if isinstance(value, (set, frozenset)):
+        return {"s": sorted(_canonical_json(item) for item in value)}
+    if isinstance(value, dict):
+        pairs = [[_canonical_json(key), _tagged(item)] for key, item in value.items()]
+        return {"d": sorted(pairs, key=lambda pair: pair[0])}
+    raise TypeError(f"no canonical form for {type(value).__name__}")
+
+
+def _canonical_json(value: Any) -> str:
+    return json.dumps(_tagged(value), sort_keys=True, separators=(",", ":"))
+
+
+def _comparison_summary(view: tuple, nodes: list, edges: list, own: str) -> dict:
+    """What :func:`_changed_symbol_names` compares of one version of a module.
+
+    Names the module defines itself resolve to the module whether or not it
+    exports them, so outside a wildcard import only the names it re-exports
+    from elsewhere count among what importers read; the local ones are kept
+    apart.
+    """
+    exports = view[3] or {}
+    foreign = {name: origin for name, origin in exports.items() if origin != own}
+    local = sorted(name for name, origin in exports.items() if origin == own)
+    if not all(isinstance(name, str) for name in local):
+        raise TypeError("export names are not strings")
+    records = []
+    for node in nodes:
+        shape = _node_shape(node)
+        if not (
+            isinstance(shape[0], str) and isinstance(shape[1], str)
+            and isinstance(shape[2], str) and isinstance(node.line_start, int)
+        ):
+            raise TypeError("node kind, name or parent is not a string")
+        records.append([shape[0], shape[1], shape[2], node.line_start, _canonical_json(shape)])
+    # An importer reads a return or property annotation only under the name
+    # its own source writes for the callee or the attribute, so each entry
+    # goes with that name and only importers that spell it are re-parsed.
+    annotated = [
+        [name, _canonical_json(("return", name, annotation))]
+        for name, annotation in (view[2] or {}).items()
+    ] + [
+        [key[1], _canonical_json(("property", key, annotation))]
+        for key, annotation in (view[1] or {}).items()
+    ]
+    if not all(isinstance(token, str) for token, _entry in annotated):
+        raise TypeError("annotated names are not strings")
+    properties = sorted(
+        [key[1], annotation] for key, annotation in (view[1] or {}).items()
+    )
+    if not all(isinstance(a, str) and isinstance(b, str) for a, b in properties):
+        raise TypeError("property names or annotations are not strings")
+    identities = None if view[0] is None else sorted(
+        [name, _canonical_json(identity)] for name, identity in view[0].items()
+    )
+    foreign_pairs = sorted([name, _canonical_json(origin)] for name, origin in foreign.items())
+    if not all(
+        isinstance(name, str) for name, _value in (identities or []) + foreign_pairs
+    ):
+        raise TypeError("imported names are not strings")
+    return {
+        "imports": _canonical_json(((view[0], view[4]), foreign)),
+        # The parts of "imports", for telling which names a difference touches.
+        "identities": identities,
+        "foreign": foreign_pairs,
+        "alias": _canonical_json(view[4]),
+        "properties": properties,
+        "annotated": sorted(annotated),
+        "local": local,
+        "visible": sorted(
+            _canonical_json(_edge_shape(edge)) for edge in edges
+            if edge.kind in _IMPORTER_VISIBLE_EDGE_KINDS
+        ),
+        "nodes": records,
+    }
+
+
+def _string_pairs(value: Any) -> bool:
+    return isinstance(value, list) and all(
+        isinstance(entry, list) and len(entry) == 2
+        and all(isinstance(part, str) for part in entry)
+        for entry in value
+    )
+
+
+def _valid_summary(summary: Any) -> bool:
+    if not isinstance(summary, dict):
+        return False
+    if not (
+        isinstance(summary.get("imports"), str) and isinstance(summary.get("visible"), list)
+        and isinstance(summary.get("local"), list) and isinstance(summary.get("nodes"), list)
+    ):
+        return False
+    if not all(isinstance(name, str) for name in summary["local"]):
+        return False
+    if not all(isinstance(entry, str) for entry in summary["visible"]):
+        return False
+    if not isinstance(summary.get("alias"), str):
+        return False
+    identities = summary.get("identities")
+    if identities is not None and not _string_pairs(identities):
+        return False
+    if not (_string_pairs(summary.get("foreign")) and _string_pairs(summary.get("properties"))):
+        return False
+    annotated = summary.get("annotated")
+    if not isinstance(annotated, list) or not all(
+        isinstance(entry, list) and len(entry) == 2
+        and all(isinstance(part, str) for part in entry)
+        for entry in annotated
+    ):
+        return False
+    return all(
+        isinstance(record, list) and len(record) == 5
+        and all(isinstance(record[i], str) for i in (0, 1, 2, 4))
+        and isinstance(record[3], int) and not isinstance(record[3], bool)
+        for record in summary["nodes"]
+    )
+
+
+def _read_summary(copy_dir: Path | None, file_hash: str, fingerprint: str | None) -> dict | None:
+    if copy_dir is None or fingerprint is None or not _SHA256_HEX_RE.fullmatch(file_hash or ""):
+        return None
+    try:
+        saved = json.loads((copy_dir / f"{file_hash}{_SUMMARY_SUFFIX}").read_text("utf-8"))
+    except (OSError, ValueError) as exc:
+        if not isinstance(exc, FileNotFoundError):
+            logger.debug("Reading the summary of %s failed: %s", file_hash, exc)
+        return None
+    if not (
+        isinstance(saved, dict) and saved.get("version") == _SUMMARY_VERSION
+        and saved.get("fingerprint") == fingerprint and saved.get("hash") == file_hash
+        and _valid_summary(saved.get("summary"))
+    ):
+        return None
+    return saved["summary"]
+
+
+def _write_summary(
+    copy_dir: Path | None, file_hash: str, fingerprint: str | None, summary: dict,
+) -> None:
+    if copy_dir is None or fingerprint is None or not _SHA256_HEX_RE.fullmatch(file_hash):
+        return
+    target = copy_dir / f"{file_hash}{_SUMMARY_SUFFIX}"
+    payload = json.dumps({
+        "version": _SUMMARY_VERSION, "fingerprint": fingerprint, "hash": file_hash,
+        "summary": summary,
+    }, separators=(",", ":"))
+    try:
+        copy_dir.mkdir(exist_ok=True)
+        partial_path = copy_dir / f".{file_hash}.{uuid.uuid4().hex}.tmp"
+        partial_path.write_text(payload, "utf-8")
+        os.replace(partial_path, target)
+    except OSError as exc:
+        logger.warning("Keeping the summary of %s in %s failed: %s", file_hash, copy_dir, exc)
+
+
+def _visible_change_unread(old: dict, new: dict, own: str) -> bool:
+    """Whether no importer reads the edges that differ between *old* and *new*.
+
+    Those are a Python import inside a function, which binds nothing at
+    module scope, an import of a module outside the repository, and the
+    inheritance of a class only one side defines,
+    which an importer reaches only by spelling the class, a name that counts
+    as changed with its node.
+    """
+    def defined(summary: dict) -> set[str]:
+        return {
+            f"{parent}.{name}" if parent else name
+            for _kind, name, parent, _line, _shape in summary["nodes"]
+        }
+
+    old_visible, new_visible = set(old["visible"]), set(new["visible"])
+    old_defined, new_defined = defined(old), defined(new)
+    prefix = own + "::"
+    for entry in old_visible ^ new_visible:
+        fields = json.loads(entry)
+        fields = fields.get("t") if isinstance(fields, dict) else None
+        if not (isinstance(fields, list) and len(fields) == 4):
+            return False
+        kind, source, target, extra = fields
+        if not all(isinstance(part, str) for part in (source, target, extra)):
+            return False
+        if kind == "IMPORTS_FROM":
+            context = json.loads(extra)
+            if not (source == own and isinstance(context, dict)):
+                return False
+            if context.get(IMPORT_CONTEXT_KEY) == IMPORT_CONTEXT_DEFERRED:
+                continue
+            # A module from outside the repository: no file of it is in the
+            # graph, and what the import binds is in the compared summary.
+            if os.path.isabs(target) or "/" in target or "\\" in target:
+                return False
+            continue
+        if kind not in ("INHERITS", "IMPLEMENTS") or not source.startswith(prefix):
+            return False
+        qualified = source[len(prefix):]
+        if (qualified in old_defined) == (qualified in new_defined):
+            return False
+    return True
+
+
 def _changed_symbol_names(
     repo_root: Path, rel_path: str, file_hash: str, parser: Any, parsed: dict,
-) -> tuple[set[str], bool] | None:
+    copy_dir: Path | None = None, stored_commit: str | None = None,
+) -> tuple[set[str], bool, set[str], dict[str, set[str]]] | None:
     """Names whose definitions in *rel_path* changed since the graph stored it.
 
     The flag says whether the module's public names changed, which only a
-    wildcard import reads. None when an importer's parse could have changed
-    too, or when that cannot be told: the file is not an indexed Python module
-    whose stored bytes Git still has, a summary importers read from it
+    wildcard import reads. The last set holds the names of the return and
+    property annotations that changed: an importer's parse reads one only
+    where its source spells that name, so those importers' parses can change.
+    It also holds the properties whose annotation names a type whose class
+    identity changed, and the re-exported names that changed. Those last make
+    up the final mapping, to the files they came from before and after: an
+    importer that spells one, other than the file that defines it, can pass
+    the change on to its own importers.
+    None when another importer's parse could have changed too, or when that
+    cannot be told: the file is not an indexed Python module whose stored
+    bytes Git (or *copy_dir*) still has, a summary importers read from it
     differs, or an edge kind importers read through the graph (imports,
-    inheritance) changed. The new bytes are parsed with the update's own
-    *parser*, and that result goes into *parsed* for the update to store.
+    inheritance) changed. The new bytes are parsed with the update's
+    own *parser*, and that result goes into *parsed* for the update to store.
+    The stored version's side comes from the summary an earlier update saved
+    in *copy_dir* when there is one, and the new version's is saved there.
     """
     if not rel_path.endswith(".py"):
         return None
@@ -3514,64 +4056,261 @@ def _changed_symbol_names(
         new_source = abs_path.read_bytes()
     except OSError:
         return None
-    old_source = _committed_bytes(repo_root, rel_path, file_hash)
-    if old_source is None:
-        return None
-    # A parser of its own for the old bytes: they must not reach a cache the
-    # update's parser shares with the files it parses next.
-    old_parser = _get_code_parser_cls()(repo_root)
+    fingerprint = _summary_fingerprint(repo_root) if copy_dir is not None else None
+    old = _read_summary(copy_dir, file_hash, fingerprint)
+    old_source = None
+    if old is None:
+        old_source = _committed_bytes(
+            repo_root, rel_path, file_hash, copy_dir, stored_commit,
+        )
+        if old_source is None:
+            return None
     own = normalize_file_path(abs_path.resolve())
 
-    def split_view(view: tuple) -> tuple[tuple, dict, set]:
-        # Names the module defines itself resolve to the module whether or
-        # not it exports them, so outside a wildcard import only the names it
-        # re-exports from elsewhere count.
-        exports = view[3] or {}
-        foreign = {name: origin for name, origin in exports.items() if origin != own}
-        local = {name for name, origin in exports.items() if origin == own}
-        return view[:3] + view[4:], foreign, local
-
     try:
-        old_view = split_view(old_parser.python_importer_view(abs_path, old_source))
-        new_view = split_view(parser.python_importer_view(abs_path, new_source))
-        if old_view[:2] != new_view[:2]:
-            return None
-        old_nodes, old_edges = old_parser.parse_bytes(abs_path, old_source)
+        new_view = parser.python_importer_view(abs_path, new_source)
+        if old_source is not None:
+            # A parser of its own for the old bytes: they must not reach a
+            # cache the update's parser shares with the files it parses next.
+            old_parser = _get_code_parser_cls()(repo_root)
+            old_view = old_parser.python_importer_view(abs_path, old_source)
+            old_nodes, old_edges = old_parser.parse_bytes(abs_path, old_source)
+            old = json.loads(json.dumps(
+                _comparison_summary(old_view, old_nodes, old_edges, own),
+            ))
         new_nodes, new_edges = parser.parse_bytes(abs_path, new_source)
         parsed[rel_path] = (new_source, new_nodes, new_edges)
+        # Round-tripped, so both sides are compared in the form a saved one has.
+        new = json.loads(json.dumps(_comparison_summary(new_view, new_nodes, new_edges, own)))
     except Exception as exc:  # noqa: BLE001 - any failure means "re-parse all"
         logger.debug("Comparing versions of %s failed: %s", rel_path, exc)
         return None
+    _write_summary(copy_dir, hashlib.sha256(new_source).hexdigest(), fingerprint, new)
 
-    def visible(edges: list) -> list[tuple]:
-        return sorted(
-            _edge_shape(edge) for edge in edges
-            if edge.kind in _IMPORTER_VISIBLE_EDGE_KINDS
-        )
-
-    if visible(old_edges) != visible(new_edges):
+    if old["visible"] != new["visible"] and not _visible_change_unread(old, new, own):
         return None
-    old_shapes = sorted(_node_shape(node) for node in old_nodes)
-    new_shapes = sorted(_node_shape(node) for node in new_nodes)
     names: set[str] = set()
-    for shape in set(old_shapes) ^ set(new_shapes):
-        names.add(shape[1])
-        names.add(shape[2])
+    old_shapes = {record[4]: record for record in old["nodes"]}
+    new_shapes = {record[4]: record for record in new["nodes"]}
+    for shape in old_shapes.keys() ^ new_shapes.keys():
+        record = old_shapes.get(shape) or new_shapes[shape]
+        names.add(record[1])
+        names.add(record[2])
+
     # Same-named definitions share one name and take collision identities by
-    # position, so their names count as changed whenever anything moved.
-    for shapes in (old_shapes, new_shapes):
-        counts: dict[tuple, int] = {}
-        for shape in shapes:
-            key = (shape[0], shape[1], shape[2])
-            counts[key] = counts.get(key, 0) + 1
-        for (_kind, name, parent), count in counts.items():
-            if count > 1:
-                names.add(name)
-                names.add(parent)
+    # position (a stored row keeps its identity while it keeps its line), so
+    # their names count as changed whenever one of them moved or changed.
+    def groups(records: list) -> dict[tuple, list[tuple]]:
+        by_key: dict[tuple, list[tuple]] = {}
+        for record in records:
+            by_key.setdefault((record[0], record[1], record[2]), []).append(
+                (record[3], record[4]),
+            )
+        return {key: sorted(members) for key, members in by_key.items()}
+
+    old_groups, new_groups = groups(old["nodes"]), groups(new["nodes"])
+    for key in old_groups.keys() | new_groups.keys():
+        old_members = old_groups.get(key, [])
+        new_members = new_groups.get(key, [])
+        if max(len(old_members), len(new_members)) > 1 and old_members != new_members:
+            names.add(key[1])
+            names.add(key[2])
     names.discard("")
-    exports_changed = old_view[2] != new_view[2]
-    names |= old_view[2] ^ new_view[2]
-    return names, exports_changed
+    old_local, new_local = set(old["local"]), set(new["local"])
+    names |= old_local ^ new_local
+    old_annotated = {tuple(entry) for entry in old["annotated"]}
+    new_annotated = {tuple(entry) for entry in new["annotated"]}
+    spelled = {token for token, _entry in old_annotated ^ new_annotated}
+    reexported: dict[str, set[str]] = {}
+    if old["imports"] != new["imports"]:
+        if (
+            old["alias"] != new["alias"]
+            or old["identities"] is None or new["identities"] is None
+        ):
+            return None
+
+        def changed(field: str) -> set[str]:
+            pairs = {tuple(entry) for entry in old[field]} ^ {
+                tuple(entry) for entry in new[field]
+            }
+            return {name for name, _value in pairs}
+
+        # An importer reads a class identity here only for the type a property
+        # annotation of this module names, under the property's spelled name;
+        # a re-exported name it reads under the name it imports.
+        for name in changed("identities"):
+            word = re.compile(rf"(?<![A-Za-z0-9_]){re.escape(name)}(?![A-Za-z0-9_])")
+            for prop, annotation in old["properties"] + new["properties"]:
+                if word.search(annotation):
+                    spelled.add(prop)
+        for name in changed("foreign"):
+            origins = reexported.setdefault(name, set())
+            for entry_name, value in old["foreign"] + new["foreign"]:
+                origin = json.loads(value) if entry_name == name else None
+                if isinstance(origin, str):
+                    origins.add(origin)
+        spelled |= set(reexported)
+    return names, old_local != new_local or bool(reexported), spelled, reexported
+
+
+def _known_dirs(repo_root: Path, store: GraphStore, stored_commit: str | None) -> set[str] | None:
+    """Folders (relative, POSIX) that held a file the graph or the stored commit has."""
+    known: set[str] = set()
+    for stored in store.get_all_files():
+        try:
+            rel = PurePosixPath(Path(stored).relative_to(repo_root).as_posix())
+        except ValueError:
+            continue
+        known.update(str(parent) for parent in rel.parents)
+    if stored_commit and _GIT_COMMIT_RE.fullmatch(stored_commit):
+        try:
+            result = subprocess.run(
+                ["git", "ls-tree", "-r", "-d", "--name-only", "-z", stored_commit],
+                cwd=str(repo_root), capture_output=True, timeout=_GIT_TIMEOUT, check=False,
+            )
+        except (OSError, subprocess.SubprocessError) as exc:
+            logger.debug("Listing the folders of %s failed: %s", stored_commit, exc)
+            return None
+        if result.returncode == 0:
+            known.update(
+                name.decode("utf-8", "surrogateescape")
+                for name in result.stdout.split(b"\0") if name
+            )
+    return known
+
+
+def _unimported_changes_unreachable(
+    repo_root: Path, store: GraphStore, paths: list[str], importers: set[str],
+    stored_commit: str | None,
+) -> bool:
+    """Whether no importer's parse can see the change to *paths*.
+
+    Each path is a file nothing in the graph depends on that is not an
+    indexed Python module still on disk: a new or deleted file, or one in a
+    language other than Python.
+
+    A Python parse reads another file only by resolving an import, which
+    probes a ``.py`` file named after a module's last part, or a folder named
+    after a part for a namespace package, never anything below a folder whose
+    name starts with a dot. So a file added, removed or edited there changes
+    what some module resolves to only where a Python file spells its stem, or
+    the name of a folder that came or went with it. When no Python file on
+    disk spells one (ignored files included, as the parser reads those too),
+    apart from the changed files themselves, no importer's parse can change.
+    A symlink that leads below a dot folder, a package ``__init__.py`` (which
+    also decides where a standard-library name resolves) and this tool's own
+    config folder make it give up.
+    """
+    if not paths:
+        return True
+    if os.name == "nt":
+        return False
+    for rel_path in importers:
+        parts = PurePosixPath(Path(rel_path).as_posix()).parts
+        if not rel_path.endswith(".py") or any(part.startswith(".") for part in parts):
+            return False
+    known: set[str] | None = None
+    tokens: set[str] = set()
+    own: set[str] = set()
+    for rel_path in paths:
+        posix = PurePosixPath(Path(rel_path).as_posix())
+        own.add(str(posix))
+        parts = posix.parts
+        if any(part.startswith(".code-review-graph") for part in parts):
+            return False
+        if any(part.startswith(".") for part in parts):
+            continue
+        if parts[-1] == "__init__.py":
+            return False
+        abs_path = repo_root / rel_path
+        if abs_path.is_symlink():
+            return False
+        if parts[-1].endswith(".py"):
+            tokens.add(parts[-1][: -len(".py")])
+        exists = abs_path.exists()
+        for depth in range(1, len(parts)):
+            folder = "/".join(parts[:depth])
+            if exists:
+                if known is None:
+                    known = _known_dirs(repo_root, store, stored_commit)
+                    if known is None:
+                        return False
+                came_or_went = folder not in known
+            else:
+                came_or_went = not (repo_root / folder).is_dir()
+            if came_or_went:
+                tokens.add(parts[depth - 1])
+    if not tokens:
+        return True
+    if len(tokens) > _MAX_CHANGED_SYMBOL_NAMES:
+        return False
+    grep_cmd = ["git", "grep", "--no-index", "-l", "-z", "-w", "-F"]
+    for token in sorted(tokens):
+        grep_cmd += ["-e", token]
+    grep_cmd += ["--", "*.py", ":!.*", ":!**/.*"]
+    # Git does not follow symlinks here, so each one is checked on its own.
+    find_cmd = [
+        "find", ".", "-mindepth", "1", "-name", ".*", "-prune", "-o", "-type", "l", "-print0",
+    ]
+    try:
+        grep = subprocess.Popen(
+            grep_cmd, cwd=str(repo_root), stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+        )
+        try:
+            links = subprocess.run(
+                find_cmd, cwd=str(repo_root), capture_output=True, timeout=_GIT_TIMEOUT,
+                check=False,
+            )
+            found, _ = grep.communicate(timeout=_GIT_TIMEOUT)
+        finally:
+            if grep.poll() is None:
+                grep.kill()
+                grep.wait()
+    except (OSError, subprocess.SubprocessError) as exc:
+        logger.debug("Looking for files that name %s failed: %s", sorted(tokens), exc)
+        return False
+    if grep.returncode not in (0, 1) or links.returncode != 0:
+        return False
+    for name in found.split(b"\0"):
+        if name and name.decode("utf-8", "surrogateescape") not in own:
+            return False
+    for name in links.stdout.split(b"\0"):
+        if not name:
+            continue
+        try:
+            target = (repo_root / name.decode("utf-8", "surrogateescape")).resolve()
+            inside = target.relative_to(repo_root)
+        except (OSError, RuntimeError, ValueError):
+            continue
+        if any(part.startswith(".") for part in inside.parts):
+            return False
+    return True
+
+
+def _spelling_re(names: set[str]) -> re.Pattern[bytes]:
+    """Any of *names* as a whole word in a file's bytes."""
+    return re.compile(
+        rb"(?<![A-Za-z0-9_])(?:"
+        + b"|".join(re.escape(name.encode("utf-8", "surrogatepass")) for name in sorted(names))
+        + rb")(?![A-Za-z0-9_])",
+    )
+
+
+def _file_scope_import_names(parser: Any, file_path: str, source: bytes) -> set[str] | None:
+    """The names a Python file's file-scope imports bind, as its exports read them.
+
+    None when the file cannot be parsed as Python.
+    """
+    if not file_path.endswith((".py", ".pyi")):
+        return None
+    ts_parser = parser._get_parser("python")
+    if not ts_parser:
+        return None
+    tree = ts_parser.parse(source)
+    import_map, _defined = parser._collect_file_scope(
+        tree.root_node, "python", source, file_path,
+    )
+    return set(import_map)
 
 
 def _importers_to_reparse(
@@ -3581,8 +4320,12 @@ def _importers_to_reparse(
     importers: set[str],
     parser: Any,
     parsed: dict,
+    unimported: list[str] | None = None,
 ) -> set[str] | None:
     """The importers of *changed* (path to stored hash) a re-parse could alter.
+
+    *unimported* are the other changed paths: nothing imports them and no
+    Python parse reads their bytes (see :func:`_unimported_changes_unreachable`).
 
     Used with ``CRG_FAST_ENGINE``. An importer with unchanged bytes parses as
     before when every changed module shows its importers the same summaries
@@ -3592,28 +4335,96 @@ def _importers_to_reparse(
     as they settle every other file. None means re-parse every importer.
     """
     names: set[str] = set()
-    exports_changed = False
+    spelled: set[str] = set()
+    reexported: dict[str, set[str]] = {}
+    # Which changed module each re-exported name changed in.
+    reexported_by: dict[str, set[str]] = {}
+    exports_from: list[str] = []
+    copy_dir = _source_copy_dir(store, repo_root)
+    # Once a commit lands, the bytes the graph holds are in the commit it was
+    # last synced to rather than in HEAD.
+    stored_commit = store.get_metadata("git_head_sha")
+    if not _unimported_changes_unreachable(
+        repo_root, store, unimported or [], importers, stored_commit,
+    ):
+        return None
     for rel_path, file_hash in changed.items():
-        found = _changed_symbol_names(repo_root, rel_path, file_hash, parser, parsed)
+        found = _changed_symbol_names(
+            repo_root, rel_path, file_hash, parser, parsed, copy_dir, stored_commit,
+        )
         if found is None:
             return None
         names |= found[0]
-        exports_changed = exports_changed or found[1]
-        if len(names) > _MAX_CHANGED_SYMBOL_NAMES:
+        if found[1]:
+            exports_from.append(rel_path)
+        spelled |= found[2]
+        for name, origins in found[3].items():
+            reexported.setdefault(name, set()).update(origins)
+            reexported_by.setdefault(name, set()).add(rel_path)
+        if len(names) > _MAX_CHANGED_SYMBOL_NAMES or len(spelled) > _MAX_CHANGED_SYMBOL_NAMES:
             return None
-    if exports_changed:
-        # A wildcard importer, or one that imports through it, reads the
-        # public names themselves rather than an edge that names them.
-        for rel_path in importers:
-            try:
-                if _WILDCARD_IMPORT_RE.search((repo_root / rel_path).read_bytes()):
-                    return None
-            except OSError:
-                return None
     by_stored = {
         normalize_file_path(repo_root / rel_path): rel_path for rel_path in importers
     }
     selected: set[str] = set()
+    # A wildcard importer reads a module's public names themselves rather than
+    # an edge that names them, so it is re-parsed; one that is imported in turn
+    # passes them on, which this update does not compare. Only a file that
+    # imports the module can import it with a wildcard.
+    for rel_path in exports_from:
+        for dependent in find_dependents(store, normalize_file_path(repo_root / rel_path)):
+            try:
+                source = Path(dependent).read_bytes()
+            except OSError:
+                return None
+            if not _WILDCARD_IMPORT_RE.search(source):
+                continue
+            if _single_hop_dependents(store, dependent):
+                return None
+            if dependent in by_stored:
+                selected.add(by_stored[dependent])
+    if spelled:
+        # Any spelling counts, even in a comment or a string: only an importer
+        # whose bytes never hold the name surely parses as before.
+        spelling = _spelling_re(spelled)
+        for rel_path in importers:
+            try:
+                source = (repo_root / rel_path).read_bytes()
+            except OSError:
+                return None
+            if not spelling.search(source):
+                continue
+            selected.add(rel_path)
+            stored_path = normalize_file_path(repo_root / rel_path)
+            # Its own importers can read a re-exported name through its
+            # exports, which this update does not compare, unless it is the
+            # module whose exports changed (its importers are the ones
+            # checked here), or the file that defines the name and does not
+            # rename it on import.
+            # Its exports are the names its file-scope imports bind, so a
+            # name it spells only as an attribute or in a call is not one.
+            passed_on = [
+                name for name, origins in reexported.items()
+                if rel_path not in reexported_by[name]
+                and _spelling_re({name}).search(source)
+            ]
+            bound: set[str] | None = None
+            for name in passed_on:
+                renamed = re.search(
+                    rb"(?<![A-Za-z0-9_])" + re.escape(name.encode("utf-8", "surrogatepass"))
+                    + rb"\s+as(?![A-Za-z0-9_])",
+                    source,
+                )
+                if stored_path in reexported[name] and not renamed:
+                    continue
+                if not renamed:
+                    if bound is None:
+                        bound = _file_scope_import_names(parser, stored_path, source)
+                    if bound is not None and name not in bound:
+                        continue
+                if _single_hop_dependents(store, stored_path):
+                    return None
+                break
     conn = store._conn
     for name in sorted(names):
         for row in conn.execute(
@@ -3638,8 +4449,11 @@ def incremental_update(
     follow_symlinks: bool | None = None,
     *,
     reconcile_followed: bool = False,
+    defer_target_refresh: bool = False,
 ) -> dict:
     """Incremental update: re-parse changed + dependent files only.
+
+    *defer_target_refresh* is as for ``full_build``.
 
     *enrich* is as for :func:`full_build`.
 
@@ -3667,6 +4481,19 @@ def incremental_update(
         _assert_graph_matches_root(repo_root, store)
     store.bind_repo_root(repo_root)
     parser = _get_code_parser_cls()(repo_root)
+    from .parser import fast_engine_enabled
+
+    if fast_engine_enabled():
+        skeleton_dir = _source_copy_dir(store, repo_root)
+        skeleton_print = _summary_fingerprint(repo_root) if skeleton_dir else None
+        if skeleton_dir is not None and skeleton_print is not None:
+            parser.use_python_skeletons(
+                skeleton_dir.parent / _MODULE_FACT_DIR, skeleton_print,
+            )
+        if skeleton_dir is not None:
+            from .parser import use_parser_probe_record
+
+            use_parser_probe_record(skeleton_dir.parent / _PARSER_PROBE_RECORD_NAME)
     ignore_patterns = _load_ignore_patterns(repo_root)
     vcs = detect_vcs(repo_root)
     stored_git_sha = store.get_metadata("git_head_sha") if vcs == "git" else None
@@ -3694,8 +4521,12 @@ def incremental_update(
             logger.info(
                 "C++ identity format changed; rebuilding the graph before incremental update",
             )
-        rebuilt = full_build(repo_root, store, enrich=enrich, follow_symlinks=follow)
+        rebuilt = full_build(
+            repo_root, store, enrich=enrich, follow_symlinks=follow,
+            defer_target_refresh=defer_target_refresh,
+        )
         return {
+            "target_refresh_owed": rebuilt["target_refresh_owed"],
             "files_updated": rebuilt["files_parsed"],
             "total_nodes": rebuilt["total_nodes"],
             "total_edges": rebuilt["total_edges"],
@@ -3835,6 +4666,7 @@ def incremental_update(
     # Changed files whose bytes differ from the stored ones, with the stored
     # hash, or None once one of them cannot take the fast path below.
     content_changed: dict[str, str] | None = {}
+    unimported: list[str] = []
     for rel_path in changed_files:
         full_path = normalize_file_path(repo_root / rel_path)
         # Duplicate watch notifications do not invalidate dependents. A real
@@ -3842,7 +4674,7 @@ def incremental_update(
         # refer to the old export identity, so its own hash is not sufficient.
         # A path with no rows has no stored hash to compare, and may be a large
         # file the graph never indexes, so it is not read here.
-        existing = store.get_nodes_by_file(full_path)
+        existing, existing_hash = store.first_file_hash(full_path)
         # A nested-scope upgrade renames this file's members, so whoever
         # resolved a call to the old names must be re-resolved too.
         if existing and rel_path not in pending_nested:
@@ -3851,16 +4683,31 @@ def incremental_update(
                 if current_hash is None:
                     current_hash = hashlib.sha256((repo_root / rel_path).read_bytes()).hexdigest()
                     current_hashes[normalize_file_path(rel_path)] = current_hash
-                if existing[0].file_hash == current_hash:
+                if existing_hash == current_hash:
                     continue
             except (OSError, PermissionError):
                 pass
-        if content_changed is not None:
-            if existing and rel_path not in pending_nested and existing[0].file_hash:
-                content_changed[rel_path] = existing[0].file_hash
-            else:
-                content_changed = None
         deps = find_dependents(store, full_path)
+        if content_changed is not None:
+            if (
+                not deps and existing and rel_path not in pending_nested
+                and rel_path.endswith(".py") and not (repo_root / rel_path).is_symlink()
+                and (repo_root / rel_path).is_file()
+            ):
+                # Edited in place and nothing depends on it: no importer's
+                # parse reads it, and the file itself is re-parsed below.
+                pass
+            elif (
+                deps and existing and rel_path not in pending_nested and existing_hash
+            ):
+                content_changed[rel_path] = existing_hash
+            elif deps or rel_path in pending_nested:
+                content_changed = None
+            else:
+                # Nothing depends on it and no parse reads its bytes (a new or
+                # deleted module, or a changelog): checked below for a module
+                # or folder an importer's parse could now resolve differently.
+                unimported.append(rel_path)
         for d in deps:
             # Convert back to relative path if needed
             try:
@@ -3886,7 +4733,7 @@ def incremental_update(
     ):
         importers_to_reparse = _importers_to_reparse(
             repo_root, store, content_changed, dependent_files - dependents_pending,
-            parser, preparsed,
+            parser, preparsed, unimported,
         )
         if importers_to_reparse is not None:
             importers_to_reparse |= dependents_pending
@@ -3914,7 +4761,7 @@ def incremental_update(
                 ignored_path = repo_root / rel_path
                 if (
                     normalize_file_path(ignored_path) in stale_files
-                    or not store.get_nodes_by_file(str(ignored_path))
+                    or not store.first_file_hash(str(ignored_path))[0]
                 ):
                     # Nothing of this file is in the graph (it was removed as
                     # stale, or never parsed), so there is nothing to migrate.
@@ -3950,14 +4797,14 @@ def incremental_update(
             except (OSError, PermissionError):
                 fhash = None
         try:
-            existing_nodes = store.get_nodes_by_file(str(abs_path))
+            existing_nodes, existing_hash = store.first_file_hash(str(abs_path))
             if (
                 rel_path not in pending_csharp
                 and rel_path not in pending_nested
                 and rel_path not in remaining_identity
                 and fhash is not None
                 and existing_nodes
-                and existing_nodes[0].file_hash == fhash
+                and existing_hash == fhash
             ):
                 if rel_path not in dependent_files:
                     continue
@@ -3982,7 +4829,9 @@ def incremental_update(
     # ``update --skip-flows`` and would never get the flows back.
     from .communities import (
         capture_community_assignments,
+        capture_community_assignments_in_sql,
         purge_empty_communities,
+        remap_captured_community_assignments,
         remap_community_assignments,
     )
     from .flows import (
@@ -4005,13 +4854,22 @@ def incremental_update(
     lifecycle_paths = expand_changed_file_paths(
         store, lifecycle_inputs, repo_root=repo_root,
     )
-    community_by_qn = capture_community_assignments(store, lifecycle_paths)
+    # The TEMP-table capture commits as it goes (autocommit); inside an open
+    # transaction a later rollback could drop it, so that case keeps the dict.
+    community_by_qn: Optional[dict[str, int]] = None
+    if store._conn.in_transaction:
+        community_by_qn = capture_community_assignments(store, lifecycle_paths)
+        communities_captured = len(community_by_qn)
+    else:
+        communities_captured = capture_community_assignments_in_sql(store, lifecycle_paths)
     cleared_entry_qns: set[str] = set()
     flow_node_ids: dict[int, str] = {}
 
     # Stored paths of the files re-parsed here. Re-parsing replaces a file's
     # edges, so these are the only files the Jedi step needs to scan again.
     reparsed_paths: list[str] = []
+    # Files stored with new bytes: path to the hash stored for them.
+    stored_sources: dict[str, str] = {}
 
     # Dependents whose bytes did not change only get their edges re-saved,
     # which is most of an update's writes: save them a batch per transaction.
@@ -4040,57 +4898,72 @@ def incremental_update(
         cleared_entry_qns.update(capture_affected_flow_entry_points(store, file_paths))
         flow_node_ids.update(capture_flow_node_ids(store, file_paths))
         store.store_file_nodes_edges(str(repo_root / rel_path), nodes, edges, fhash)
+        stored_sources[rel_path] = fhash
 
-    use_serial = os.environ.get("CRG_SERIAL_PARSE", "") == "1"
-    parsed_files = 0
+    # Under the native engine the stored files are committed a group at a
+    # time: one commit per file rewrote the shared index pages every time.
+    # When they replace most of the edge rows, the edge indexes are dropped
+    # and rebuilt once instead.
+    fast_writes = fast_engine_enabled()
+    bulk_edges = fast_writes and len(to_parse) >= 8 and store.edge_row_share(
+        str(repo_root / rel_path) for rel_path in to_parse
+    ) >= _BULK_EDGE_SHARE
+    with (
+        store.grouped_writes(_GROUPED_WRITE_FILES, bulk_edges=bulk_edges) if fast_writes
+        else nullcontext()
+    ):
+        use_serial = os.environ.get("CRG_SERIAL_PARSE", "") == "1"
+        parsed_files = 0
 
-    if use_serial or len(to_parse) < 8:
-        for rel_path in to_parse:
-            abs_path = repo_root / rel_path
-            try:
-                source = abs_path.read_bytes()
-                fhash = hashlib.sha256(source).hexdigest()
-                ready = preparsed.pop(rel_path, None)
-                if ready is not None and ready[0] == source:
-                    nodes, edges = ready[1], ready[2]
-                else:
-                    nodes, edges = parser.parse_bytes(abs_path, source)
-            except (OSError, PermissionError) as e:
-                errors.append({"file": rel_path, "error": str(e)})
-                continue
-            except Exception as e:
-                logger.warning("Error parsing %s: %s", rel_path, e)
-                errors.append({"file": rel_path, "error": str(e)})
-                continue
-            # Parse succeeded: note this file's flows, then replace its nodes.
-            # Same reasoning as the serial loop in full_build: a failed write
-            # is not a failed parse. Letting it propagate stops the update
-            # before the freshness anchor is advanced, so the next run still
-            # sees this file as changed.
-            store_parsed(rel_path, nodes, edges, fhash)
-            remaining_identity.discard(rel_path)
-            parsed_files += 1
-            total_nodes += len(nodes)
-            total_edges += len(edges)
-    else:
-        # See full-build comment above for executor kind rationale.
-        _prewarm_parser_probes(parser, to_parse)
-        args_list = [(rel_path, str(repo_root)) for rel_path in to_parse]
-        with _make_executor(_MAX_PARSE_WORKERS) as executor:
-            for rel_path, nodes, edges, error, fhash in _parse_results(
-                executor, args_list, 20,
-            ):
-                if error:
-                    logger.warning("Error parsing %s: %s", rel_path, error)
-                    errors.append({"file": rel_path, "error": error})
+        if use_serial or len(to_parse) < 8:
+            for rel_path in to_parse:
+                abs_path = repo_root / rel_path
+                try:
+                    source = abs_path.read_bytes()
+                    fhash = hashlib.sha256(source).hexdigest()
+                    ready = preparsed.pop(rel_path, None)
+                    if ready is not None and ready[0] == source:
+                        nodes, edges = ready[1], ready[2]
+                    else:
+                        nodes, edges = parser.parse_bytes(abs_path, source)
+                except (OSError, PermissionError) as e:
+                    errors.append({"file": rel_path, "error": str(e)})
                     continue
+                except Exception as e:
+                    logger.warning("Error parsing %s: %s", rel_path, e)
+                    errors.append({"file": rel_path, "error": str(e)})
+                    continue
+                # Parse succeeded: note this file's flows, then replace its nodes.
+                # Same reasoning as the serial loop in full_build: a failed write
+                # is not a failed parse. Letting it propagate stops the update
+                # before the freshness anchor is advanced, so the next run still
+                # sees this file as changed.
                 store_parsed(rel_path, nodes, edges, fhash)
                 remaining_identity.discard(rel_path)
                 parsed_files += 1
                 total_nodes += len(nodes)
                 total_edges += len(edges)
+        else:
+            # See full-build comment above for executor kind rationale.
+            _prewarm_parser_probes(parser, to_parse)
+            args_list: list[tuple[str, ...]] = [(rel_path, str(repo_root)) for rel_path in to_parse]
+            with _make_executor(_MAX_PARSE_WORKERS) as executor:
+                for rel_path, nodes, edges, error, fhash in _parse_results(
+                    executor, args_list, 20,
+                ):
+                    if error:
+                        logger.warning("Error parsing %s: %s", rel_path, error)
+                        errors.append({"file": rel_path, "error": error})
+                        continue
+                    store_parsed(rel_path, nodes, edges, fhash)
+                    remaining_identity.discard(rel_path)
+                    parsed_files += 1
+                    total_nodes += len(nodes)
+                    total_edges += len(edges)
 
-    flush_edges()
+        flush_edges()
+    if fast_engine_enabled():
+        _save_source_copies(store, repo_root, stored_sources)
 
     failed_dependents = dependent_files & {error["file"] for error in errors}
     if failed_dependents != dependents_pending:
@@ -4112,14 +4985,17 @@ def incremental_update(
 
     # Remap surviving community IDs onto replacement nodes, drop orphan flow
     # rows, and remove community rows that no longer have any members.
-    remap_community_assignments(store, community_by_qn)
+    if community_by_qn is None:
+        remap_captured_community_assignments(store)
+    else:
+        remap_community_assignments(store, community_by_qn)
     remap_flow_node_ids(store, flow_node_ids)
     purge_orphan_flow_data(store)
     purge_empty_communities(store)
 
     flow_entry_point_qns = sorted(cleared_entry_qns)
     communities_were_affected = (
-        (bool(community_by_qn) and (parsed_files > 0 or bool(to_remove)))
+        (communities_captured > 0 and (parsed_files > 0 or bool(to_remove)))
         or bool(missing_paths)
         or bool(stale_files)
     )
@@ -4188,8 +5064,12 @@ def incremental_update(
     )
     if files_updated and followed_dirs:
         _relink_stored_edges(store, repo_root, followed_dirs)
+    target_refresh_owed = False
     if has_graph_changes or scoped_changed:
-        _refresh_target_resolution(store)
+        if defer_target_refresh:
+            target_refresh_owed = True
+        else:
+            _refresh_target_resolution(store)
 
     # Freshness follows what was stored. A file that failed to parse is
     # reported in ``errors`` and keeps its previous rows; it must not stop the
@@ -4218,11 +5098,14 @@ def incremental_update(
         store._invalidate_cache()
 
     return {
+        "target_refresh_owed": target_refresh_owed,
         "files_updated": files_updated,
         "total_nodes": total_nodes,
         "total_edges": total_edges,
         "changed_files": list(changed_files),
         "dependent_files": list(dependent_files),
+        # Internal: importers left as stored, which ``build`` pops.
+        "kept_importers": kept_importers,
         "stale_files_removed": len(stale_files),
         "flow_entry_point_qns": flow_entry_point_qns,
         "communities_were_affected": communities_were_affected,

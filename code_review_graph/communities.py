@@ -10,6 +10,7 @@ import importlib.util
 import logging
 import random
 import re
+import sys
 from collections import Counter, defaultdict, namedtuple
 from collections.abc import Sequence
 from pathlib import Path
@@ -360,6 +361,28 @@ def _reassign_test_nodes(
     return reassigned
 
 
+def _import_igraph() -> Any:
+    """``import igraph``; under the fast engine, without its matplotlib backend.
+
+    igraph's drawing package imports matplotlib when it is installed, which
+    costs most of igraph's import time and is only needed for plotting. Under
+    ``CRG_FAST_ENGINE`` the import runs with matplotlib hidden, so igraph
+    takes its no-matplotlib path; Leiden is the same code either way.
+    """
+    from .parser import fast_engine_enabled
+
+    if not fast_engine_enabled() or "matplotlib" in sys.modules:
+        import igraph as _ig  # type: ignore[import-untyped]
+        return _ig
+    sys.modules["matplotlib"] = None  # type: ignore[assignment]
+    try:
+        import igraph as _ig
+    finally:
+        if sys.modules.get("matplotlib", 0) is None:
+            del sys.modules["matplotlib"]
+    return _ig
+
+
 def _load_igraph() -> bool:
     """Import igraph lazily; a failed import disables the package for good.
 
@@ -374,7 +397,7 @@ def _load_igraph() -> bool:
     if ig is not None:
         return True
     try:
-        import igraph as _ig  # type: ignore[import-untyped]
+        _ig = _import_igraph()
         # A native build can import and still fail on first attribute access,
         # so touch the type we need while the handlers are still in scope.
         _ig.Graph
@@ -940,25 +963,95 @@ def remap_community_assignments(
         return 0
 
     conn = store._conn
-    updated = 0
     items = list(community_by_qn.items())
     if conn.in_transaction:
         logger.warning("Rolling back uncommitted transaction before BEGIN IMMEDIATE")
         conn.rollback()
     conn.execute("BEGIN IMMEDIATE")
     try:
-        for qn, cid in items:
-            cur = conn.execute(
-                "UPDATE nodes SET community_id = ? WHERE qualified_name = ?",
-                (cid, qn),
-            )
-            if cur.rowcount:
-                updated += cur.rowcount
+        cur = conn.executemany(
+            "UPDATE nodes SET community_id = ? WHERE qualified_name = ? "
+            "AND community_id IS NOT ?",
+            [(cid, qn, cid) for qn, cid in items],
+        )
+        updated = max(cur.rowcount, 0)
         conn.commit()
     except BaseException:
         conn.rollback()
         raise
     return updated
+
+
+_CAPTURE_TABLE = "temp.crg_community_capture"
+
+
+def capture_community_assignments_in_sql(
+    store: GraphStore,
+    file_paths: list[str],
+) -> int:
+    """:func:`capture_community_assignments` kept in a TEMP table, not a dict.
+
+    Same rows, with the last row of a qualified name winning as in the dict,
+    but stored as written, so neither the capture nor
+    :func:`remap_captured_community_assignments` passes thousands of names
+    through the connection's path translation. Returns the number of names
+    captured (the dict's length).
+    """
+    conn = store._conn
+    conn.execute(
+        "CREATE TEMP TABLE IF NOT EXISTS crg_community_capture "
+        "(qn TEXT PRIMARY KEY, cid INTEGER NOT NULL)"
+    )
+    conn.execute(f"DELETE FROM {_CAPTURE_TABLE}")  # nosec B608 - fixed name
+    for i in range(0, len(file_paths), _SQL_BATCH):
+        batch = file_paths[i:i + _SQL_BATCH]
+        placeholders = ",".join("?" * len(batch))
+        conn.execute(
+            f"INSERT OR REPLACE INTO {_CAPTURE_TABLE} (qn, cid) "  # nosec B608
+            "SELECT qualified_name, community_id FROM nodes "
+            "WHERE community_id IS NOT NULL AND qualified_name IS NOT NULL "
+            f"AND qualified_name != '' AND file_path IN ({placeholders})",
+            batch,
+        )
+    row = conn.execute(f"SELECT COUNT(*) FROM {_CAPTURE_TABLE}").fetchone()  # nosec B608
+    return int(row[0])
+
+
+def remap_captured_community_assignments(store: GraphStore) -> int:
+    """:func:`remap_community_assignments` for the TEMP-table capture.
+
+    Updates the same rows to the same IDs in one statement and drops the
+    capture. Returns the number of nodes updated.
+    """
+    conn = store._conn
+    if not conn.execute(
+        "SELECT 1 FROM sqlite_temp_master WHERE type = 'table' "
+        "AND name = 'crg_community_capture'"
+    ).fetchone():
+        return 0
+    try:
+        if not conn.execute(f"SELECT 1 FROM {_CAPTURE_TABLE} LIMIT 1").fetchone():  # nosec B608
+            return 0
+        if conn.in_transaction:
+            logger.warning("Rolling back uncommitted transaction before BEGIN IMMEDIATE")
+            conn.rollback()
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            cur = conn.execute(
+                "UPDATE nodes SET community_id = ("  # nosec B608 - fixed name
+                f"SELECT c.cid FROM {_CAPTURE_TABLE} c WHERE c.qn = nodes.qualified_name) "
+                f"WHERE qualified_name IN (SELECT qn FROM {_CAPTURE_TABLE}) "
+                "AND community_id IS NOT ("
+                f"SELECT c.cid FROM {_CAPTURE_TABLE} c WHERE c.qn = nodes.qualified_name)"
+            )
+            updated = max(cur.rowcount, 0)
+            conn.commit()
+        except BaseException:
+            conn.rollback()
+            raise
+        return updated
+    finally:
+        conn.execute(f"DROP TABLE IF EXISTS {_CAPTURE_TABLE}")  # nosec B608
 
 
 def purge_empty_communities(store: GraphStore) -> int:
@@ -1026,32 +1119,39 @@ def incremental_detect_communities(
 
     from .flows import expand_changed_file_paths
 
-    expanded = expand_changed_file_paths(store, changed_files, repo_root=repo_root)
     conn = store._conn
 
-    # Check if any communities are affected (batch to stay under SQLite limit)
-    affected_count = 0
-    unassigned_count = 0
-    for i in range(0, len(expanded), _SQL_BATCH):
-        batch = expanded[i:i + _SQL_BATCH]
-        placeholders = ",".join("?" * len(batch))
-        row = conn.execute(
-            f"SELECT COUNT(DISTINCT community_id), "  # nosec B608
-            f"SUM(CASE WHEN community_id IS NULL AND kind != 'File' "
-            f"THEN 1 ELSE 0 END) FROM nodes "
-            f"WHERE file_path IN ({placeholders})",
-            batch,
-        ).fetchone()
-        if row:
-            affected_count += row[0] or 0
-            unassigned_count += row[1] or 0
+    # Check if any communities are affected. The paths are expanded and
+    # checked a slice at a time, the changed files (listed first) before their
+    # dependents, and the first slice that holds a community answers.
+    affected = force
+    paths = list(changed_files)
+    step = 64
+    for start in range(0, len(paths), step):
+        if affected:
+            break
+        expanded = expand_changed_file_paths(
+            store, paths[start:start + step], repo_root=repo_root,
+        )
+        for i in range(0, len(expanded), _SQL_BATCH):
+            batch = expanded[i:i + _SQL_BATCH]
+            placeholders = ",".join("?" * len(batch))
+            row = conn.execute(
+                f"SELECT COUNT(DISTINCT community_id), "  # nosec B608
+                f"SUM(CASE WHEN community_id IS NULL AND kind != 'File' "
+                f"THEN 1 ELSE 0 END) FROM nodes "
+                f"WHERE file_path IN ({placeholders})",
+                batch,
+            ).fetchone()
+            if row and (row[0] or row[1]):
+                affected = True
+                break
 
-    if not force and affected_count == 0 and unassigned_count == 0:
+    if not affected:
         return 0  # No communities affected, skip
 
     # Re-run full community detection (correct and fast enough)
-    communities = detect_communities(store, min_size=min_size)
-    return store_communities(store, communities)
+    return detect_and_store_communities(store, min_size=min_size)
 
 
 def store_communities(
@@ -1081,25 +1181,42 @@ def store_communities(
     # sequence is atomic — no partial community data on crash.
     conn.execute("BEGIN IMMEDIATE")
     try:
-        conn.execute("DELETE FROM communities")
+        # The ids the table holds are reused in ascending order before new
+        # ones are taken, so detecting the same communities again leaves each
+        # one, and every node's ``community_id``, where it was. The native
+        # engine writes the table the same way.
+        reusable = [
+            row[0] for row in conn.execute("SELECT id FROM communities ORDER BY id")
+        ]
         conn.execute("UPDATE nodes SET community_id = NULL")
 
         count = 0
         for comm in communities:
-            cursor = conn.execute(
-                """INSERT INTO communities
-                   (name, level, cohesion, size, dominant_language, description)
-                   VALUES (?, ?, ?, ?, ?, ?)""",
-                (
-                    comm["name"],
-                    comm.get("level", 0),
-                    comm.get("cohesion", 0.0),
-                    comm["size"],
-                    comm.get("dominant_language", ""),
-                    comm.get("description", ""),
-                ),
+            fields = (
+                comm["name"],
+                comm.get("level", 0),
+                comm.get("cohesion", 0.0),
+                comm["size"],
+                comm.get("dominant_language", ""),
+                comm.get("description", ""),
             )
-            community_id = cursor.lastrowid
+            if count < len(reusable):
+                community_id = reusable[count]
+                conn.execute(
+                    """UPDATE communities SET name = ?, level = ?, parent_id = NULL,
+                       cohesion = ?, size = ?, dominant_language = ?, description = ?,
+                       created_at = datetime('now')
+                       WHERE id = ?""",
+                    (*fields, community_id),
+                )
+            else:
+                cursor = conn.execute(
+                    """INSERT INTO communities
+                       (name, level, cohesion, size, dominant_language, description)
+                       VALUES (?, ?, ?, ?, ?, ?)""",
+                    fields,
+                )
+                community_id = cursor.lastrowid
 
             # Batch update community_id on member nodes
             member_qns = comm.get("members", [])
@@ -1111,6 +1228,13 @@ def store_communities(
                     [community_id] + batch,
                 )
             count += 1
+        if count < len(reusable):
+            if count:
+                conn.execute(
+                    "DELETE FROM communities WHERE id > ?", (reusable[count - 1],),
+                )
+            else:
+                conn.execute("DELETE FROM communities")
 
         # Recorded in the same transaction as the communities it describes,
         # so the two cannot disagree. Communities from a caller that does not
@@ -1131,6 +1255,112 @@ def store_communities(
         conn.rollback()
         raise
     return count
+
+
+
+def _leiden_clusters(
+    vertex_count: int,
+    edge_list: list[tuple[int, int]],
+    weights: list[float],
+    **leiden_args: Any,
+) -> Any:
+    """igraph's Leiden partition of a weighted graph, seeded as everywhere here."""
+    g = ig.Graph(n=vertex_count, edges=edge_list, directed=False)
+    g.es["weight"] = weights
+    seed = env_int("CRG_LEIDEN_SEED", _LEIDEN_SEED)
+    # Deterministic seeding for benchmark reproducibility — community
+    # detection is not a security-sensitive context. nosec B311.
+    ig.set_random_number_generator(random.Random(seed))  # nosec B311
+    return g.community_leiden(
+        objective_function="modularity", weights="weight", **leiden_args,
+    )
+
+
+def _native_leiden_store(store: GraphStore, min_size: int) -> int:
+    """``store_communities(store, detect_communities(store, min_size))`` with Leiden.
+
+    ``crg_fast`` reads the graph once and does every step but the Leiden
+    calls, which igraph runs here on the same graphs with the same seed, so
+    the stored communities are the same. -1 when this ``crg_fast`` lacks the
+    passes or the graph holds something they do not read the way Python
+    does; nothing is written then.
+    """
+    try:
+        import crg_fast
+    except ImportError:
+        return -1
+    stage_read = getattr(crg_fast, "stage_leiden_read", None)
+    if stage_read is None or getattr(crg_fast, "stage_leiden_store", None) is None:
+        return -1
+    token, state = stage_read(list(EDGE_WEIGHTS.items()), 0.5, store._codec_fields())
+    try:
+        try:
+            row = store._conn.execute("SELECT crg_run(?)", (token,)).fetchone()
+        except BaseException:
+            crg_fast.discard_job(token)
+            raise
+        if int(row[0]) < 0:
+            return -1
+        graph = crg_fast.leiden_graph(state)
+        if graph is None:
+            return -1
+        vertex_count, edge_list, weights = graph
+        import math
+        resolution = max(0.05, 1.0 / math.log10(max(vertex_count, 10)))
+        partition = _leiden_clusters(
+            vertex_count, edge_list, weights, resolution=resolution, n_iterations=2,
+        )
+        oversized = crg_fast.leiden_communities(
+            state, [list(cluster_ids) for cluster_ids in partition], min_size,
+        )
+        if oversized is None:
+            return -1
+        splits: list[tuple[int, list[list[int]] | None]] = []
+        for position, sub_count, sub_edges, sub_weights in oversized:
+            try:
+                sub_partition = _leiden_clusters(
+                    sub_count, sub_edges, sub_weights, resolution=0.5,
+                )
+                partition_clusters: dict[int, list[int]] = {}
+                for idx, cid in enumerate(sub_partition.membership):
+                    partition_clusters.setdefault(cid, []).append(idx)
+                splits.append((position, list(partition_clusters.values())))
+            except Exception:
+                logger.warning(
+                    "Failed to split community %d, keeping as-is", position, exc_info=True,
+                )
+                splits.append((position, None))
+        return store._native_resolver_job("stage_leiden_store", state, splits)
+    finally:
+        crg_fast.discard_leiden(state)
+
+
+def detect_and_store_communities(
+    store: GraphStore, min_size: int = 2, nodes: list[GraphNode] | None = None,
+) -> int:
+    """:func:`detect_communities`, then :func:`store_communities`.
+
+    Under ``CRG_FAST_ENGINE`` without igraph, the file-based detector and the
+    writes run as one native job on the store's connection, with the same
+    result. With igraph, only its Leiden calls run in Python
+    (:func:`_native_leiden_store`). *nodes* is as for
+    :func:`detect_communities`. Returns the number of communities stored.
+    """
+    if getattr(store, "_native_sql", False) and _load_igraph():
+        count = _native_leiden_store(store, min_size)
+        if count >= 0:
+            return count
+    elif getattr(store, "_native_sql", False):
+        count = store._native_resolver_job("stage_file_communities", min_size)
+        if count >= 0:
+            logger.info(
+                'Tip: pip install "code-review-graph[communities]" for finer communities '
+                "(grouping by file for now)."
+            )
+            return count
+    return store_communities(
+        store, detect_communities(store, min_size=min_size, nodes=nodes),
+    )
 
 
 def get_communities(

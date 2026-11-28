@@ -231,6 +231,29 @@ def _fts_file_hint(
     return [normalize_file_path(root / path) for path in changed_files]
 
 
+def _files_flows_reach(
+    store: Any,
+    changed_files: list[str],
+    kept_files: list[str] | None,
+    repo_root: str | None,
+) -> list[str]:
+    """*changed_files* less the kept importers no write of the update reached.
+
+    A kept importer's own rows are as stored, so a flow through it traces
+    differently only where an edge or node the flow reads was written, and
+    the flow scope names those files. Without a scope every file is kept.
+    """
+    if not kept_files or repo_root is None:
+        return changed_files
+    root = Path(repo_root)
+    stored = {normalize_file_path(root / rel): rel for rel in kept_files}
+    hits = store.flow_scope_hits(list(stored))
+    if hits is None:
+        return changed_files
+    unreached = {rel for path, rel in stored.items() if path not in hits}
+    return [path for path in changed_files if path not in unreached]
+
+
 def _run_postprocess(
     store: Any,
     build_result: dict[str, Any],
@@ -243,6 +266,8 @@ def _run_postprocess(
     entry_point_qns: list[str] | None = None,
     communities_were_affected: bool = False,
     skip_resolvers: bool = False,
+    refresh_owed: bool = False,
+    kept_files: list[str] | None = None,
 ) -> list[str]:
     """Run post-build steps based on *postprocess* level.
 
@@ -251,6 +276,13 @@ def _run_postprocess(
 
     *skip_resolvers* leaves call-target resolution out, for a no-op update on a
     graph whose edges are already resolved.
+
+    *refresh_owed* says the build left the target-resolution refresh to this
+    step, which then runs it even where it resolves nothing.
+
+    *kept_files* are the importers among *changed_files* that the update left
+    as stored. Their flows are traced again only where the update's writes
+    reach them (see ``GraphStore.flow_scope_hits``).
 
     Records structured stage durations in ``build_result["postprocess_timing"]``.
     Minimal processing reports ``signatures_s`` and ``fts_s``; full processing
@@ -292,6 +324,9 @@ def _run_postprocess(
     )
 
     # Resolve bare and C++ scoped call targets before derived graph steps.
+    # A capture started by the update ends here, before the writes below.
+    scoped = store.end_change_capture()
+    refreshed = False
     if not skip_resolvers:
         try:
             if noop_incremental and not store.get_nodes_without_signature():
@@ -299,8 +334,10 @@ def _run_postprocess(
                 build_result["cpp_scoped_edges_resolved"] = 0
             else:
                 noop_incremental = False
-                resolved = store.resolve_bare_call_targets()
-                resolved += store.resolve_bare_tested_by_sources()
+                try:
+                    resolved = store.resolve_bare_endpoints(scoped=scoped)
+                finally:
+                    store.drop_bare_scope()
                 build_result["bare_edges_resolved"] = resolved
                 build_result["cpp_scoped_edges_resolved"] = (
                     store.resolve_cpp_scoped_call_targets()
@@ -308,12 +345,23 @@ def _run_postprocess(
                 # Resolvers rewrite bare targets into qualified ones, so the stored
                 # certainty column is only correct once they have all run.
                 store.refresh_target_resolution()
+                refreshed = True
         except sqlite3.OperationalError as e:
             logger.warning("Call-target resolution failed: %s", e)
             _note_contention(build_result, e)
             warnings.append(
                 f"Call-target resolution failed: {type(e).__name__}: {e}"
             )
+    if refresh_owed and not refreshed:
+        try:
+            store.refresh_target_resolution()
+        except sqlite3.OperationalError as e:
+            logger.warning("Target-resolution refresh failed: %s", e)
+            _note_contention(build_result, e)
+            warnings.append(
+                f"Target-resolution refresh failed: {type(e).__name__}: {e}"
+            )
+    store.drop_change_scope()
 
     # -- Signatures + FTS (fast, always run unless "none") --
     timing: dict[str, float] = {}
@@ -417,26 +465,30 @@ def _run_postprocess(
 
             count = incremental_trace_flows(
                 store,
-                changed_files or [],
+                _files_flows_reach(store, changed_files or [], kept_files, repo_root),
                 repo_root=repo_root,
                 entry_point_qns=entry_point_qns,
             )
         else:
             from code_review_graph.flows import store_flows as _store_flows
             from code_review_graph.flows import trace_flows as _trace_flows
+            from code_review_graph.flows import trace_flows_native
             from code_review_graph.parser import fast_engine_enabled
 
-            if fast_engine_enabled():
-                # Community detection reads the same node rows, in the
-                # same order, so the adjacency is loaded once for both.
-                shared_adjacency = store.load_flow_adjacency()
-            flows = _trace_flows(store, adjacency=shared_adjacency)
+            flows = trace_flows_native(store) if fast_engine_enabled() else None
+            if flows is None:
+                if fast_engine_enabled():
+                    # Community detection reads the same node rows, in the
+                    # same order, so the adjacency is loaded once for both.
+                    shared_adjacency = store.load_flow_adjacency()
+                flows = _trace_flows(store, adjacency=shared_adjacency)
             count = _store_flows(store, flows)
         build_result["flows_detected"] = count
     except (sqlite3.OperationalError, ImportError) as e:
         logger.warning("Flow detection failed: %s", e)
         _note_contention(build_result, e)
         warnings.append(f"Flow detection failed: {type(e).__name__}: {e}")
+    store.end_flow_scope()
     timing["flows_s"] = max(
         0.0,
         round(time.perf_counter() - stage_started, 6),
@@ -458,21 +510,15 @@ def _run_postprocess(
                 force=communities_were_affected,
             )
         else:
-            from code_review_graph.communities import (
-                detect_communities as _detect_communities,
-            )
-            from code_review_graph.communities import (
-                store_communities as _store_communities,
-            )
+            from code_review_graph.communities import detect_and_store_communities
 
-            comms = _detect_communities(
+            count = detect_and_store_communities(
                 store,
                 nodes=None if shared_adjacency is None else [
                     node for node in shared_adjacency.nodes_by_id.values()
                     if node.kind != "File"
                 ],
             )
-            count = _store_communities(store, comms)
         build_result["communities_detected"] = count
     except (sqlite3.OperationalError, ImportError) as e:
         logger.warning("Community detection failed: %s", e)
@@ -579,6 +625,7 @@ def build_or_update_graph(
     store = None
     try:
         recovery_reason: str | None = None
+        kept_importers: list[str] = []
         _prepare_db_path(root, db_path)
         store, root = _get_store(
             str(root), db_path=db_path, recover_corrupt=full_rebuild and recover_corrupt
@@ -619,8 +666,9 @@ def build_or_update_graph(
         if full_rebuild:
             result = full_build(
                 root, store, recurse_submodules, enrich=enrich,
-                follow_symlinks=follow_symlinks,
+                follow_symlinks=follow_symlinks, defer_target_refresh=True,
             )
+            refresh_owed = bool(result.pop("target_refresh_owed", False))
             failed = [str(item.get("file", "?")) for item in result["errors"]]
             summary = (
                 f"Full build complete: parsed {result['files_parsed']} files, "
@@ -639,12 +687,32 @@ def build_or_update_graph(
             if recovery_reason is not None:
                 build_result["recovery_reason"] = recovery_reason
         else:
+            from code_review_graph.parser import fast_engine_enabled
+
+            if (
+                fast_engine_enabled()
+                and previous_state == BUILD_COMPLETE
+                and store.get_metadata("postprocess_level") in ("full", "minimal")
+            ):
+                # The graph is at the resolvers' fixed point, so the bare
+                # pass after this update only has to revisit what it changes.
+                store.begin_change_capture()
+                if store.get_metadata("postprocess_level") == "full":
+                    # And its flows are traced, so only those the update
+                    # reaches need tracing again.
+                    store.begin_flow_scope()
             try:
                 result = incremental_update(
                     root, store, base=base_resolved, enrich=enrich,
-                    follow_symlinks=follow_symlinks,
+                    follow_symlinks=follow_symlinks, defer_target_refresh=True,
                 )
+                refresh_owed = bool(result.pop("target_refresh_owed", False))
+                kept_importers = result.pop("kept_importers", None) or []
             except RuntimeError as exc:
+                # Nothing was written: stop the capture this update started.
+                store.end_change_capture()
+                store.drop_change_scope()
+                store.end_flow_scope()
                 # Change discovery or root validation failed before anything was
                 # stored; report it the way every other failure is reported.
                 # Nothing was written, so the previous completeness verdict
@@ -671,6 +739,11 @@ def build_or_update_graph(
                     else "No graph changes detected. Freshness metadata was not advanced."
                 )
                 if postprocess == "none":
+                    if refresh_owed:
+                        try:
+                            store.refresh_target_resolution()
+                        except sqlite3.OperationalError as e:
+                            logger.warning("Target-resolution refresh failed: %s", e)
                     # An explicit skip should not turn an existing state into
                     # a claim that derived data was checked. No source rows
                     # changed, so restore the state that was present before
@@ -724,6 +797,7 @@ def build_or_update_graph(
                     embedding_provider=embedding_provider if pending else None,
                     embedding_model=embedding_model if pending else None,
                     skip_resolvers=not pending,
+                    refresh_owed=refresh_owed,
                 )
                 if warnings:
                     build_result["warnings"] = warnings
@@ -797,6 +871,8 @@ def build_or_update_graph(
             embedding_model=embedding_model,
             entry_point_qns=entry_qns,
             communities_were_affected=communities_affected,
+            refresh_owed=refresh_owed,
+            kept_files=kept_importers if changed is not None else None,
         )
         if warnings:
             build_result["warnings"] = warnings
@@ -941,8 +1017,7 @@ def run_postprocess(
         graph_complete = graph_contents_are_complete(state_before)
 
         try:
-            resolved = store.resolve_bare_call_targets()
-            resolved += store.resolve_bare_tested_by_sources()
+            resolved = store.resolve_bare_endpoints()
             result["bare_edges_resolved"] = resolved
             result["cpp_scoped_edges_resolved"] = (
                 store.resolve_cpp_scoped_call_targets()
@@ -1014,15 +1089,9 @@ def run_postprocess(
 
         if communities:
             try:
-                from code_review_graph.communities import (
-                    detect_communities as _detect_communities,
-                )
-                from code_review_graph.communities import (
-                    store_communities as _store_communities,
-                )
+                from code_review_graph.communities import detect_and_store_communities
 
-                comms = _detect_communities(store)
-                count = _store_communities(store, comms)
+                count = detect_and_store_communities(store)
                 result["communities_detected"] = count
             except (sqlite3.OperationalError, ImportError) as e:
                 store.rollback()

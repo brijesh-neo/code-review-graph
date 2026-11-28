@@ -19,6 +19,7 @@ import re
 import subprocess
 import sys
 import threading
+import unicodedata
 from bisect import bisect_left, bisect_right
 from collections import deque
 from collections.abc import Iterator
@@ -102,6 +103,21 @@ _PYTHON_STAR_EXPORT_CYCLE_CUTS = [0]
 # once. See :meth:`CodeParser._python_module_alias`.
 _PYTHON_MODULE_ALIAS_CACHE: dict[tuple[str, int, int], Optional[str]] = {}
 _PYTHON_MODULE_ALIAS_CACHE_LOCK = threading.Lock()
+# Under CRG_FAST_ENGINE, a cheap test before ``ast.parse`` in
+# ``_read_python_module_alias``. Importers only follow a swap written as a
+# module-level statement, and a module-level statement starts a logical line
+# at column 0 (or follows ``;``), possibly after backslash continuations or
+# inside parentheses opened there. Spaces before it are an indent, which only
+# a nested statement has, unless ``;`` or a continuation comes first. A
+# file with no ``sys.modules`` in such a place holds no swap to follow. The
+# test only skips the parse, so a file it keeps is still decided by ``ast``.
+_LINE_CONTINUATION = rb"\\(?:\r\n|\r|\n)"
+_TOP_LEVEL_SYS_MODULES_RE = re.compile(
+    rb"(?:^(?:\xef\xbb\xbf)?\f*|(?<=\r)\f*|;[ \t\f]*)"
+    rb"(?:" + _LINE_CONTINUATION + rb"[ \t\f]*)*"
+    rb"(?:\((?:\s|" + _LINE_CONTINUATION + rb"|#[^\r\n]*)*)*sys\.modules",
+    re.MULTILINE,
+)
 
 # ``{module file: {top-level def name: return annotation text}}``, keyed by
 # the module's mtime and size the way the star-export cache is. Only the text
@@ -256,6 +272,63 @@ class _PythonScopeBindingVisitor:
                         stack.append(value)
 
 
+_NON_ASCII_RE = re.compile(r"[^\x00-\x7f]")
+
+
+class _PythonSourceSpans:
+    """Whether a scope of one Python file spells any of a few names.
+
+    A scope can only bind a name its own text spells, so a scope whose bytes
+    hold none of the (ASCII) names a pass asks about needs no binding scan;
+    ``ast`` positions are UTF-8 byte offsets, so they index the bytes. Python
+    reads identifiers after NFKC normalisation, so a file holding any
+    character whose normal form has an ASCII character in it (a fullwidth
+    letter, a ligature) could spell a name another way, and answers "maybe"
+    everywhere, as does one with a byte order mark or a lone carriage return.
+    """
+
+    __slots__ = ("_source", "_starts")
+
+    def __init__(self, source: bytes) -> None:
+        self._source: Optional[bytes] = None
+        self._starts: list[int] = []
+        if b"\r" in source or source.startswith(b"\xef\xbb\xbf"):
+            return
+        if not source.isascii():
+            try:
+                text = source.decode("utf-8")
+            except UnicodeDecodeError:
+                return
+            for char in set(_NON_ASCII_RE.findall(text)):
+                if any(part.isascii() for part in unicodedata.normalize("NFKC", char)):
+                    return
+        starts = [0]
+        find = source.find
+        index = find(b"\n")
+        while index != -1:
+            starts.append(index + 1)
+            index = find(b"\n", index + 1)
+        self._source = source
+        self._starts = starts
+
+    def may_spell(self, node: ast.AST, names: frozenset[str]) -> bool:
+        """False only when *node*'s source text holds none of *names*."""
+        source = self._source
+        if source is None:
+            return True
+        try:
+            start = self._starts[node.lineno - 1] + node.col_offset  # type: ignore[attr-defined]
+            end_line = node.end_lineno  # type: ignore[attr-defined]
+            end_col = node.end_col_offset  # type: ignore[attr-defined]
+            if end_line is None or end_col is None:
+                return True
+            end = self._starts[end_line - 1] + end_col
+        except (AttributeError, IndexError, TypeError):
+            return True
+        find = source.find
+        return any(find(name.encode(), start, end) != -1 for name in names)
+
+
 _PY_STATEMENT_HOLDERS = (ast.stmt, ast.excepthandler, ast.match_case)
 
 
@@ -329,9 +402,13 @@ def _python_function_local_names(
 
 
 def _python_type_checking_aliases(
-    tree: ast.Module,
+    tree: ast.Module, spans: Optional[_PythonSourceSpans] = None,
 ) -> tuple[frozenset[str], frozenset[str]]:
-    """Return unshadowed aliases for ``typing.TYPE_CHECKING``."""
+    """Return unshadowed aliases for ``typing.TYPE_CHECKING``.
+
+    *spans*, the file's source spans, lets a statement that spells none of
+    the aliases skip its binding scan.
+    """
     has_typing_import = False
     for statement in tree.body:
         if isinstance(statement, ast.Import):
@@ -348,6 +425,7 @@ def _python_type_checking_aliases(
     names: set[str] = set()
     modules: set[str] = set()
     shadowed: set[str] = set()
+    others: list[ast.stmt] = []
     for statement in tree.body:
         if isinstance(statement, ast.Import):
             for alias in statement.names:
@@ -364,9 +442,15 @@ def _python_type_checking_aliases(
                 elif alias.name != "*":
                     shadowed.add(alias.asname or alias.name)
         else:
-            bindings = _PythonScopeBindingVisitor()
-            bindings.visit(statement)
-            shadowed.update(bindings.names)
+            others.append(statement)
+    # Only the aliases' own names matter in *shadowed*.
+    asked = frozenset(names | modules)
+    for statement in others:
+        if spans is not None and not spans.may_spell(statement, asked):
+            continue
+        bindings = _PythonScopeBindingVisitor()
+        bindings.visit(statement)
+        shadowed.update(bindings.names)
     return frozenset(names - shadowed), frozenset(modules - shadowed)
 
 
@@ -429,11 +513,21 @@ class _PythonUnreachableCallVisitor(ast.NodeVisitor):
         self,
         type_checking_names: frozenset[str],
         typing_modules: frozenset[str],
+        spans: Optional[_PythonSourceSpans] = None,
     ) -> None:
         self._dead = False
         self.positions: set[tuple[int, int]] = set()
         self._type_checking_names = type_checking_names
         self._typing_modules = typing_modules
+        self._spans = spans
+
+    def _scope_may_shadow(self, node: ast.AST) -> bool:
+        """Whether *node*'s scope could bind a ``TYPE_CHECKING`` alias."""
+        names = self._type_checking_names | self._typing_modules
+        if not names:
+            return False
+        spans = self._spans
+        return spans is None or spans.may_spell(node, names)
 
     def visit_Module(self, node: ast.Module) -> None:  # noqa: N802
         self._visit_statements(node.body, dead=False)
@@ -479,7 +573,7 @@ class _PythonUnreachableCallVisitor(ast.NodeVisitor):
 
         outer_names = self._type_checking_names
         outer_modules = self._typing_modules
-        if outer_names or outer_modules:
+        if self._scope_may_shadow(node):
             bindings = _PythonScopeBindingVisitor()
             for statement in node.body:
                 bindings.visit(statement)
@@ -524,7 +618,7 @@ class _PythonUnreachableCallVisitor(ast.NodeVisitor):
 
         outer_names = self._type_checking_names
         outer_modules = self._typing_modules
-        if outer_names or outer_modules:
+        if self._scope_may_shadow(node):
             bindings = _PythonScopeBindingVisitor()
             for statement in node.body:
                 bindings.visit(statement)
@@ -595,10 +689,12 @@ def _python_unreachable_call_positions(
     tree = _python_module_ast(source)
     if tree is None:
         return frozenset()
-    type_checking_names, typing_modules = _python_type_checking_aliases(tree)
+    spans = _PythonSourceSpans(source)
+    type_checking_names, typing_modules = _python_type_checking_aliases(tree, spans)
     visitor = _PythonUnreachableCallVisitor(
         type_checking_names,
         typing_modules,
+        spans,
     )
     visitor.visit(tree)
     return frozenset(visitor.positions)
@@ -634,10 +730,12 @@ def _python_unreachable_import_positions(
     tree = _python_module_ast(source)
     if tree is None:
         return frozenset()
-    type_checking_names, typing_modules = _python_type_checking_aliases(tree)
+    spans = _PythonSourceSpans(source)
+    type_checking_names, typing_modules = _python_type_checking_aliases(tree, spans)
     visitor = _PythonUnreachableImportVisitor(
         type_checking_names | {"TYPE_CHECKING"},
         typing_modules,
+        spans,
     )
     visitor.visit(tree)
     return frozenset(visitor.positions)
@@ -920,6 +1018,81 @@ def _run_parser_load_probe(grammar: str, timeout_seconds: float) -> bool:
     return False
 
 
+# Where grammar loads that passed their probe are recorded across processes
+# (see ``use_parser_probe_record``), or None to probe in every process.
+_PARSER_PROBE_RECORD: list[Optional[Path]] = [None]
+
+
+def use_parser_probe_record(path: Optional[Path]) -> None:
+    """Record grammar probes that passed in *path* and trust them later.
+
+    A record names the interpreter and the exact grammar library it loaded
+    (path, size and modification time), so a changed library is probed again.
+    """
+    _PARSER_PROBE_RECORD[0] = Path(path) if path is not None else None
+    if path is None:
+        return
+    # Grammars this process already probed before the record was named.
+    with _PARSER_PROBE_LOCK:
+        passed = sorted(grammar for grammar, ok in _PARSER_PROBE_RESULTS.items() if ok)
+    for grammar in passed:
+        recorded, identity = _recorded_probe_passed(grammar)
+        if not recorded and identity is not None:
+            _record_probe_passed(grammar, identity)
+
+
+def _parser_probe_identity(grammar: str) -> Optional[str]:
+    """What a passed probe of *grammar* vouches for, or None when unknown."""
+    try:
+        spec = importlib.util.find_spec("tree_sitter_language_pack")
+        origin = spec.origin if spec is not None else None
+        if not origin:
+            return None
+        package = Path(origin).resolve()
+        library = package.parent / "bindings" / f"{grammar}.abi3.so"
+        package_stat = package.stat()
+        library_stat = library.stat()
+    except (OSError, ValueError, ImportError):
+        return None
+    return json.dumps([
+        os.path.realpath(sys.executable), str(package), package_stat.st_mtime_ns,
+        package_stat.st_size, str(library), library_stat.st_mtime_ns, library_stat.st_size,
+    ])
+
+
+def _read_parser_probe_record(path: Path) -> dict[str, str]:
+    try:
+        record = json.loads(path.read_text("utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return record if isinstance(record, dict) else {}
+
+
+def _recorded_probe_passed(grammar: str) -> tuple[bool, Optional[str]]:
+    """Whether the record vouches for *grammar*, and the identity to record."""
+    path = _PARSER_PROBE_RECORD[0]
+    if path is None:
+        return False, None
+    identity = _parser_probe_identity(grammar)
+    if identity is None:
+        return False, None
+    return _read_parser_probe_record(path).get(grammar) == identity, identity
+
+
+def _record_probe_passed(grammar: str, identity: str) -> None:
+    path = _PARSER_PROBE_RECORD[0]
+    if path is None:
+        return
+    record = _read_parser_probe_record(path)
+    record[grammar] = identity
+    partial = path.with_name(f".{path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
+    try:
+        partial.write_text(json.dumps(record, sort_keys=True), "utf-8")
+        os.replace(partial, path)
+    except OSError as exc:
+        logger.debug("Recording the %s parser probe failed: %s", grammar, exc)
+
+
 def _parser_load_probe_succeeds(
     grammar: str,
     timeout_seconds: float | None = None,
@@ -944,12 +1117,19 @@ def _parser_load_probe_succeeds(
             cached = _PARSER_PROBE_RESULTS.get(grammar)
             if cached is not None:
                 return cached
+        recorded, identity = _recorded_probe_passed(grammar)
+        if recorded:
+            with _PARSER_PROBE_LOCK:
+                _PARSER_PROBE_RESULTS[grammar] = True
+            return True
         timeout = (
             _parser_load_timeout_seconds()
             if timeout_seconds is None
             else timeout_seconds
         )
         result = _run_parser_load_probe(grammar, timeout)
+        if result and identity is not None:
+            _record_probe_passed(grammar, identity)
         with _PARSER_PROBE_LOCK:
             _PARSER_PROBE_RESULTS[grammar] = result
             detail = _PARSER_PROBE_FAILURE_DETAILS.get(grammar) if not result else None
@@ -1063,6 +1243,7 @@ def _clear_parser_probe_cache() -> None:
         _PARSER_PROBE_RESULTS.clear()
         _PARSER_PROBE_FAILURE_DETAILS.clear()
         _PARSER_PROBE_GRAMMAR_LOCKS.clear()
+        _PARSER_PROBE_RECORD[0] = None
 
 
 # Grammars the native engine (``CRG_FAST_ENGINE=1``) parses. Others,
@@ -4025,6 +4206,16 @@ class CodeParser:
         self._repo_root = Path(repo_root).resolve() if repo_root is not None else None
         self._dbt_model_paths_cache: dict[Path, tuple[Path, ...]] = {}
         self._parsers: dict[str, object] = {}
+        # Recent Python trees keyed by their source bytes. The importer view,
+        # its readers and the parse itself each need a tree of the same bytes;
+        # trees are never edited, so one parse serves them all.
+        self._python_tree_cache: dict[bytes, object] = {}
+        self._python_tree_bytes = 0
+        self._python_tree_lock = threading.Lock()
+        # Where skeletons of imported modules are kept, and the fingerprint of
+        # the code that made them (see ``use_python_skeletons``).
+        self._python_skeleton_dir: Optional[Path] = None
+        self._python_skeleton_header = b""
         self._module_file_cache: dict[str, Optional[str]] = {}
         # Ignore patterns per repository boundary, so a resolver never names
         # a path the build will not index; see :meth:`_path_is_indexed`.
@@ -4114,6 +4305,159 @@ class CodeParser:
             self._parsers[language] = parser
         return self._parsers[language]
 
+    # Recent Python trees, least recently used first. An update reads one
+    # imported module several times (star exports, then annotations) with
+    # small modules read in between, so the bound is on source bytes: about
+    # 25 bytes of tree per byte of source, so 2 MB of source is ~50 MB.
+    _PYTHON_TREE_CACHE_SIZE = 16
+    _PYTHON_TREE_CACHE_BYTES = 2_000_000
+
+    def _python_tree(self, parser, source: bytes):
+        """Parse *source* as Python with *parser*, reusing a recent tree of the same bytes."""
+        with self._python_tree_lock:
+            cache = self._python_tree_cache
+            tree = cache.pop(source, None)
+            if tree is not None:
+                cache[source] = tree
+                return tree
+        tree = parser.parse(source)
+        with self._python_tree_lock:
+            cache = self._python_tree_cache
+            if source not in cache:
+                cache[source] = tree
+                self._python_tree_bytes += len(source)
+            while len(cache) > 1 and (
+                len(cache) > self._PYTHON_TREE_CACHE_SIZE
+                or self._python_tree_bytes > self._PYTHON_TREE_CACHE_BYTES
+            ):
+                oldest = next(iter(cache))
+                del cache[oldest]
+                self._python_tree_bytes -= len(oldest)
+        return tree
+
+    # A skeleton keeps a module's top-level statements and stubs its function
+    # and class definitions, which star-export discovery reads only by name;
+    # it parses in a tenth of the time. Version 1.
+    _PYTHON_SKELETON_STUBS = {
+        "function_definition": b"def %s(): pass\n",
+        "class_definition": b"class %s: pass\n",
+    }
+
+    def use_python_skeletons(self, directory: Path, fingerprint: str) -> None:
+        """Keep and read star-export skeletons of Python modules in *directory*.
+
+        A skeleton is named by the sha256 of the bytes it was made from and
+        holds *fingerprint*, the code that made it, so it is used only for
+        those bytes and that code.
+        """
+        self._python_skeleton_dir = Path(directory)
+        self._python_skeleton_header = f"crg-skel 1 {fingerprint}\n".encode()
+
+    def _load_python_fact(self, digest: str, kind: str) -> Optional[bytes]:
+        """The kept *kind* fact of the bytes whose sha256 is *digest*, if any."""
+        directory = self._python_skeleton_dir
+        if directory is None:
+            return None
+        try:
+            data = (directory / f"{digest}.{kind}").read_bytes()
+        except OSError:
+            return None
+        header = self._python_skeleton_header
+        return data[len(header):] if data.startswith(header) else None
+
+    def _python_skeleton_of(self, parser, source: bytes, root) -> Optional[bytes]:
+        """The skeleton of *source*, or None when it would not read the same.
+
+        The skeleton is parsed back and must give the same top-level nodes:
+        each copied statement the same tree, each stub the same name.
+        """
+        if root.has_error:
+            return None
+        parts: list[bytes] = []
+        stubbed: list[Optional[str]] = []
+        for child in root.children:
+            target = child
+            if child.type == "decorated_definition":
+                target = next(
+                    (inner for inner in child.children
+                     if inner.type in self._PYTHON_SKELETON_STUBS),
+                    child,
+                )
+            stub = self._PYTHON_SKELETON_STUBS.get(target.type)
+            name = (
+                self._get_name(
+                    target, "python",
+                    "class" if target.type == "class_definition" else "function",
+                )
+                if stub is not None else None
+            )
+            if stub is not None and name and name.isidentifier():
+                parts.append(stub % name.encode())
+                stubbed.append(name)
+            else:
+                parts.append(source[child.start_byte:child.end_byte] + b"\n")
+                stubbed.append(None)
+        skeleton = b"".join(parts)
+        try:
+            skeleton_root = parser.parse(skeleton).root_node
+        except (RecursionError, ValueError):  # pragma: no cover
+            return None
+        if skeleton_root.has_error:
+            return None
+        skeleton_children = skeleton_root.children
+        if len(skeleton_children) != len(stubbed):
+            return None
+        for original, copied, name in zip(root.children, skeleton_children, stubbed):
+            if name is not None:
+                if copied.type not in self._PYTHON_SKELETON_STUBS or self._get_name(
+                    copied, "python",
+                    "class" if copied.type == "class_definition" else "function",
+                ) != name:
+                    return None
+                continue
+            pending = [(original, copied)]
+            while pending:
+                left, right = pending.pop()
+                if left.type != right.type or left.child_count != right.child_count:
+                    return None
+                if left.child_count == 0:
+                    if left.text != right.text:
+                        return None
+                    continue
+                pending.extend(zip(left.children, right.children))
+        return skeleton
+
+    def _store_python_fact(self, digest: str, kind: str, payload: bytes) -> None:
+        directory = self._python_skeleton_dir
+        if directory is None:
+            return
+        target = directory / f"{digest}.{kind}"
+        partial = directory / f".{digest}.{os.getpid()}.{threading.get_ident()}.tmp"
+        try:
+            directory.mkdir(exist_ok=True)
+            partial.write_bytes(self._python_skeleton_header + payload)
+            os.replace(partial, target)
+        except OSError as exc:
+            logger.debug("Keeping the %s of %s failed: %s", kind, digest, exc)
+
+    def _kept_python_fact(self, source: bytes, kind: str, compute, encode, decode):
+        """*compute()*, or its kept answer for these exact bytes.
+
+        Only for facts that are a function of the module's bytes alone.
+        """
+        if self._python_skeleton_dir is None:
+            return compute()
+        digest = hashlib.sha256(source).hexdigest()
+        kept = self._load_python_fact(digest, kind)
+        if kept is not None:
+            try:
+                return decode(kept)
+            except (ValueError, TypeError) as exc:
+                logger.debug("Ignoring the kept %s of %s: %s", kind, digest, exc)
+        value = compute()
+        self._store_python_fact(digest, kind, encode(value))
+        return value
+
     def clear_caches(
         self, include_parsers: bool = False, release_memory: bool = True
     ) -> None:
@@ -4130,6 +4474,9 @@ class CodeParser:
         self._dart_pubspec_cache.clear()
         self._rust_project_cache.clear()
         self._tsconfig_resolver = TsconfigResolver()
+        with self._python_tree_lock:
+            self._python_tree_cache.clear()
+            self._python_tree_bytes = 0
         if include_parsers:
             self._parsers.clear()
         with _PYTHON_STAR_EXPORT_CACHE_LOCK:
@@ -4433,7 +4780,10 @@ class CodeParser:
             return [], []
 
         if tree is None:
-            tree = parser.parse(parse_source)
+            if language == "python":
+                tree = self._python_tree(parser, parse_source)
+            else:
+                tree = parser.parse(parse_source)
         nodes: list[NodeInfo] = []
         edges: list[EdgeInfo] = []
         file_path_str = normalize_file_path(path)
@@ -10032,7 +10382,7 @@ class CodeParser:
         if not parser:
             return None
         try:
-            tree = parser.parse(source)  # type: ignore[union-attr]
+            tree = self._python_tree(parser, source)  # type: ignore[union-attr]
         except (RecursionError, ValueError):  # pragma: no cover
             return None
 
@@ -10089,17 +10439,31 @@ class CodeParser:
         """
         if source is None:
             try:
-                source = module_path.read_bytes()
+                file_bytes = module_path.read_bytes()
             except (OSError, PermissionError):
                 return {}
+            return self._kept_python_fact(
+                file_bytes, "props",
+                lambda: self._read_python_property_return_annotations(
+                    module_path, file_bytes,
+                ),
+                lambda value: json.dumps(
+                    [[owner, name, text] for (owner, name), text in value.items()],
+                ).encode(),
+                lambda data: {
+                    (owner, name): text for owner, name, text in json.loads(data)
+                },
+            )
         parser = self._get_parser("python")
         if not parser:
             return {}
         try:
-            tree = parser.parse(source)  # type: ignore[union-attr]
+            tree = self._python_tree(parser, source)  # type: ignore[union-attr]
         except (RecursionError, ValueError) as exc:  # pragma: no cover
             logger.debug("Property-annotation parse failed for %s: %s", module_path, exc)
             return {}
+        if fast_parser.is_fast_node(tree.root_node):
+            return fast_parser.module_property_return_annotations(self, tree.root_node)
 
         properties: dict[tuple[str, str], str] = {}
         class_names: set[str] = set()
@@ -10660,14 +11024,20 @@ class CodeParser:
         """
         if source is None:
             try:
-                source = module_path.read_bytes()
+                file_bytes = module_path.read_bytes()
             except (OSError, PermissionError):
                 return {}
+            return self._kept_python_fact(
+                file_bytes, "rets",
+                lambda: self._read_python_return_annotations(module_path, file_bytes),
+                lambda value: json.dumps(list(value.items())).encode(),
+                lambda data: {name: text for name, text in json.loads(data)},
+            )
         parser = self._get_parser("python")
         if not parser:
             return {}
         try:
-            tree = parser.parse(source)  # type: ignore[union-attr]
+            tree = self._python_tree(parser, source)  # type: ignore[union-attr]
         except (RecursionError, ValueError) as exc:  # pragma: no cover
             logger.debug("Return-annotation parse failed for %s: %s", module_path, exc)
             return {}
@@ -20509,16 +20879,26 @@ class CodeParser:
         *source* stands in for the file's bytes when given.
         """
         resolved_module = normalize_file_path(module_path)
+        digest: Optional[str] = None
         if source is None:
             try:
                 source = module_path.read_bytes()
             except (OSError, PermissionError):
                 return {}
+            if self._python_skeleton_dir is not None:
+                digest = hashlib.sha256(source).hexdigest()
+                skeleton = self._load_python_fact(digest, "skel")
+                if skeleton is not None:
+                    source, digest = skeleton, None
         try:
             parser = self._get_parser("python")
             if not parser:
                 return {}
-            tree = parser.parse(source)  # type: ignore[union-attr]
+            tree = self._python_tree(parser, source)  # type: ignore[union-attr]
+            if digest is not None:
+                made = self._python_skeleton_of(parser, source, tree.root_node)
+                if made is not None:
+                    self._store_python_fact(digest, "skel", made)
             import_map, defined_names = self._collect_file_scope(
                 tree.root_node, "python", source, resolved_module,
             )
@@ -20898,6 +21278,8 @@ class CodeParser:
             except OSError:
                 return None
         if b"sys.modules" not in source or b"import_module" not in source:
+            return None
+        if fast_engine_enabled() and not _TOP_LEVEL_SYS_MODULES_RE.search(source):
             return None
         try:
             tree = ast.parse(source)

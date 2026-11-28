@@ -87,8 +87,7 @@ def _resolve_bare_endpoints(
 ) -> None:
     """Resolve bare and C++ scoped call targets before derived graph steps."""
     try:
-        resolved = store.resolve_bare_call_targets()
-        resolved += store.resolve_bare_tested_by_sources()
+        resolved = store.resolve_bare_endpoints()
         result["bare_edges_resolved"] = resolved
         result["cpp_scoped_edges_resolved"] = (
             store.resolve_cpp_scoped_call_targets()
@@ -187,10 +186,9 @@ def _detect_communities(
 ) -> None:
     """Detect code communities via Leiden algorithm or file grouping."""
     try:
-        from .communities import detect_communities, store_communities
+        from .communities import detect_and_store_communities
 
-        comms = detect_communities(store)
-        count = store_communities(store, comms)
+        count = detect_and_store_communities(store)
         result["communities_detected"] = count
     except (sqlite3.OperationalError, ImportError) as e:
         logger.warning("Community detection failed: %s", e)

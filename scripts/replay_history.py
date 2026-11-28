@@ -18,6 +18,7 @@ any step differs.
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import shutil
 import sqlite3
@@ -77,6 +78,21 @@ def run(args: list[str], data_dir: Path, code: Path) -> float:
     return time.perf_counter() - t
 
 
+def _community_names(conn: sqlite3.Connection, cols: list[str], rows: list) -> list:
+    """*rows* of nodes with ``community_id`` read as its community's name.
+
+    The id is a rowid, like ``nodes.id``: which number a community gets depends
+    on what the table held before, not on the graph.
+    """
+    if "community_id" not in cols:
+        return rows
+    at = cols.index("community_id")
+    names = dict(conn.execute("SELECT id, name FROM communities"))
+    return [
+        (*row[:at], names.get(row[at], row[at]), *row[at + 1:]) for row in rows
+    ]
+
+
 def dump(data_dir: Path, name: str) -> list[Path]:
     conn = sqlite3.connect(data_dir / "graph.db")
     out = []
@@ -86,9 +102,29 @@ def dump(data_dir: Path, name: str) -> list[Path]:
             if r[1] not in ("id", "updated_at")
         ]
         rows = conn.execute(f"SELECT {', '.join(cols)} FROM {table}").fetchall()  # nosec B608
+        if table == "nodes":
+            rows = _community_names(conn, cols, rows)
         path = WORK / f"{name}.{table}"
         path.write_text("\n".join(sorted("\t".join(repr(v) for v in row) for row in rows)) + "\n")
         out.append(path)
+    qualified = dict(conn.execute("SELECT id, qualified_name FROM nodes"))
+    rows = []
+    for flow, entry, depth, nodes, files, criticality, path_json in conn.execute(
+        "SELECT name, entry_point_id, depth, node_count, file_count, criticality, path_json "
+        "FROM flows"
+    ):
+        steps = [qualified.get(node_id, node_id) for node_id in json.loads(path_json)]
+        rows.append(repr((flow, qualified.get(entry, entry), depth, nodes, files,
+                          criticality, steps)))
+    names = dict(conn.execute("SELECT id, name FROM communities"))
+    for row in conn.execute(
+        "SELECT name, level, parent_id, cohesion, size, dominant_language, description "
+        "FROM communities"
+    ):
+        rows.append(repr(("community", *row[:2], names.get(row[2], row[2]), *row[3:])))
+    path = WORK / f"{name}.derived"
+    path.write_text("\n".join(sorted(rows)) + "\n")
+    out.append(path)
     conn.close()
     return out
 

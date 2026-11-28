@@ -198,18 +198,43 @@ fn json_confidence(lookup: &Stmt, db: *mut ffi::sqlite3, extra: &str) -> Result<
     Ok(value)
 }
 
-fn plan(db: *mut ffi::sqlite3, settings: &Settings) -> Result<Option<(Vec<RowChange>, i64)>, String> {
+fn plan(
+    db: *mut ffi::sqlite3,
+    settings: &Settings,
+    scope_floor: Option<i64>,
+) -> Result<Option<(Vec<RowChange>, i64)>, String> {
     let Some(names) = qualified_names(db)? else { return Ok(None) };
     let lookup = Stmt::prepare(
         db,
         "SELECT CASE WHEN json_valid(?1) THEN json_extract(?1, '$.confidence') END",
     )?;
-    let scan = Stmt::prepare(
-        db,
+    let mut sql = String::from(
         "SELECT id, kind, source_qualified, target_qualified, extra, confidence_tier, \
          target_resolution, confidence FROM edges \
          WHERE kind IN ('CALLS', 'REFERENCES', 'TESTED_BY')",
-    )?;
+    );
+    // Only the rows the certainty capture says can change, in id order.
+    if scope_floor.is_some() {
+        sql = format!(
+            "SELECT * FROM ({sql} AND id > ?1 \
+             UNION SELECT id, kind, source_qualified, target_qualified, extra, confidence_tier, \
+             target_resolution, confidence FROM edges \
+             WHERE id IN (SELECT id FROM temp.crg_cert_edge) \
+             AND kind IN ('CALLS', 'REFERENCES', 'TESTED_BY') \
+             UNION SELECT id, kind, source_qualified, target_qualified, extra, confidence_tier, \
+             target_resolution, confidence FROM edges \
+             WHERE target_qualified IN (SELECT qn FROM temp.crg_cert_qn) \
+             AND kind IN ('CALLS', 'REFERENCES', 'TESTED_BY') \
+             UNION SELECT id, kind, source_qualified, target_qualified, extra, confidence_tier, \
+             target_resolution, confidence FROM edges \
+             WHERE source_qualified IN (SELECT qn FROM temp.crg_cert_qn) \
+             AND kind IN ('CALLS', 'REFERENCES', 'TESTED_BY')) ORDER BY id"
+        );
+    }
+    let scan = Stmt::prepare(db, &sql)?;
+    if let Some(floor) = scope_floor {
+        scan.bind_i64(1, floor)?;
+    }
     let [score_unresolved, score_ambiguous, score_inferred, score_extracted] = settings.scores;
     let mut changes = Vec::new();
     let mut resolution_changes: i64 = 0;
@@ -349,7 +374,12 @@ fn write(db: *mut ffi::sqlite3, changes: &[RowChange]) -> Result<(), String> {
 ///
 /// *scores* is (unresolved, ambiguous, inferred, extracted).
 #[pyfunction]
-pub fn stage_certainty_refresh(resolver_keys: Vec<String>, scores: (f64, f64, f64, f64)) -> PyResult<i64> {
+#[pyo3(signature = (resolver_keys, scores, scope_floor=None))]
+pub fn stage_certainty_refresh(
+    resolver_keys: Vec<String>,
+    scores: (f64, f64, f64, f64),
+    scope_floor: Option<i64>,
+) -> PyResult<i64> {
     let keys: Option<Vec<Vec<u8>>> = resolver_keys.iter().map(|key| needle(key)).collect();
     let Some(keys) = keys else {
         return stage(Box::new(|_| Ok(FALL_BACK)));
@@ -361,7 +391,7 @@ pub fn stage_certainty_refresh(resolver_keys: Vec<String>, scores: (f64, f64, f6
         scores: [scores.0, scores.1, scores.2, scores.3],
     };
     stage(Box::new(move |db| {
-        let Some((changes, resolution_changes)) = plan(db, &settings)? else {
+        let Some((changes, resolution_changes)) = plan(db, &settings, scope_floor)? else {
             return Ok(FALL_BACK);
         };
         write(db, &changes)?;

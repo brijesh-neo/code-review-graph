@@ -72,6 +72,21 @@ def run(args: list[str], data_dir: Path, cli: list[str]) -> float:
     return time.perf_counter() - t
 
 
+def _community_names(conn: sqlite3.Connection, cols: list[str], rows: list) -> list:
+    """*rows* of nodes with ``community_id`` read as its community's name.
+
+    The id is a rowid, like ``nodes.id``: which number a community gets depends
+    on what the table held before, not on the graph.
+    """
+    if "community_id" not in cols:
+        return rows
+    at = cols.index("community_id")
+    names = dict(conn.execute("SELECT id, name FROM communities"))
+    return [
+        (*row[:at], names.get(row[at], row[at]), *row[at + 1:]) for row in rows
+    ]
+
+
 def dump(data_dir: Path, name: str) -> None:
     conn = sqlite3.connect(data_dir / "graph.db")
     node_cols = [
@@ -82,6 +97,8 @@ def dump(data_dir: Path, name: str) -> None:
     ]
     for table, cols in (("nodes", node_cols), ("edges", edge_cols)):
         rows = conn.execute(f"SELECT {', '.join(cols)} FROM {table}").fetchall()  # nosec B608
+        if table == "nodes":
+            rows = _community_names(conn, cols, rows)
         lines = sorted("\t".join(repr(v) for v in row) for row in rows)
         (WORK / f"{name}.{table}").write_text("\n".join(lines) + "\n")
         print(f"{table}: {len(lines)} rows -> {WORK / f'{name}.{table}'}")

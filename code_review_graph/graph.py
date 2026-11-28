@@ -14,9 +14,10 @@ import json
 import logging
 import re
 import sqlite3
+import sys
 import threading
 import time
-from collections.abc import Iterable, Iterator
+from collections.abc import Callable, Iterable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath, PureWindowsPath
@@ -1273,6 +1274,10 @@ class GraphStore:
         # transaction. The old rows are deleted in one pass when it ends.
         self._bulk_replaced: set[str] | None = None
         self._bulk_replacing: list[str] = []
+        # While grouped_writes() runs: files stored in its open transaction,
+        # else None.
+        self._write_group: list[int] | None = None
+        self._write_group_limit = 0
         self._cache_epoch = 0
         # Identifies the read transaction currently open on this connection,
         # so a reader cannot roll back a transaction a writer took from it.
@@ -1780,7 +1785,7 @@ class GraphStore:
             file_path=edge.file_path, line=edge.line, extra=extra,
         )
 
-    def _settle_collision_endpoints(self) -> int:
+    def _settle_collision_endpoints(self, scope_floor: Optional[int] = None) -> int:
         """Keep every edge into a duplicated name honest after a store pass.
 
         A file is stored on its own, so a call from another file can be written
@@ -1790,6 +1795,13 @@ class GraphStore:
         on a name several definitions share lists them all instead (#585); one
         whose duplicates are gone binds to the definition left. A recursive
         call is evidence and keeps its binding.
+
+        With *scope_floor* (a native update whose certainty capture and
+        ``temp.crg_endpoint_rows`` are both still there) the key scan reads
+        only rows that can hold the key: those that matched ``endpoint"`` when
+        the endpoint rows were kept, those updated since the capture began, and
+        those inserted above the floor. Nothing after the capture's triggers
+        are dropped writes ``extra``, so no other row can.
 
         Returns the number of edges changed.
         """
@@ -1846,11 +1858,22 @@ class GraphStore:
             ("TESTED_BY", "source_qualified", "target_qualified"),
         )
         handled: set[int] = set()
-        for row in conn.execute(
-            "SELECT id, kind, source_qualified, target_qualified, extra FROM edges "
-            "WHERE extra LIKE ?",
-            (f'%"{_COLLISION_ENDPOINT_KEY}"%',),
-        ).fetchall():
+        key_pattern = f'%"{_COLLISION_ENDPOINT_KEY}"%'
+        if scope_floor is None:
+            key_rows = conn.execute(
+                "SELECT id, kind, source_qualified, target_qualified, extra FROM edges "
+                "WHERE extra LIKE ?",
+                (key_pattern,),
+            ).fetchall()
+        else:
+            key_rows = conn.execute(
+                "SELECT id, kind, source_qualified, target_qualified, extra FROM edges "
+                "WHERE (id IN (SELECT id FROM temp.crg_endpoint_rows "
+                "UNION SELECT id FROM temp.crg_cert_edge) OR id > ?) "
+                "AND extra LIKE ? ORDER BY id",
+                (scope_floor, key_pattern),
+            ).fetchall()
+        for row in key_rows:
             extra = _load_collision_extra(row["extra"])
             base = extra.get(_COLLISION_ENDPOINT_KEY)
             column = next((c for k, c, _ in endpoints if k == row["kind"]), None)
@@ -1994,6 +2017,10 @@ class GraphStore:
         """Start an IMMEDIATE transaction, rolling back any prior uncommitted
         transaction first (regression guard for #135 / #489).
         """
+        if self._conn.in_transaction and self._write_group is not None:
+            # A grouped write's transaction holds only whole files: commit them
+            # rather than lose them.
+            self._commit_write_group()
         if self._conn.in_transaction:
             if self._active_read_txn is None:
                 logger.warning(
@@ -2011,6 +2038,9 @@ class GraphStore:
         self, file_path: str, nodes: list[NodeInfo], edges: list[EdgeInfo], fhash: str = ""
     ) -> None:
         """Atomically replace all data for a file."""
+        if self._write_group is not None:
+            self._grouped_write(lambda: self._replace_file_data(file_path, nodes, edges, fhash), 1)
+            return
         self._begin_immediate()
         try:
             self._replace_file_data(file_path, nodes, edges, fhash)
@@ -2021,6 +2051,169 @@ class GraphStore:
             raise
         self._bulk_committed()
         self._invalidate_cache()
+
+    @contextmanager
+    def grouped_writes(self, limit: int, bulk_edges: bool = False) -> Iterator[None]:
+        """Commit the files :meth:`store_file_nodes_edges` and :meth:`store_files_edges`
+        store about *limit* at a time instead of once per call.
+
+        Each file is still written whole, in call order, so the rows and their
+        ids are those of one commit per call; the reads between calls go
+        through this connection and see the open transaction. A commit writes
+        every page the transaction dirtied, and the indexes the files share
+        are dirtied again by each one, so fewer commits write far fewer pages.
+        A failed write rolls back the files stored since the last commit; a
+        build state that one commit per call could also leave behind.
+
+        With *bulk_edges*, everything is written in one transaction with the
+        edge indexes dropped (see :meth:`_grouped_bulk_edges`).
+        """
+        if self._write_group is not None:
+            yield
+            return
+        if bulk_edges and self._bulk_edge_files is None and self._bulk_replaced is None:
+            with self._grouped_bulk_edges():
+                yield
+            return
+        self._write_group = [0]
+        self._write_group_limit = max(1, limit)
+        try:
+            yield
+            self._commit_write_group()
+        except BaseException:
+            if self._conn.in_transaction:
+                self._conn.rollback()
+            self._bulk_replacing.clear()
+            raise
+        finally:
+            self._write_group = None
+
+    @contextmanager
+    def _grouped_bulk_edges(self) -> Iterator[None]:
+        """:meth:`grouped_writes` in one transaction with the edge indexes dropped.
+
+        For a write that replaces most of the edge rows: building the indexes
+        once is cheaper than updating them for every row. As in
+        :meth:`bulk_edge_load`, a stored file's pre-load rows stay in place
+        while it runs and are deleted in one pass at the end, which leaves the
+        rows and ids a per-file DELETE would. The reads between writes do not
+        read edges. A failure rolls the whole transaction back, indexes too.
+        """
+        self._begin_immediate()
+        try:
+            old_max_id = self._conn.execute("SELECT MAX(id) FROM edges").fetchone()[0]
+            indexes = self._conn.execute(
+                "SELECT name, sql FROM sqlite_master WHERE type = 'index' "
+                "AND tbl_name = 'edges' AND sql IS NOT NULL ORDER BY rowid"
+            ).fetchall()
+            # DROP INDEX deletes an index's planner statistics. An update does
+            # not run ANALYZE, so they are put back as they were.
+            stats = self._edge_index_stats({name for name, _sql in indexes})
+            for name, _sql in indexes:
+                self._conn.execute(f'DROP INDEX IF EXISTS "{name}"')  # nosec B608
+        except BaseException:
+            self._conn.rollback()
+            raise
+        self._bulk_edge_files = set()
+        self._bulk_replaced = set() if old_max_id is not None else None
+        self._bulk_replacing.clear()
+        # Never full: everything commits once, after the indexes are back.
+        self._write_group = [0]
+        self._write_group_limit = sys.maxsize
+        finished = False
+        try:
+            yield
+            finished = True
+        finally:
+            self._write_group = None
+            self._bulk_edge_files = None
+            replaced, self._bulk_replaced = self._bulk_replaced, None
+            if finished and replaced is not None:
+                replaced.update(self._bulk_replacing)
+            self._bulk_replacing.clear()
+            if not finished and self._conn.in_transaction:
+                # Left: only what a commit in between (another writer's
+                # BEGIN) already made durable.
+                self._conn.rollback()
+            if replaced:
+                self._delete_replaced_edges(old_max_id, replaced, commit=False)
+            present = {
+                row[0] for row in self._conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'index' "
+                    "AND tbl_name = 'edges'"
+                )
+            }
+            for name, sql in indexes:
+                if name not in present:
+                    self._conn.execute(sql)
+            if stats and self._edge_index_stats({name for name, _sql in indexes}) != stats:
+                self._conn.execute(
+                    "DELETE FROM sqlite_stat1 WHERE tbl = 'edges' AND idx IN "
+                    "(SELECT value FROM json_each(?))",
+                    (json.dumps([idx for _rowid, _tbl, idx, _stat in stats]),),
+                )
+                self._conn.executemany(
+                    "INSERT INTO sqlite_stat1 (rowid, tbl, idx, stat) VALUES (?, ?, ?, ?)",
+                    stats,
+                )
+                # Load the restored rows into the query planner.
+                self._conn.execute("ANALYZE sqlite_schema")
+            self._conn.commit()
+            self._invalidate_cache()
+
+    def _edge_index_stats(self, names: set[str]) -> list[tuple[int, str, str, str]]:
+        """The sqlite_stat1 rows of the edge indexes *names*, in rowid order."""
+        if self._conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'sqlite_stat1'"
+        ).fetchone() is None:
+            return []
+        return [
+            (row[0], row[1], row[2], row[3]) for row in self._conn.execute(
+                "SELECT rowid, tbl, idx, stat FROM sqlite_stat1 WHERE tbl = 'edges' "
+                "ORDER BY rowid"
+            ) if row[2] in names
+        ]
+
+    def _grouped_write(self, write: Callable[[], None], files: int) -> None:
+        """Run *write* in the open :meth:`grouped_writes` transaction."""
+        group = self._write_group
+        assert group is not None
+        if not self._conn.in_transaction:
+            self._begin_immediate()
+            group[0] = 0
+        try:
+            write()
+        except BaseException:
+            self._conn.rollback()
+            self._bulk_replacing.clear()
+            group[0] = 0
+            raise
+        group[0] += files
+        self._invalidate_cache()
+        if group[0] >= self._write_group_limit:
+            self._commit_write_group()
+
+    def _commit_write_group(self) -> None:
+        """Commit the files :meth:`grouped_writes` has stored so far."""
+        group = self._write_group
+        if group is None:
+            return
+        if self._conn.in_transaction:
+            self._conn.commit()
+            self._bulk_committed()
+        group[0] = 0
+
+    def edge_row_share(self, file_paths: Iterable[str]) -> float:
+        """The share of the edge rows filed under *file_paths*, from 0 to 1."""
+        total = self._conn.execute("SELECT COUNT(*) FROM edges").fetchone()[0]
+        if not total:
+            return 0.0
+        count = 0
+        for path in dict.fromkeys(normalize_file_path(p) for p in file_paths):
+            count += self._conn.execute(
+                "SELECT COUNT(*) FROM edges WHERE file_path = ?", (path,),
+            ).fetchone()[0]
+        return count / total
 
     def _bulk_committed(self) -> None:
         """Count the files of a committed transaction as replaced by the bulk load."""
@@ -2093,7 +2286,9 @@ class GraphStore:
         self._bulk_committed()
         self._invalidate_cache()
 
-    def _delete_replaced_edges(self, old_max_id: int, replaced: set[str]) -> None:
+    def _delete_replaced_edges(
+        self, old_max_id: int, replaced: set[str], commit: bool = True,
+    ) -> None:
         """Delete the pre-load edge rows (id <= *old_max_id*) of the *replaced* files."""
         self._conn.execute(
             "CREATE TEMP TABLE IF NOT EXISTS crg_bulk_replaced (path TEXT PRIMARY KEY)"
@@ -2109,7 +2304,8 @@ class GraphStore:
             (old_max_id,),
         )
         self._conn.execute("DROP TABLE temp.crg_bulk_replaced")
-        self._conn.commit()
+        if commit:
+            self._conn.commit()
 
     def store_file_edges(self, file_path: str, edges: list[EdgeInfo]) -> None:
         """Atomically replace a file's edges and keep its node rows.
@@ -2126,6 +2322,12 @@ class GraphStore:
         one commit per file was most of the cost of writing them.
         """
         if not batch:
+            return
+        if self._write_group is not None:
+            def write() -> None:
+                for file_path, edges in batch:
+                    self._replace_file_edges(normalize_file_path(file_path), edges)
+            self._grouped_write(write, len(batch))
             return
         self._begin_immediate()
         try:
@@ -2153,10 +2355,18 @@ class GraphStore:
             )
             for row in stored
         )
-        self._conn.execute("DELETE FROM edges WHERE file_path = ?", (normalized,))
-        self._insert_edges(
-            self._aligned_edges(normalized, edges, collisions), time.time(),
-        )
+        bulk_files = self._bulk_edge_files
+        if bulk_files is None or normalized in bulk_files:
+            self._conn.execute("DELETE FROM edges WHERE file_path = ?", (normalized,))
+        if self._bulk_replaced is not None:
+            self._bulk_replacing.append(normalized)
+        aligned = self._aligned_edges(normalized, edges, collisions)
+        if bulk_files is not None:
+            if all(edge.file_path == normalized for edge in aligned):
+                bulk_files.add(normalized)
+            else:
+                self._bulk_edge_files = None
+        self._insert_edges(aligned, time.time())
 
     def relocate_edge_targets(self, old_prefix: str, new_prefix: str) -> int:
         """Rewrite edge targets that start with *old_prefix* to *new_prefix*.
@@ -2658,6 +2868,17 @@ class GraphStore:
     def get_nodes_by_file(self, file_path: str) -> list[GraphNode]:
         return list(self.iter_nodes_by_file(file_path))
 
+    def first_file_hash(self, file_path: str) -> tuple[bool, Optional[str]]:
+        """Whether *file_path* has nodes, and the ``file_hash`` of its first one.
+
+        The first node of :meth:`get_nodes_by_file`, read without loading the rest.
+        """
+        row = self._conn.execute(
+            "SELECT file_hash FROM nodes WHERE file_path = ? LIMIT 1",
+            (normalize_file_path(file_path),),
+        ).fetchone()
+        return (False, None) if row is None else (True, row[0])
+
     def iter_nodes_by_file(self, file_path: str) -> Iterator[GraphNode]:
         """Yield file nodes without first materializing the complete row set."""
         rows = self._conn.execute(
@@ -2715,6 +2936,31 @@ class GraphStore:
         dependents = {row[0] for row in rows}
         dependents.discard(file_path)
         dependents.discard(norm_fp)
+        return dependents
+
+    def get_direct_dependent_files_of_all(self, file_paths: list[str]) -> set[str]:
+        """The union of :meth:`get_direct_dependent_files` over *file_paths*.
+
+        For paths already in normal form, so each one's own spelling is the
+        only one to drop. A few chunked queries instead of one per file.
+        """
+        dependents: set[str] = set()
+        for start in range(0, len(file_paths), 400):
+            chunk = file_paths[start:start + 400]
+            marks = ",".join("?" * len(chunk))
+            rows = self._conn.execute(
+                "SELECT file_path FROM edges INDEXED BY idx_edges_target_kind "  # nosec B608
+                f"WHERE target_qualified IN ({marks}) AND kind = 'IMPORTS_FROM' "
+                "UNION "
+                "SELECT e.file_path FROM nodes n "
+                "JOIN edges e INDEXED BY idx_edges_target_kind "
+                "ON e.target_qualified = n.qualified_name "
+                f"WHERE n.file_path IN ({marks}) "
+                "AND e.kind IN ('CALLS', 'IMPORTS_FROM', 'INHERITS', 'IMPLEMENTS')",
+                (*chunk, *chunk),
+            ).fetchall()
+            dependents.update(row[0] for row in rows)
+        dependents.difference_update(file_paths)
         return dependents
 
     def iter_edges_by_target(self, qualified_name: str) -> Iterator[GraphEdge]:
@@ -3690,7 +3936,7 @@ class GraphStore:
             edge_extra, node.qualified_name, node.file_path, node.parent_name,
         )
 
-    def resolve_bare_call_targets(self) -> int:
+    def resolve_bare_call_targets(self, *, scoped: bool = False) -> int:
         """Resolve bare CALLS targets backed by same-file or import evidence.
 
         After parsing, some CALLS edges have bare targets (no ``::`` separator)
@@ -3705,7 +3951,7 @@ class GraphStore:
         # context. Fill it fresh here so a write that bypassed the store's
         # invalidation (a resolver using the raw connection) is never missed.
         self._drop_bare_endpoint_context()
-        return self._resolve_bare_endpoints("CALLS", "target_qualified")
+        return self._resolve_bare_endpoints("CALLS", "target_qualified", scoped=scoped)
 
     # -- Target-resolution certainty --------------------------------------
 
@@ -3722,33 +3968,54 @@ class GraphStore:
         """
         # The inherited walk first: it needs the name the parser wrote, and it
         # takes up edges an earlier pass settled.
-        self._resolve_inherited_endpoints()
-        self._settle_unbound_endpoints()
-        self._begin_immediate()
         try:
-            changed = self._native_certainty_refresh() if self._native_sql else -1
-            if changed < 0:
-                changed = self._certainty_refresh_sql()
-            self._conn.commit()
-        except BaseException:
-            self._conn.rollback()
-            raise
-        self._settle_collision_endpoints()
+            self._collect_endpoint_rows()
+            self._resolve_inherited_endpoints()
+            self._settle_unbound_endpoints()
+            # Read before the refresh's own writes; triggers off before them.
+            scope_floor = getattr(self, "_certainty_scope_floor", None)
+            if scope_floor is not None:
+                self._drop_certainty_triggers()
+            self._begin_immediate()
+            try:
+                changed = (
+                    self._native_certainty_refresh(scope_floor) if self._native_sql else -1
+                )
+                if changed < 0:
+                    changed = self._certainty_refresh_sql()
+                self._conn.commit()
+            except BaseException:
+                self._conn.rollback()
+                raise
+            # Still inside the capture: the collision pass reads only the rows
+            # that can hold its key (see _settle_collision_endpoints).
+            self._settle_collision_endpoints(
+                scope_floor if getattr(self, "_endpoint_rows_kept", False) else None
+            )
+        finally:
+            if getattr(self, "_certainty_scope_floor", None) is not None:
+                self._end_certainty_scope()
         return changed
 
-    def _native_certainty_refresh(self) -> int:
+    def _native_certainty_refresh(self, scope_floor: Optional[int] = None) -> int:
         """The four UPDATEs of ``_certainty_refresh_sql`` in one native pass.
 
         Same rows, same values, and the same count back. -1 when a row holds
         a value the native pass does not read the way SQLite does; it has then
-        written nothing.
+        written nothing. With *scope_floor* it reads only the rows the
+        certainty capture says can change (see ``_begin_certainty_scope``);
+        every other row is already at the answer.
         """
         import crg_fast
 
-        token = crg_fast.stage_certainty_refresh(
+        args: tuple = (
             list(_RESOLVER_BOUND_KEYS),
             (_SCORE_UNRESOLVED, _SCORE_AMBIGUOUS, _SCORE_INFERRED, _SCORE_EXTRACTED),
         )
+        if scope_floor is None:
+            token = crg_fast.stage_certainty_refresh(*args)
+        else:
+            token = crg_fast.stage_certainty_refresh(*args, scope_floor=scope_floor)
         try:
             row = self._conn.execute("SELECT crg_run(?)", (token,)).fetchone()
         except BaseException:
@@ -3806,6 +4073,15 @@ class GraphStore:
         Runs before ``_settle_unbound_endpoints`` and also takes up edges that
         pass settled earlier. Returns the number of edges changed. See: #984
         """
+        if self._native_sql:
+            scope_floor = getattr(self, "_certainty_scope_floor", None)
+            native = (
+                self._native_resolver_job("stage_inherited_resolve", scope_floor=scope_floor)
+                if scope_floor is not None and getattr(self, "_endpoint_rows_kept", False)
+                else self._native_resolver_job("stage_inherited_resolve")
+            )
+            if native >= 0:
+                return native
         conn = self._conn
         work: list[tuple[str, sqlite3.Row, dict, str, str, str]] = []
         for kind, column in (
@@ -3940,6 +4216,17 @@ class GraphStore:
 
         Returns the number of edges changed.
         """
+        if self._native_sql:
+            # The certainty capture is still on here: the unbound scans need
+            # only read what it holds.
+            scope_floor = getattr(self, "_certainty_scope_floor", None)
+            native = (
+                self._native_resolver_job("stage_unbound_settle")
+                if scope_floor is None or not getattr(self, "_endpoint_rows_kept", False)
+                else self._native_resolver_job("stage_unbound_settle", scope_floor=scope_floor)
+            )
+            if native >= 0:
+                return native
         conn = self._conn
         changes: dict[str, list[tuple[str, str, int]]] = {}
         for kind, column, managed_key in _NODE_ENDPOINTS:
@@ -4061,12 +4348,16 @@ class GraphStore:
         rows = self._conn.execute(
             "SELECT e.id, e.source_qualified, e.target_qualified, e.file_path, "
             "e.line, e.extra, s.parent_name, t.id target_id "
-            "FROM edges e "
-            "JOIN nodes s ON s.qualified_name = e.source_qualified "
+            # Drive the join from the (few) C++ nodes: starting from every
+            # CALLS edge costs a node lookup per edge in a mostly non-C++ graph.
+            "FROM nodes s "
+            "CROSS JOIN edges e ON e.source_qualified = s.qualified_name "
+            "AND e.kind = 'CALLS' "
             "LEFT JOIN nodes t ON t.qualified_name = e.target_qualified "
-            "WHERE e.kind = 'CALLS' AND s.language = 'cpp' "
+            "WHERE s.language = 'cpp' "
             "AND ((t.id IS NULL AND e.target_qualified LIKE '%::%') "
-            "OR e.extra LIKE '%\"cpp_scoped_target\"%')",
+            "OR e.extra LIKE '%\"cpp_scoped_target\"%') "
+            "ORDER BY e.id",
         ).fetchall()
         if not rows:
             return 0
@@ -4261,7 +4552,7 @@ class GraphStore:
                 raise
         return resolved
 
-    def resolve_bare_tested_by_sources(self) -> int:
+    def resolve_bare_tested_by_sources(self, *, scoped: bool = False) -> int:
         """Resolve bare TESTED_BY sources backed by graph evidence.
 
         TESTED_BY edges copy the target of a test's CALLS edge, so unresolved
@@ -4272,16 +4563,519 @@ class GraphStore:
         Returns the number of resolved edges.
         """
         try:
-            return self._resolve_bare_endpoints("TESTED_BY", "source_qualified")
+            return self._resolve_bare_endpoints(
+                "TESTED_BY", "source_qualified", scoped=scoped,
+            )
         finally:
             # The pair is done: do not keep a copy of every node name alive
             # for the rest of the store's life (watch mode keeps one open).
             self._drop_bare_endpoint_context()
 
+    def resolve_bare_endpoints(self, *, scoped: bool = False) -> int:
+        """``resolve_bare_call_targets`` then ``resolve_bare_tested_by_sources``.
+
+        The native engine runs both passes as one job on one evidence context,
+        which is what the two calls do in Python. Returns the sum of their
+        counts.
+        """
+        if self._native_sql and self._bare_kinds_pending() == ("CALLS", "TESTED_BY"):
+            import crg_fast
+
+            if getattr(crg_fast, "stage_bare_resolve_pair", None) is not None:
+                floor = self._scope_edge_floor if scoped else None
+                try:
+                    packed = (
+                        self._native_resolver_job("stage_bare_resolve_pair")
+                        if floor is None
+                        else self._native_resolver_job(
+                            "stage_bare_resolve_pair", scope_floor=floor,
+                        )
+                    )
+                finally:
+                    self._drop_bare_endpoint_context()
+                if packed >= 0:
+                    for count, kind, side in (
+                        (packed >> 32, "CALLS", "targets"),
+                        (packed & 0xFFFFFFFF, "TESTED_BY", "sources"),
+                    ):
+                        if count:
+                            logger.info(
+                                "Resolved %d evidence-backed bare %s %s", count, kind, side,
+                            )
+                    return (packed >> 32) + (packed & 0xFFFFFFFF)
+        resolved = self.resolve_bare_call_targets(scoped=scoped)
+        return resolved + self.resolve_bare_tested_by_sources(scoped=scoped)
+
+    def _bare_kinds_pending(self) -> tuple[str, ...]:
+        """The kinds among CALLS and TESTED_BY with an edge the bare pass reads."""
+        row = self._conn.execute(
+            "SELECT EXISTS(SELECT 1 FROM edges WHERE kind = 'CALLS' AND ("
+            "target_qualified NOT LIKE '%::%' "
+            "OR extra LIKE '%\"bare_call_target\"%')), "
+            "EXISTS(SELECT 1 FROM edges WHERE kind = 'TESTED_BY' AND ("
+            "source_qualified NOT LIKE '%::%' "
+            "OR extra LIKE '%\"bare_tested_by_source\"%'))"
+        ).fetchone()
+        return tuple(kind for kind, hit in zip(("CALLS", "TESTED_BY"), row) if hit)
+
     def _drop_bare_endpoint_context(self) -> None:
         with self._cache_lock:
             self._cache_epoch += 1
             self._bare_endpoint_context_cache = None
+
+    # -- Change capture for a scoped bare-endpoint pass ---------------------
+    #
+    # An update that starts from a complete graph starts from a fixed point of
+    # the bare-endpoint pass: running it again writes nothing. What that pass
+    # decides for one edge depends on the edge row itself, on the Function,
+    # Test and Class nodes that share the bare name or are the caller, on
+    # Class and File nodes, and on the IMPORTS_FROM and INHERITS edges. So
+    # after an update only the edges that touch something that changed can
+    # get a different answer. The capture records those changes in TEMP
+    # tables, which live in this connection alone: nothing is stored in the
+    # graph. Any change to Class or File nodes, or to import or inheritance
+    # edges, can move answers far away, and then the pass runs in full.
+
+    _CAPTURE_TRIGGERS = (
+        "crg_cap_node_ins", "crg_cap_node_del", "crg_cap_node_upd",
+        "crg_cap_edge_del", "crg_cap_edge_upd",
+    )
+    _NODE_KINDS_SQL = "('Function', 'Test', 'Class', 'File')"
+    _SHAPE_EDGE_KINDS_SQL = "('IMPORTS_FROM', 'INHERITS')"
+
+    @staticmethod
+    def _node_log_row(ref: str, sign: int) -> str:
+        return (
+            f"INSERT INTO temp.crg_change_log SELECT 'n', {sign}, {ref}.id, "
+            f"{ref}.kind, {ref}.name, {ref}.qualified_name, {ref}.file_path, "
+            f"{ref}.parent_name, {ref}.language, CASE WHEN {ref}.kind IN "
+            f"('Class', 'File') THEN {ref}.extra END "
+        )
+
+    @staticmethod
+    def _edge_log_row(ref: str, sign: int) -> str:
+        return (
+            f"INSERT INTO temp.crg_change_log SELECT 'e', {sign}, {ref}.id, "
+            f"{ref}.kind, {ref}.source_qualified, {ref}.target_qualified, "
+            f"{ref}.file_path, CASE WHEN {ref}.kind IN "
+            f"{GraphStore._SHAPE_EDGE_KINDS_SQL} THEN {ref}.extra END, NULL, NULL "
+        )
+
+    def begin_change_capture(self) -> bool:
+        """Start recording node and edge changes on this connection."""
+        conn = self._conn
+        nodes = self._NODE_KINDS_SQL
+        shape = self._SHAPE_EDGE_KINDS_SQL
+        resolved = "('CALLS', 'TESTED_BY', 'IMPORTS_FROM', 'INHERITS')"
+        node_cols = "kind, name, qualified_name, file_path, parent_name, language, extra"
+        edge_cols = "kind, source_qualified, target_qualified, file_path, extra"
+        # ``edges.id`` is AUTOINCREMENT, so every edge inserted from here on
+        # has an id above the sequence's current value. Triggers take no
+        # parameters; the floor is an int read from the database.
+        try:
+            row = conn.execute(
+                "SELECT seq FROM sqlite_sequence WHERE name = 'edges'"
+            ).fetchone()
+        except sqlite3.Error as exc:
+            logger.debug("Change capture unavailable: %s", exc)
+            return False
+        floor = int(row[0]) if row else 0
+        self._capture_edge_floor = floor
+        statements = [
+            "CREATE TEMP TABLE IF NOT EXISTS crg_change_log ("
+            "tbl TEXT, sign INTEGER, row_id INTEGER, kind TEXT, "
+            "a TEXT, b TEXT, c TEXT, d TEXT, e TEXT, f TEXT)",
+            "DELETE FROM temp.crg_change_log",
+            f"CREATE TEMP TRIGGER IF NOT EXISTS crg_cap_node_ins AFTER INSERT ON main.nodes "
+            f"WHEN NEW.kind IN {nodes} BEGIN {self._node_log_row('NEW', 1)}; END",
+            f"CREATE TEMP TRIGGER IF NOT EXISTS crg_cap_node_del AFTER DELETE ON main.nodes "
+            f"WHEN OLD.kind IN {nodes} BEGIN {self._node_log_row('OLD', -1)}; END",
+            f"CREATE TEMP TRIGGER IF NOT EXISTS crg_cap_node_upd AFTER UPDATE OF "
+            f"{node_cols} ON main.nodes "
+            f"WHEN OLD.kind IN {nodes} OR NEW.kind IN {nodes} BEGIN "
+            f"{self._node_log_row('OLD', -1)} WHERE OLD.kind IN {nodes}; "
+            f"{self._node_log_row('NEW', 1)} WHERE NEW.kind IN {nodes}; END",
+            # An AFTER INSERT trigger on edges slows the bulk insert about
+            # sixfold, so new edges (ids above the floor) are read at the end
+            # instead, and these triggers only see rows that existed before.
+            f"CREATE TEMP TRIGGER IF NOT EXISTS crg_cap_edge_del AFTER DELETE ON main.edges "
+            f"WHEN OLD.id <= {floor} AND OLD.kind IN {shape} "
+            f"BEGIN {self._edge_log_row('OLD', -1)}; END",
+            f"CREATE TEMP TRIGGER IF NOT EXISTS crg_cap_edge_upd AFTER UPDATE OF "
+            f"{edge_cols} ON main.edges "
+            f"WHEN OLD.id <= {floor} AND (OLD.kind IN {resolved} OR NEW.kind IN {resolved}) "
+            f"BEGIN {self._edge_log_row('OLD', -1)} WHERE OLD.kind IN {shape}; "
+            f"{self._edge_log_row('NEW', 1)}; END",
+        ]
+        try:
+            for statement in statements:
+                conn.execute(statement)
+        except sqlite3.Error as exc:
+            logger.debug("Change capture unavailable: %s", exc)
+            self.end_change_capture()
+            return False
+        self._change_capture_active = True
+        self._begin_certainty_scope(floor)
+        return True
+
+    # -- Change capture for a scoped certainty refresh -----------------------
+
+    _CERTAINTY_TRIGGERS = (
+        "crg_cert_edge_upd", "crg_cert_node_ins", "crg_cert_node_del", "crg_cert_node_upd",
+    )
+
+    def _begin_certainty_scope(self, floor: int) -> None:
+        """Record what the certainty refresh reads, from now until it runs.
+
+        The refresh is a function of each row and of whether its endpoint
+        names a node, and the graph is at its fixed point when the capture
+        starts. So only rows inserted since (ids above *floor*), rows updated
+        since, and rows whose endpoint is a name a node gained or lost can
+        come out different. Unlike the bare capture this one stays on through
+        every resolver, up to the refresh, which drops it.
+        """
+        conn = self._conn
+        node_ins = "INSERT OR IGNORE INTO temp.crg_cert_qn VALUES"
+        statements = [
+            "CREATE TEMP TABLE IF NOT EXISTS crg_cert_edge (id INTEGER PRIMARY KEY)",
+            "CREATE TEMP TABLE IF NOT EXISTS crg_cert_qn (qn TEXT PRIMARY KEY)",
+            "DELETE FROM temp.crg_cert_edge",
+            "DELETE FROM temp.crg_cert_qn",
+            "CREATE TEMP TRIGGER IF NOT EXISTS crg_cert_edge_upd AFTER UPDATE OF "
+            "kind, source_qualified, target_qualified, extra, confidence_tier, "
+            f"target_resolution, confidence ON main.edges WHEN OLD.id <= {floor} "
+            "BEGIN INSERT OR IGNORE INTO temp.crg_cert_edge VALUES (OLD.id); END",
+            "CREATE TEMP TRIGGER IF NOT EXISTS crg_cert_node_ins AFTER INSERT ON main.nodes "
+            f"BEGIN {node_ins} (NEW.qualified_name); END",
+            "CREATE TEMP TRIGGER IF NOT EXISTS crg_cert_node_del AFTER DELETE ON main.nodes "
+            f"BEGIN {node_ins} (OLD.qualified_name); END",
+            "CREATE TEMP TRIGGER IF NOT EXISTS crg_cert_node_upd AFTER UPDATE OF "
+            "qualified_name ON main.nodes "
+            f"BEGIN {node_ins} (OLD.qualified_name); {node_ins} (NEW.qualified_name); END",
+        ]
+        try:
+            for statement in statements:
+                conn.execute(statement)
+        except sqlite3.Error as exc:
+            logger.debug("Certainty capture unavailable: %s", exc)
+            self._end_certainty_scope()
+            return
+        self._certainty_scope_floor: Optional[int] = floor
+
+    def _collect_endpoint_rows(self) -> None:
+        """Keep, for the native passes, the rows that may hold a moved endpoint.
+
+        The inherited and the unbound passes each read the rows whose
+        ``extra`` names a claimed or an inherited endpoint. One scan for
+        ``endpoint"`` (a superset of both, LIKE being case-blind alike) into
+        ``temp.crg_endpoint_rows`` replaces their full scans. Only for a
+        native update with the certainty capture on: rows the passes write
+        later are in the capture.
+        """
+        self._endpoint_rows_kept = False
+        if not self._native_sql or getattr(self, "_certainty_scope_floor", None) is None:
+            return
+        conn = self._conn
+        try:
+            conn.execute(
+                "CREATE TEMP TABLE IF NOT EXISTS crg_endpoint_rows (id INTEGER PRIMARY KEY)"
+            )
+            conn.execute("DELETE FROM temp.crg_endpoint_rows")
+            conn.execute(
+                "INSERT INTO temp.crg_endpoint_rows "
+                "SELECT id FROM edges WHERE extra LIKE ?", ('%endpoint"%',),
+            )
+        except sqlite3.Error as exc:
+            logger.debug("Endpoint rows unavailable: %s", exc)
+            return
+        self._endpoint_rows_kept = True
+
+    def _drop_certainty_triggers(self) -> None:
+        for trigger in self._CERTAINTY_TRIGGERS:
+            try:
+                self._conn.execute(f"DROP TRIGGER IF EXISTS temp.{trigger}")
+            except sqlite3.Error as exc:  # pragma: no cover - defensive
+                logger.debug("Could not drop %s: %s", trigger, exc)
+
+    def _end_certainty_scope(self) -> None:
+        """Drop the certainty capture; the next refresh reads every row."""
+        self._certainty_scope_floor = None
+        self._endpoint_rows_kept = False
+        conn = self._conn
+        try:
+            for trigger in self._CERTAINTY_TRIGGERS:
+                conn.execute(f"DROP TRIGGER IF EXISTS temp.{trigger}")
+            for table in ("crg_cert_edge", "crg_cert_qn", "crg_endpoint_rows"):
+                conn.execute(f"DROP TABLE IF EXISTS temp.{table}")
+        except sqlite3.Error as exc:  # pragma: no cover - defensive
+            logger.debug("Could not drop the certainty capture: %s", exc)
+
+    # -- Which kept files an update reached, for incremental flows -----------
+
+    _FLOW_SCOPE_TRIGGERS = (
+        "crg_flow_edge_del", "crg_flow_edge_upd",
+        "crg_flow_node_ins", "crg_flow_node_del", "crg_flow_node_upd",
+    )
+    _FLOW_SCOPE_TABLES = (
+        "crg_flow_file", "crg_flow_end", "crg_flow_qn", "crg_flow_moved", "crg_flow_kept",
+    )
+
+    def begin_flow_scope(self) -> bool:
+        """Record what the update writes that a stored flow is traced from.
+
+        A flow is a function of the ``CALLS`` and ``TESTED_BY`` edges it walks
+        and of its nodes' names, kinds, files, test flags and decorators.
+        :meth:`flow_scope_hits` later names the files, of a given set, that
+        those writes reached, so an update can leave the flows of the others
+        as stored. Like the bare capture, rows inserted on edges are read by
+        id at the end (a trigger there slows the bulk insert), and the
+        triggers see rows that existed before.
+        """
+        self._flow_scope_floor: Optional[int] = None
+        conn = self._conn
+        try:
+            row = conn.execute(
+                "SELECT seq FROM sqlite_sequence WHERE name = 'edges'"
+            ).fetchone()
+        except sqlite3.Error as exc:
+            logger.debug("Flow scope unavailable: %s", exc)
+            return False
+        floor = int(row[0]) if row else 0
+        file_ins = "INSERT OR IGNORE INTO temp.crg_flow_file VALUES"
+        end_ins = "INSERT OR IGNORE INTO temp.crg_flow_end VALUES"
+
+        def count(ref: str, step: int) -> str:
+            return (
+                f"INSERT INTO temp.crg_flow_qn VALUES ({ref}.qualified_name, {step}) "
+                f"ON CONFLICT(qn) DO UPDATE SET n = n + {step}"
+            )
+
+        statements = [
+            "CREATE TEMP TABLE IF NOT EXISTS crg_flow_file (file_path TEXT PRIMARY KEY)",
+            "CREATE TEMP TABLE IF NOT EXISTS crg_flow_end (qn TEXT PRIMARY KEY)",
+            "CREATE TEMP TABLE IF NOT EXISTS crg_flow_qn "
+            "(qn TEXT PRIMARY KEY, n INTEGER NOT NULL)",
+            "CREATE TEMP TABLE IF NOT EXISTS crg_flow_moved (qn TEXT PRIMARY KEY)",
+            "DELETE FROM temp.crg_flow_file",
+            "DELETE FROM temp.crg_flow_end",
+            "DELETE FROM temp.crg_flow_qn",
+            "DELETE FROM temp.crg_flow_moved",
+            "CREATE TEMP TRIGGER IF NOT EXISTS crg_flow_edge_del AFTER DELETE ON main.edges "
+            f"WHEN OLD.id <= {floor} BEGIN {file_ins} (OLD.file_path); "
+            f"{end_ins} (OLD.source_qualified); {end_ins} (OLD.target_qualified); END",
+            "CREATE TEMP TRIGGER IF NOT EXISTS crg_flow_edge_upd AFTER UPDATE OF "
+            "kind, source_qualified, target_qualified, file_path ON main.edges "
+            f"WHEN OLD.id <= {floor} BEGIN {file_ins} (OLD.file_path); "
+            f"{file_ins} (NEW.file_path); "
+            f"{end_ins} (OLD.source_qualified); {end_ins} (OLD.target_qualified); "
+            f"{end_ins} (NEW.source_qualified); {end_ins} (NEW.target_qualified); END",
+            "CREATE TEMP TRIGGER IF NOT EXISTS crg_flow_node_ins AFTER INSERT ON main.nodes "
+            f"BEGIN {count('NEW', 1)}; END",
+            "CREATE TEMP TRIGGER IF NOT EXISTS crg_flow_node_del AFTER DELETE ON main.nodes "
+            f"BEGIN {count('OLD', -1)}; END",
+            "CREATE TEMP TRIGGER IF NOT EXISTS crg_flow_node_upd AFTER UPDATE OF "
+            "kind, name, qualified_name, file_path, is_test, extra ON main.nodes "
+            f"BEGIN {file_ins} (OLD.file_path); {file_ins} (NEW.file_path); "
+            "INSERT OR IGNORE INTO temp.crg_flow_moved VALUES (OLD.qualified_name); "
+            "INSERT OR IGNORE INTO temp.crg_flow_moved VALUES (NEW.qualified_name); END",
+        ]
+        try:
+            for statement in statements:
+                conn.execute(statement)
+        except sqlite3.Error as exc:
+            logger.debug("Flow scope unavailable: %s", exc)
+            self.end_flow_scope()
+            return False
+        self._flow_scope_floor = floor
+        return True
+
+    def flow_scope_hits(self, file_paths: list[str]) -> Optional[set[str]]:
+        """The *file_paths* whose flows the writes since :meth:`begin_flow_scope` reach.
+
+        A file is reached when an edge it holds was written, or a node it
+        holds is an endpoint of a written edge, or the partner, across any
+        edge, of a node that appeared, disappeared or changed. Flows that
+        touch none of those files trace as stored. None: no scope is on.
+        """
+        floor = getattr(self, "_flow_scope_floor", None)
+        if floor is None:
+            return None
+        conn = self._conn
+        partners = (
+            "SELECT qn FROM temp.crg_flow_qn WHERE n != 0 "
+            "UNION SELECT qn FROM temp.crg_flow_moved"
+        )
+        end_ins = "INSERT OR IGNORE INTO temp.crg_flow_end"
+        try:
+            conn.execute(
+                "CREATE TEMP TABLE IF NOT EXISTS crg_flow_kept (file_path TEXT PRIMARY KEY)"
+            )
+            conn.execute("DELETE FROM temp.crg_flow_kept")
+            conn.executemany(
+                "INSERT OR IGNORE INTO temp.crg_flow_kept VALUES (?)",
+                [(path,) for path in file_paths],
+            )
+            conn.execute(f"{end_ins} {partners}")  # nosec B608
+            conn.execute(
+                f"{end_ins} SELECT source_qualified FROM edges "  # nosec B608
+                f"WHERE target_qualified IN ({partners})"
+            )
+            conn.execute(
+                f"{end_ins} SELECT target_qualified FROM edges "  # nosec B608
+                f"WHERE source_qualified IN ({partners})"
+            )
+            conn.execute(
+                f"{end_ins} SELECT source_qualified FROM edges WHERE id > ? "
+                "UNION SELECT target_qualified FROM edges WHERE id > ?",
+                (floor, floor),
+            )
+            conn.execute(
+                "INSERT OR IGNORE INTO temp.crg_flow_file "
+                "SELECT file_path FROM edges WHERE id > ?",
+                (floor,),
+            )
+            rows = conn.execute(
+                "SELECT k.file_path FROM temp.crg_flow_kept k "
+                "WHERE k.file_path IN (SELECT file_path FROM temp.crg_flow_file) "
+                "OR EXISTS (SELECT 1 FROM nodes n JOIN temp.crg_flow_end q "
+                "ON q.qn = n.qualified_name WHERE n.file_path = k.file_path)"
+            ).fetchall()
+        except sqlite3.Error as exc:
+            logger.debug("Flow scope unreadable: %s", exc)
+            return None
+        return {row[0] for row in rows}
+
+    def end_flow_scope(self) -> None:
+        """Drop the flow scope's triggers and tables."""
+        self._flow_scope_floor = None
+        conn = self._conn
+        try:
+            for trigger in self._FLOW_SCOPE_TRIGGERS:
+                conn.execute(f"DROP TRIGGER IF EXISTS temp.{trigger}")
+            for table in self._FLOW_SCOPE_TABLES:
+                conn.execute(f"DROP TABLE IF EXISTS temp.{table}")
+        except sqlite3.Error as exc:  # pragma: no cover - defensive
+            logger.debug("Could not drop the flow scope: %s", exc)
+
+    def end_change_capture(self) -> bool:
+        """Stop recording; prepare the dirty sets when a scoped pass is safe.
+
+        Returns True when ``resolve_bare_*(scoped=True)`` may be used, until
+        :meth:`drop_change_scope` is called.
+        """
+        conn = self._conn
+        active = getattr(self, "_change_capture_active", False)
+        self._change_capture_active = False
+        scoped = False
+        try:
+            for trigger in self._CAPTURE_TRIGGERS:
+                conn.execute(f"DROP TRIGGER IF EXISTS temp.{trigger}")
+            if active:
+                scoped = self._prepare_change_scope(conn)
+            conn.execute("DROP TABLE IF EXISTS temp.crg_change_log")
+        except sqlite3.Error as exc:
+            logger.debug("Change capture could not be read: %s", exc)
+            scoped = False
+        if not scoped:
+            self.drop_bare_scope()
+        return scoped
+
+    def _prepare_change_scope(self, conn: sqlite3.Connection) -> bool:
+        shape = self._SHAPE_EDGE_KINDS_SQL
+        conn.execute(
+            "INSERT INTO temp.crg_change_log SELECT 'e', 1, id, kind, "
+            "source_qualified, target_qualified, file_path, extra, NULL, NULL "
+            f"FROM main.edges WHERE id > ? AND kind IN {shape}",
+            (self._capture_edge_floor,),
+        )
+        # Rows that left and came back unchanged (a reparsed file) cancel out.
+        # What a file imports is evidence only for the edges written in that
+        # file and for the parents of the classes it defines, so a changed
+        # import scopes the pass to the file unless one of its classes has a
+        # parent. Directory scopes are shared by every importer of the
+        # directory, so a changed one still runs the full pass.
+        moved = conn.execute(
+            "SELECT 1 FROM ("
+            "SELECT 1 FROM temp.crg_change_log WHERE tbl = 'n' "
+            "AND kind IN ('Class', 'File') "
+            "GROUP BY kind, a, b, c, d, e, f HAVING SUM(sign) != 0 "
+            "UNION ALL "
+            "SELECT 1 FROM temp.crg_change_log WHERE tbl = 'e' "
+            "AND kind = 'INHERITS' "
+            "GROUP BY kind, a, b, c, d HAVING SUM(sign) != 0 "
+            "UNION ALL "
+            "SELECT 1 FROM temp.crg_change_log WHERE tbl = 'e' "
+            "AND kind = 'IMPORTS_FROM' AND d LIKE ? "
+            "GROUP BY kind, a, b, c, d HAVING SUM(sign) != 0"
+            ") LIMIT 1",
+            (f'%"{IMPORT_SCOPE_KEY}"%',),
+        ).fetchone()
+        if moved is not None:
+            return False
+        for table, column in (
+            ("crg_dirty_name", "name TEXT"),
+            ("crg_dirty_qn", "qn TEXT"),
+            ("crg_dirty_edge", "id INTEGER"),
+            ("crg_dirty_file", "path TEXT"),
+        ):
+            conn.execute(
+                f"CREATE TEMP TABLE IF NOT EXISTS {table} ({column} PRIMARY KEY)"
+            )
+            conn.execute(f"DELETE FROM temp.{table}")
+        conn.execute(
+            "INSERT OR IGNORE INTO temp.crg_dirty_file "
+            "SELECT c FROM temp.crg_change_log WHERE tbl = 'e' "
+            "AND kind = 'IMPORTS_FROM' AND c IS NOT NULL "
+            "GROUP BY kind, a, b, c, d HAVING SUM(sign) != 0"
+        )
+        parented = conn.execute(
+            "SELECT 1 FROM nodes n WHERE n.kind = 'Class' "
+            "AND n.file_path IN (SELECT path FROM temp.crg_dirty_file) "
+            "AND EXISTS (SELECT 1 FROM edges e WHERE e.kind = 'INHERITS' "
+            "AND e.source_qualified = n.qualified_name) LIMIT 1"
+        ).fetchone()
+        if parented is not None:
+            return False
+        changed = conn.execute(
+            "SELECT a, b FROM temp.crg_change_log WHERE tbl = 'n' "
+            "AND kind IN ('Function', 'Test') "
+            "GROUP BY kind, a, b, c, d, e, f HAVING SUM(sign) != 0"
+        ).fetchall()
+        names = {row[0] for row in changed if row[0] is not None}
+        if "initialize" in names:
+            # ``Shop::Cart.new`` is looked up as ``initialize``.
+            names.add("new")
+        conn.executemany(
+            "INSERT OR IGNORE INTO temp.crg_dirty_name VALUES (?)",
+            [(name,) for name in names],
+        )
+        conn.executemany(
+            "INSERT OR IGNORE INTO temp.crg_dirty_qn VALUES (?)",
+            [(row[1],) for row in changed if row[1] is not None],
+        )
+        conn.execute(
+            "INSERT OR IGNORE INTO temp.crg_dirty_edge "
+            "SELECT row_id FROM temp.crg_change_log WHERE tbl = 'e' AND sign = 1 "
+            "AND kind IN ('CALLS', 'TESTED_BY')"
+        )
+        self._scope_edge_floor = self._capture_edge_floor
+        return True
+
+    def drop_change_scope(self) -> None:
+        """Forget the last capture: its dirty sets and the certainty scope."""
+        self.drop_bare_scope()
+        self._end_certainty_scope()
+
+    def drop_bare_scope(self) -> None:
+        """Forget the dirty sets of the last capture, which only the bare passes read.
+
+        The certainty scope stays: the refresh after the bare passes reads it.
+        """
+        for table in ("crg_dirty_name", "crg_dirty_qn", "crg_dirty_edge", "crg_dirty_file"):
+            try:
+                self._conn.execute(f"DROP TABLE IF EXISTS temp.{table}")
+            except sqlite3.Error as exc:  # pragma: no cover - defensive
+                logger.debug("Could not drop %s: %s", table, exc)
 
     @staticmethod
     def _directory_member_files(
@@ -4485,8 +5279,14 @@ class GraphStore:
                 self._bare_endpoint_context_cache = result
         return result
 
-    def _resolve_bare_endpoints(self, kind: str, endpoint: str) -> int:
-        """Resolve a bare edge endpoint only when one candidate has evidence."""
+    def _resolve_bare_endpoints(
+        self, kind: str, endpoint: str, *, scoped: bool = False,
+    ) -> int:
+        """Resolve a bare edge endpoint only when one candidate has evidence.
+
+        *scoped* reads only the edges the last change capture can have moved
+        (see :meth:`end_change_capture`); the rest are already at the answer.
+        """
         if endpoint == "target_qualified":
             raw_key = "bare_call_target"
             endpoint_column = "target_qualified"
@@ -4527,6 +5327,20 @@ class GraphStore:
         if not has_bare:
             return 0
 
+        if self._native_sql:
+            native = self._native_bare_resolve(
+                kind, endpoint, self._scope_edge_floor if scoped else None,
+            )
+            if native >= 0:
+                if native:
+                    logger.info(
+                        "Resolved %d evidence-backed bare %s %s",
+                        native,
+                        kind,
+                        "sources" if endpoint == "source_qualified" else "targets",
+                    )
+                return native
+
         (
             node_lookup,
             parent_lookup,
@@ -4537,9 +5351,27 @@ class GraphStore:
             raw_imports,
         ) = self._get_bare_endpoint_context(conn)
 
+        if scoped:
+            caller_col = (
+                "source_qualified" if endpoint == "target_qualified" else "target_qualified"
+            )
+            select_sql += (
+                " AND (id > ?"
+                " OR id IN (SELECT id FROM temp.crg_dirty_edge)"
+                " OR file_path IN (SELECT path FROM temp.crg_dirty_file)"
+                f" OR {endpoint_column} IN (SELECT name FROM temp.crg_dirty_name)"
+                f" OR {caller_col} IN (SELECT qn FROM temp.crg_dirty_qn)"
+                f" OR (extra LIKE '%\"{raw_key}\"%' AND CASE WHEN json_valid(extra)"
+                f" THEN json_extract(extra, '$.{raw_key}') END"
+                " IN (SELECT name FROM temp.crg_dirty_name)))"
+            )
+
         # Stream candidate rows lazily instead of materialising the full set
         # into memory (millions of rows on large graphs, issue #721).
-        bare_edges = conn.execute(select_sql, (kind,))
+        params: tuple[object, ...] = (kind,)
+        if scoped:
+            params = (kind, self._scope_edge_floor)
+        bare_edges = conn.execute(select_sql, params)
         inheritance = InheritanceIndex(conn, import_targets, raw_imports)
         # The function making the call: the edge's source for CALLS, and its
         # target for TESTED_BY, whose source is the callee.
@@ -4779,6 +5611,69 @@ class GraphStore:
             )
         return resolved
 
+    def _native_bare_resolve(
+        self, kind: str, endpoint: str, scope_floor: Optional[int] = None,
+    ) -> int:
+        """``_resolve_bare_endpoints`` as one native pass over the bare edges.
+
+        Same reads, same decisions and the same writes; the resolved count
+        back, or -1. With *scope_floor* (the change capture's edge id floor)
+        it reads only the edges the scoped Python read reads.
+        """
+        if scope_floor is None:
+            return self._native_resolver_job("stage_bare_resolve", kind, endpoint)
+        return self._native_resolver_job(
+            "stage_bare_resolve", kind, endpoint, scope_floor=scope_floor,
+        )
+
+    def _codec_fields(self) -> Optional[tuple]:
+        """The path codec's settings as native passes take them, or None."""
+        codec = getattr(self._conn, "codec", None)
+        if codec is None:
+            return None
+        return (
+            codec.root,
+            codec._json_root_out,
+            list(codec._prefixes),
+            list(codec._roots),
+            list(codec._json_roots),
+            sorted(codec._leads),
+        )
+
+    def _native_resolver_job(
+        self, stage_name: str, *args: object, **kwargs: object,
+    ) -> int:
+        """Run one native resolver pass from ``crg_fast`` in one transaction.
+
+        The pass reads values as the codec's row factory restores them and
+        writes them as ``strip_params`` strips them. -1 when this ``crg_fast``
+        lacks the pass, or the graph holds something the pass does not read
+        the way Python does; it has then written nothing.
+        """
+        import crg_fast
+
+        stage_job = getattr(crg_fast, stage_name, None)
+        if stage_job is None:
+            return -1
+        fields = self._codec_fields()
+        self._begin_immediate()
+        try:
+            token = stage_job(*args, fields, **kwargs)
+            try:
+                row = self._conn.execute("SELECT crg_run(?)", (token,)).fetchone()
+            except BaseException:
+                crg_fast.discard_job(token)
+                raise
+            changed = int(row[0])
+            if changed < 0:
+                self._conn.rollback()
+            else:
+                self._conn.commit()
+        except BaseException:
+            self._conn.rollback()
+            raise
+        return changed
+
     def get_all_files(self) -> list[str]:
         # A partially failed file update can leave Function/Class nodes or
         # edges behind after their File marker is gone. Reconciliation must see
@@ -4790,7 +5685,19 @@ class GraphStore:
         # get_all_files. json_valid gates the extraction, and the truthiness
         # comparison keeps extra='{"virtual": false}' visible instead of
         # making the node immortal to reconciliation (#864).
-        rows = self._conn.execute(
+        # The answer stands while no connection wrote: an update reads it
+        # twice (the partial-graph check, then stale-file reconciliation).
+        conn = self._conn
+        codec = getattr(conn, "codec", None)
+        key = (
+            conn.total_changes,
+            conn.execute("PRAGMA data_version").fetchone()[0],
+            id(codec), getattr(codec, "root", None),
+        )
+        memo = getattr(self, "_all_files_memo", None)
+        if memo is not None and memo[0] == key:
+            return list(memo[1])
+        rows = conn.execute(
             "SELECT file_path FROM nodes "
             "WHERE extra IS NULL "
             "OR json_valid(extra) = 0 "
@@ -4801,7 +5708,9 @@ class GraphStore:
         ).fetchall()
         # Sorted again after restoring: stored ``./`` paths order apart from
         # absolute ones.
-        return sorted(r["file_path"] for r in rows)
+        files = sorted(r["file_path"] for r in rows)
+        self._all_files_memo = (key, files)
+        return list(files)
 
     def get_file_hashes(self) -> dict[str, str]:
         """Return indexed file paths mapped to the hash last stored for each file."""

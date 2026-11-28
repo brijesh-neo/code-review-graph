@@ -260,7 +260,7 @@ class TestPostProcessingStepIsolation:
 
     def test_community_failure_still_has_signatures(self):
         with patch(
-            "code_review_graph.communities.detect_communities",
+            "code_review_graph.communities.detect_and_store_communities",
             side_effect=ImportError("comm boom"),
         ):
             result = run_post_processing(self.store)
@@ -635,7 +635,7 @@ class TestResolveBareEndpointsStep:
     def test_resolution_failure_is_a_warning_not_a_pipeline_failure(self):
         with patch.object(
             GraphStore,
-            "resolve_bare_call_targets",
+            "resolve_bare_endpoints",
             side_effect=sqlite3.OperationalError("boom"),
         ):
             result = run_post_processing(self.store)

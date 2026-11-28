@@ -26,6 +26,13 @@ mod restore;
 mod identities;
 mod node_rows;
 mod json;
+mod pyjson;
+mod pathcodec;
+mod resolve;
+mod communities;
+mod flows;
+mod leiden;
+mod entry_points;
 
 const CAPSULE_NAME: &CStr = c"tree_sitter.Language";
 
@@ -340,5 +347,19 @@ fn crg_fast(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(sqlite_ext::sqlite_extension_loaded, module)?)?;
     module.add_function(wrap_pyfunction!(sqlite_ext::discard_job, module)?)?;
     module.add_function(wrap_pyfunction!(certainty::stage_certainty_refresh, module)?)?;
+    module.add_function(wrap_pyfunction!(resolve::stage_bare_resolve, module)?)?;
+    module.add_function(wrap_pyfunction!(resolve::stage_bare_resolve_pair, module)?)?;
+    module.add_function(wrap_pyfunction!(resolve::stage_inherited_resolve, module)?)?;
+    module.add_function(wrap_pyfunction!(resolve::stage_unbound_settle, module)?)?;
+    module.add_function(wrap_pyfunction!(communities::stage_file_communities, module)?)?;
+    module.add_function(wrap_pyfunction!(flows::stage_flow_trace, module)?)?;
+    module.add_function(wrap_pyfunction!(leiden::stage_leiden_read, module)?)?;
+    module.add_function(wrap_pyfunction!(leiden::discard_leiden, module)?)?;
+    module.add_function(wrap_pyfunction!(leiden::leiden_graph, module)?)?;
+    module.add_function(wrap_pyfunction!(leiden::leiden_communities, module)?)?;
+    module.add_function(wrap_pyfunction!(leiden::stage_leiden_store, module)?)?;
+    module.add_function(wrap_pyfunction!(entry_points::stage_entry_scan, module)?)?;
+    module.add_function(wrap_pyfunction!(entry_points::take_entry_scan, module)?)?;
+    module.add_function(wrap_pyfunction!(flows::take_flow_trace, module)?)?;
     Ok(())
 }

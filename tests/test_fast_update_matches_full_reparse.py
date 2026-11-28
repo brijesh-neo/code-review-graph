@@ -14,6 +14,7 @@ without the native ``crg_fast`` module installed.
 
 from __future__ import annotations
 
+import json
 import shutil
 import sqlite3
 import subprocess
@@ -266,3 +267,308 @@ def test_flag_on_update_leaves_no_transaction_open(
             assert checkpointed == log_frames
     finally:
         store.close()
+
+
+def _twice_updated_graph(
+    base_repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    label: str, flag: bool,
+) -> Path:
+    """Add a symbol, update, then rename one before committing, and update."""
+    repo = tmp_path / label
+    shutil.copytree(base_repo, repo)
+    data = tmp_path / f"{label}-data"
+    monkeypatch.setenv("CRG_DATA_DIR", str(data))
+    monkeypatch.delenv("CRG_FAST_ENGINE", raising=False)
+    assert build_or_update_graph(full_rebuild=True, repo_root=str(repo))["status"] == "ok"
+    if flag:
+        monkeypatch.setenv("CRG_FAST_ENGINE", "1")
+    _add_symbol(repo)
+    assert build_or_update_graph(repo_root=str(repo))["status"] == "ok"
+    (repo / "lib.py").write_text(
+        (LIB + "\n\ndef later():\n    return 3\n").replace("helper", "helper_two")
+    )
+    assert build_or_update_graph(repo_root=str(repo))["status"] == "ok"
+    monkeypatch.delenv("CRG_FAST_ENGINE", raising=False)
+    return data / "graph.db"
+
+
+def test_second_save_before_a_commit_skips_importers_and_matches_legacy(
+    base_repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The graph holds bytes Git never saw after the first update, so the
+    # second one reads them from the copy the first update kept.
+    selections: list[object] = []
+    original = incremental._importers_to_reparse
+
+    def spy(*args, **kwargs):
+        selected = original(*args, **kwargs)
+        selections.append(selected)
+        return selected
+
+    monkeypatch.setattr(incremental, "_importers_to_reparse", spy)
+    legacy = _twice_updated_graph(base_repo, tmp_path, monkeypatch, "off", False)
+    assert selections == []
+    fast = _twice_updated_graph(base_repo, tmp_path, monkeypatch, "on", True)
+
+    assert _dump(fast) == _dump(legacy)
+    assert len(selections) == 2
+    assert isinstance(selections[1], set)
+    assert {"a.py", "b.py", "c.py", "d.py"} - selections[1]
+    # Only the copy and summary of the bytes the graph now holds are left.
+    stored = (tmp_path / "on" / "lib.py").read_bytes()
+    import hashlib
+
+    digest = hashlib.sha256(stored).hexdigest()
+    copies = sorted(p.name for p in (fast.parent / "source-copies").iterdir())
+    assert copies == [digest, f"{digest}.summary"]
+
+
+def test_a_copy_that_does_not_match_its_name_is_not_read(tmp_path: Path) -> None:
+    import hashlib
+
+    data = b"def f():\n    return 1\n"
+    digest = hashlib.sha256(data).hexdigest()
+    (tmp_path / digest).write_bytes(data)
+    assert incremental._read_source_copy(tmp_path, digest) == data
+    (tmp_path / digest).write_bytes(data + b"# changed\n")
+    assert incremental._read_source_copy(tmp_path, digest) is None
+    assert incremental._read_source_copy(tmp_path, "../" + digest) is None
+    assert incremental._read_source_copy(None, digest) is None
+
+
+def test_a_full_build_drops_copies_no_file_holds(
+    base_repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    data = tmp_path / "data"
+    monkeypatch.setenv("CRG_DATA_DIR", str(data))
+    monkeypatch.delenv("CRG_FAST_ENGINE", raising=False)
+    assert build_or_update_graph(full_rebuild=True, repo_root=str(base_repo))["status"] == "ok"
+    copies = data / "source-copies"
+    copies.mkdir()
+    import hashlib
+
+    held = hashlib.sha256((base_repo / "lib.py").read_bytes()).hexdigest()
+    (copies / held).write_bytes((base_repo / "lib.py").read_bytes())
+    (copies / ("0" * 64)).write_bytes(b"gone\n")
+    facts = data / "module-facts"
+    facts.mkdir()
+    (facts / f"{held}.rets").write_bytes(b"kept\n")
+    (facts / f"{'0' * 64}.skel").write_bytes(b"gone\n")
+    assert build_or_update_graph(full_rebuild=True, repo_root=str(base_repo))["status"] == "ok"
+    assert sorted(p.name for p in copies.iterdir()) == [held]
+    assert sorted(p.name for p in facts.iterdir()) == [f"{held}.rets"]
+
+
+# Two definitions of one name: the second one in the file takes a collision
+# identity, and which one an edge names follows their lines.
+DUP_LIB = """\
+def dup(x):
+    return x
+
+
+def dup(x, y):
+    return x + y
+
+
+def plain():
+    return 0
+"""
+
+
+@pytest.fixture
+def dup_repo(tmp_path: Path) -> Path:
+    repo = tmp_path / "dup-base"
+    repo.mkdir()
+    _git(repo, "init", "-q", "-b", "main")
+    (repo / "lib.py").write_text(DUP_LIB)
+    (repo / "a.py").write_text("from lib import dup\n\n\ndef use():\n    return dup(1, 2)\n")
+    (repo / "b.py").write_text("from lib import plain\n\n\ndef use_b():\n    return plain()\n")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-qm", "init")
+    return repo
+
+
+@pytest.mark.parametrize(
+    ("edit", "reparsed"),
+    [
+        # Nothing before the two definitions moves: a.py keeps its rows.
+        (lambda text: text + "\n\ndef later():\n    return 3\n", set()),
+        (lambda text: text.replace("return 0", "return 10"), set()),
+        # A line above them shifts both, so a.py's call is parsed again.
+        (lambda text: "def first():\n    return 9\n\n\n" + text, {"a.py"}),
+        (lambda text: text.replace("def dup(x, y):", "def dup(x, z):"), {"a.py"}),
+    ],
+    ids=["appended", "unrelated_body", "shifted", "one_changed"],
+)
+def test_same_named_definitions_count_as_changed_only_when_they_move(
+    edit: Callable[[str], str], reparsed: set[str],
+    dup_repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    selections: list[object] = []
+    original = incremental._importers_to_reparse
+
+    def spy(*args, **kwargs):
+        selected = original(*args, **kwargs)
+        selections.append(selected)
+        return selected
+
+    monkeypatch.setattr(incremental, "_importers_to_reparse", spy)
+
+    def apply(repo: Path) -> None:
+        (repo / "lib.py").write_text(edit(DUP_LIB))
+
+    legacy = _updated_graph(dup_repo, tmp_path, monkeypatch, "off", apply, False)
+    fast = _updated_graph(dup_repo, tmp_path, monkeypatch, "on", apply, True)
+    assert _dump(fast) == _dump(legacy)
+    assert len(selections) == 1 and isinstance(selections[0], set)
+    assert selections[0] & {"a.py"} == reparsed
+
+
+def _second_save_selection(
+    base_repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    between: Callable[[Path], None],
+) -> tuple[object, Path]:
+    """The second update's importer selection, *between* run on the copy dir."""
+    selections: list[object] = []
+    original = incremental._importers_to_reparse
+
+    def spy(*args, **kwargs):
+        selected = original(*args, **kwargs)
+        selections.append(selected)
+        return selected
+
+    monkeypatch.setattr(incremental, "_importers_to_reparse", spy)
+    repo = tmp_path / "on"
+    shutil.copytree(base_repo, repo)
+    data = tmp_path / "on-data"
+    monkeypatch.setenv("CRG_DATA_DIR", str(data))
+    monkeypatch.delenv("CRG_FAST_ENGINE", raising=False)
+    assert build_or_update_graph(full_rebuild=True, repo_root=str(repo))["status"] == "ok"
+    monkeypatch.setenv("CRG_FAST_ENGINE", "1")
+    _add_symbol(repo)
+    assert build_or_update_graph(repo_root=str(repo))["status"] == "ok"
+    between(data / "source-copies")
+    (repo / "lib.py").write_text(
+        (LIB + "\n\ndef later():\n    return 3\n").replace("helper", "helper_two")
+    )
+    assert build_or_update_graph(repo_root=str(repo))["status"] == "ok"
+    monkeypatch.delenv("CRG_FAST_ENGINE", raising=False)
+    return selections[-1], data / "graph.db"
+
+
+def _drop_byte_copies(copies: Path) -> None:
+    for entry in copies.iterdir():
+        if "." not in entry.name:
+            entry.unlink()
+
+
+def test_a_saved_summary_stands_in_for_the_stored_bytes(
+    base_repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    legacy = _twice_updated_graph(base_repo, tmp_path, monkeypatch, "off", False)
+    parses: list[Path] = []
+    original = incremental._committed_bytes
+
+    def spy(*args, **kwargs):
+        parses.append(args[1])
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(incremental, "_committed_bytes", spy)
+    selected, fast = _second_save_selection(
+        base_repo, tmp_path, monkeypatch, _drop_byte_copies,
+    )
+    assert _dump(fast) == _dump(legacy)
+    assert isinstance(selected, set)
+    # Only the first update had to read stored bytes; the second read none.
+    assert parses == ["lib.py"]
+
+
+def test_a_summary_another_code_version_wrote_is_not_read(
+    base_repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def stale(copies: Path) -> None:
+        _drop_byte_copies(copies)
+        for entry in copies.glob("*.summary"):
+            saved = json.loads(entry.read_text())
+            saved["fingerprint"] = "0" * 64
+            entry.write_text(json.dumps(saved))
+
+    selected, _ = _second_save_selection(base_repo, tmp_path, monkeypatch, stale)
+    assert selected is None
+
+
+def _first_update_after_a_build(
+    repo: Path, data: Path, monkeypatch: pytest.MonkeyPatch, fast_build: bool,
+) -> tuple[Path, list[str], list[object]]:
+    """Build *repo*, rename a symbol, update under the flag; the stored bytes read."""
+    reads: list[str] = []
+    selections: list[object] = []
+    read_original = incremental._committed_bytes
+    select_original = incremental._importers_to_reparse
+
+    def read_spy(*args, **kwargs):
+        reads.append(args[1])
+        return read_original(*args, **kwargs)
+
+    def select_spy(*args, **kwargs):
+        selected = select_original(*args, **kwargs)
+        selections.append(selected)
+        return selected
+
+    monkeypatch.setattr(incremental, "_committed_bytes", read_spy)
+    monkeypatch.setattr(incremental, "_importers_to_reparse", select_spy)
+    monkeypatch.setenv("CRG_DATA_DIR", str(data))
+    if fast_build:
+        monkeypatch.setenv("CRG_FAST_ENGINE", "1")
+    else:
+        monkeypatch.delenv("CRG_FAST_ENGINE", raising=False)
+    assert build_or_update_graph(full_rebuild=True, repo_root=str(repo))["status"] == "ok"
+    _rename_symbol(repo)
+    monkeypatch.setenv("CRG_FAST_ENGINE", "1")
+    assert build_or_update_graph(repo_root=str(repo))["status"] == "ok"
+    monkeypatch.delenv("CRG_FAST_ENGINE", raising=False)
+    return data / "graph.db", reads, selections
+
+
+@pytest.mark.parametrize("padding", [0, 4], ids=["serial-build", "parallel-build"])
+def test_a_flag_on_build_saves_the_summaries_the_first_update_reads(
+    padding: int, base_repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Eight files or more take the build's parallel parse.
+    for index in range(padding):
+        (base_repo / f"pad{index}.py").write_text(f"def pad{index}():\n    return {index}\n")
+    if padding:
+        _git(base_repo, "add", "-A")
+        _git(base_repo, "commit", "-qm", "pad")
+    without, read_without, _ = _first_update_after_a_build(
+        shutil.copytree(base_repo, tmp_path / "off"), tmp_path / "off-data",
+        monkeypatch, fast_build=False,
+    )
+    with_summaries, read_with, selections = _first_update_after_a_build(
+        shutil.copytree(base_repo, tmp_path / "on"), tmp_path / "on-data",
+        monkeypatch, fast_build=True,
+    )
+    copies = tmp_path / "on-data" / "source-copies"
+    py_files = sum(1 for path in (tmp_path / "on").glob("*.py"))
+    # One summary per Python file the graph holds, renamed lib.py's new one included.
+    assert len(list(copies.glob("*.summary"))) == py_files
+    # A build without the flag saves none, so its first update reads lib.py's bytes.
+    assert read_without == ["lib.py"]
+    assert read_with == []
+    assert isinstance(selections[-1], set)
+    assert _dump(with_summaries) == _dump(without)
+
+
+def test_canonical_json_tells_apart_values_python_tells_apart() -> None:
+    values = [
+        None, "1", 1, 1.0, True, (1,), [1], {1}, {"1": 1}, {1: 1}, ("a", ("b",)),
+        ("a", ["b"]), frozenset({"x", "y"}), {"k": ("v",)},
+    ]
+    encoded = [incremental._canonical_json(value) for value in values]
+    assert len(set(encoded)) == len(values)
+    assert incremental._canonical_json({"y", "x"}) == incremental._canonical_json(
+        frozenset({"x", "y"}),
+    )
+    assert incremental._canonical_json({"b": 1, "a": 2}) == incremental._canonical_json(
+        {"a": 2, "b": 1},
+    )

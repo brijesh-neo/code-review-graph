@@ -70,11 +70,12 @@ def resolve_python_imports(store: GraphStore) -> dict[str, int]:
     resolved = 0
     ambiguous = 0
     python_file_set = set(python_files)
+    # Each edge once, as a join with DISTINCT gives it, without sorting every
+    # row's extra to drop duplicates.
     for edge in conn.execute(
-        "SELECT DISTINCT e.id, e.target_qualified, e.extra "
-        "FROM edges e JOIN nodes f "
-        "ON f.kind = 'File' AND f.file_path = e.file_path "
-        "WHERE e.kind = 'IMPORTS_FROM' AND f.language = 'python'"
+        "SELECT e.id, e.target_qualified, e.extra FROM edges e "
+        "WHERE e.kind = 'IMPORTS_FROM' AND e.file_path IN ("
+        "SELECT file_path FROM nodes WHERE kind = 'File' AND language = 'python')"
     ).fetchall():
         raw_extra = edge["extra"]
         if not raw_extra or raw_extra == "{}":
