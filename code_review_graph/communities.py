@@ -982,6 +982,78 @@ def remap_community_assignments(
     return updated
 
 
+_CAPTURE_TABLE = "temp.crg_community_capture"
+
+
+def capture_community_assignments_in_sql(
+    store: GraphStore,
+    file_paths: list[str],
+) -> int:
+    """:func:`capture_community_assignments` kept in a TEMP table, not a dict.
+
+    Same rows, with the last row of a qualified name winning as in the dict,
+    but stored as written, so neither the capture nor
+    :func:`remap_captured_community_assignments` passes thousands of names
+    through the connection's path translation. Returns the number of names
+    captured (the dict's length).
+    """
+    conn = store._conn
+    conn.execute(
+        "CREATE TEMP TABLE IF NOT EXISTS crg_community_capture "
+        "(qn TEXT PRIMARY KEY, cid INTEGER NOT NULL)"
+    )
+    conn.execute(f"DELETE FROM {_CAPTURE_TABLE}")  # nosec B608 - fixed name
+    for i in range(0, len(file_paths), _SQL_BATCH):
+        batch = file_paths[i:i + _SQL_BATCH]
+        placeholders = ",".join("?" * len(batch))
+        conn.execute(
+            f"INSERT OR REPLACE INTO {_CAPTURE_TABLE} (qn, cid) "  # nosec B608
+            "SELECT qualified_name, community_id FROM nodes "
+            "WHERE community_id IS NOT NULL AND qualified_name IS NOT NULL "
+            f"AND qualified_name != '' AND file_path IN ({placeholders})",
+            batch,
+        )
+    row = conn.execute(f"SELECT COUNT(*) FROM {_CAPTURE_TABLE}").fetchone()  # nosec B608
+    return int(row[0])
+
+
+def remap_captured_community_assignments(store: GraphStore) -> int:
+    """:func:`remap_community_assignments` for the TEMP-table capture.
+
+    Updates the same rows to the same IDs in one statement and drops the
+    capture. Returns the number of nodes updated.
+    """
+    conn = store._conn
+    if not conn.execute(
+        "SELECT 1 FROM sqlite_temp_master WHERE type = 'table' "
+        "AND name = 'crg_community_capture'"
+    ).fetchone():
+        return 0
+    try:
+        if not conn.execute(f"SELECT 1 FROM {_CAPTURE_TABLE} LIMIT 1").fetchone():  # nosec B608
+            return 0
+        if conn.in_transaction:
+            logger.warning("Rolling back uncommitted transaction before BEGIN IMMEDIATE")
+            conn.rollback()
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            cur = conn.execute(
+                "UPDATE nodes SET community_id = ("  # nosec B608 - fixed name
+                f"SELECT c.cid FROM {_CAPTURE_TABLE} c WHERE c.qn = nodes.qualified_name) "
+                f"WHERE qualified_name IN (SELECT qn FROM {_CAPTURE_TABLE}) "
+                "AND community_id IS NOT ("
+                f"SELECT c.cid FROM {_CAPTURE_TABLE} c WHERE c.qn = nodes.qualified_name)"
+            )
+            updated = max(cur.rowcount, 0)
+            conn.commit()
+        except BaseException:
+            conn.rollback()
+            raise
+        return updated
+    finally:
+        conn.execute(f"DROP TABLE IF EXISTS {_CAPTURE_TABLE}")  # nosec B608
+
+
 def purge_empty_communities(store: GraphStore) -> int:
     """Delete community rows that no longer have any assigned nodes.
 

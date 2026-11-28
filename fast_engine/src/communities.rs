@@ -343,17 +343,33 @@ fn detect(db: *mut ffi::sqlite3, paths: &Paths, nodes: &[Node], min_size: usize)
             qn_to_idx.insert(nodes[m].qualified_name.as_str(), idx);
         }
     }
+    // The same lookup keyed by stored form, for the stored values that
+    // restore to a member's name: an edge endpoint that matches one needs no
+    // restored copy. Any other value is restored and looked up as before.
+    let mut stored_to_idx: HashMap<String, usize> = HashMap::default();
+    for (&qn, &idx) in &qn_to_idx {
+        let stored = paths.strip(qn);
+        if paths.restore(&stored).as_ref() == qn {
+            stored_to_idx.insert(stored.into_owned(), idx);
+        }
+    }
+    let lookup = |raw: &str| -> Option<usize> {
+        match stored_to_idx.get(raw) {
+            Some(&idx) => Some(idx),
+            None => qn_to_idx.get(paths.restore(raw).as_ref()).copied(),
+        }
+    };
     let mut internal = vec![0u64; pending.len()];
     let mut external = vec![0u64; pending.len()];
     if !pending.is_empty() {
         let edges = Rows::new(db, "SELECT kind, source_qualified, target_qualified FROM edges", paths)?;
         while edges.step()? {
             let sc = match edges.stored(1)? {
-                Some(raw) => qn_to_idx.get(paths.restore(raw).as_ref()).copied(),
+                Some(raw) => lookup(raw),
                 None => None,
             };
             let tc = match edges.stored(2)? {
-                Some(raw) => qn_to_idx.get(paths.restore(raw).as_ref()).copied(),
+                Some(raw) => lookup(raw),
                 None => None,
             };
             match (sc, tc) {

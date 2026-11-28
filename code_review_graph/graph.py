@@ -1785,7 +1785,7 @@ class GraphStore:
             file_path=edge.file_path, line=edge.line, extra=extra,
         )
 
-    def _settle_collision_endpoints(self) -> int:
+    def _settle_collision_endpoints(self, scope_floor: Optional[int] = None) -> int:
         """Keep every edge into a duplicated name honest after a store pass.
 
         A file is stored on its own, so a call from another file can be written
@@ -1795,6 +1795,13 @@ class GraphStore:
         on a name several definitions share lists them all instead (#585); one
         whose duplicates are gone binds to the definition left. A recursive
         call is evidence and keeps its binding.
+
+        With *scope_floor* (a native update whose certainty capture and
+        ``temp.crg_endpoint_rows`` are both still there) the key scan reads
+        only rows that can hold the key: those that matched ``endpoint"`` when
+        the endpoint rows were kept, those updated since the capture began, and
+        those inserted above the floor. Nothing after the capture's triggers
+        are dropped writes ``extra``, so no other row can.
 
         Returns the number of edges changed.
         """
@@ -1851,11 +1858,22 @@ class GraphStore:
             ("TESTED_BY", "source_qualified", "target_qualified"),
         )
         handled: set[int] = set()
-        for row in conn.execute(
-            "SELECT id, kind, source_qualified, target_qualified, extra FROM edges "
-            "WHERE extra LIKE ?",
-            (f'%"{_COLLISION_ENDPOINT_KEY}"%',),
-        ).fetchall():
+        key_pattern = f'%"{_COLLISION_ENDPOINT_KEY}"%'
+        if scope_floor is None:
+            key_rows = conn.execute(
+                "SELECT id, kind, source_qualified, target_qualified, extra FROM edges "
+                "WHERE extra LIKE ?",
+                (key_pattern,),
+            ).fetchall()
+        else:
+            key_rows = conn.execute(
+                "SELECT id, kind, source_qualified, target_qualified, extra FROM edges "
+                "WHERE (id IN (SELECT id FROM temp.crg_endpoint_rows "
+                "UNION SELECT id FROM temp.crg_cert_edge) OR id > ?) "
+                "AND extra LIKE ? ORDER BY id",
+                (scope_floor, key_pattern),
+            ).fetchall()
+        for row in key_rows:
             extra = _load_collision_extra(row["extra"])
             base = extra.get(_COLLISION_ENDPOINT_KEY)
             column = next((c for k, c, _ in endpoints if k == row["kind"]), None)
@@ -3969,10 +3987,14 @@ class GraphStore:
             except BaseException:
                 self._conn.rollback()
                 raise
+            # Still inside the capture: the collision pass reads only the rows
+            # that can hold its key (see _settle_collision_endpoints).
+            self._settle_collision_endpoints(
+                scope_floor if getattr(self, "_endpoint_rows_kept", False) else None
+            )
         finally:
             if getattr(self, "_certainty_scope_floor", None) is not None:
                 self._end_certainty_scope()
-        self._settle_collision_endpoints()
         return changed
 
     def _native_certainty_refresh(self, scope_floor: Optional[int] = None) -> int:

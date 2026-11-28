@@ -4817,7 +4817,9 @@ def incremental_update(
     # ``update --skip-flows`` and would never get the flows back.
     from .communities import (
         capture_community_assignments,
+        capture_community_assignments_in_sql,
         purge_empty_communities,
+        remap_captured_community_assignments,
         remap_community_assignments,
     )
     from .flows import (
@@ -4840,7 +4842,14 @@ def incremental_update(
     lifecycle_paths = expand_changed_file_paths(
         store, lifecycle_inputs, repo_root=repo_root,
     )
-    community_by_qn = capture_community_assignments(store, lifecycle_paths)
+    # The TEMP-table capture commits as it goes (autocommit); inside an open
+    # transaction a later rollback could drop it, so that case keeps the dict.
+    community_by_qn: Optional[dict[str, int]] = None
+    if store._conn.in_transaction:
+        community_by_qn = capture_community_assignments(store, lifecycle_paths)
+        communities_captured = len(community_by_qn)
+    else:
+        communities_captured = capture_community_assignments_in_sql(store, lifecycle_paths)
     cleared_entry_qns: set[str] = set()
     flow_node_ids: dict[int, str] = {}
 
@@ -4964,14 +4973,17 @@ def incremental_update(
 
     # Remap surviving community IDs onto replacement nodes, drop orphan flow
     # rows, and remove community rows that no longer have any members.
-    remap_community_assignments(store, community_by_qn)
+    if community_by_qn is None:
+        remap_captured_community_assignments(store)
+    else:
+        remap_community_assignments(store, community_by_qn)
     remap_flow_node_ids(store, flow_node_ids)
     purge_orphan_flow_data(store)
     purge_empty_communities(store)
 
     flow_entry_point_qns = sorted(cleared_entry_qns)
     communities_were_affected = (
-        (bool(community_by_qn) and (parsed_files > 0 or bool(to_remove)))
+        (communities_captured > 0 and (parsed_files > 0 or bool(to_remove)))
         or bool(missing_paths)
         or bool(stale_files)
     )
