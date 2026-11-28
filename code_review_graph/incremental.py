@@ -3131,6 +3131,10 @@ def _parse_single_file(
                 parser.use_python_skeletons(
                     Path(summary_dir).parent / _MODULE_FACT_DIR, fingerprint,
                 )
+            if summary_dir is not None:
+                from .parser import use_parser_probe_record
+
+                use_parser_probe_record(Path(summary_dir).parent / _PARSER_PROBE_RECORD_NAME)
         nodes, edges = parser.parse_bytes(abs_path, raw)
         if summary_dir is not None:
             _save_build_summary(

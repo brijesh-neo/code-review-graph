@@ -19,6 +19,7 @@ import re
 import subprocess
 import sys
 import threading
+import unicodedata
 from bisect import bisect_left, bisect_right
 from collections import deque
 from collections.abc import Iterator
@@ -271,6 +272,63 @@ class _PythonScopeBindingVisitor:
                         stack.append(value)
 
 
+_NON_ASCII_RE = re.compile(r"[^\x00-\x7f]")
+
+
+class _PythonSourceSpans:
+    """Whether a scope of one Python file spells any of a few names.
+
+    A scope can only bind a name its own text spells, so a scope whose bytes
+    hold none of the (ASCII) names a pass asks about needs no binding scan;
+    ``ast`` positions are UTF-8 byte offsets, so they index the bytes. Python
+    reads identifiers after NFKC normalisation, so a file holding any
+    character whose normal form has an ASCII character in it (a fullwidth
+    letter, a ligature) could spell a name another way, and answers "maybe"
+    everywhere, as does one with a byte order mark or a lone carriage return.
+    """
+
+    __slots__ = ("_source", "_starts")
+
+    def __init__(self, source: bytes) -> None:
+        self._source: Optional[bytes] = None
+        self._starts: list[int] = []
+        if b"\r" in source or source.startswith(b"\xef\xbb\xbf"):
+            return
+        if not source.isascii():
+            try:
+                text = source.decode("utf-8")
+            except UnicodeDecodeError:
+                return
+            for char in set(_NON_ASCII_RE.findall(text)):
+                if any(part.isascii() for part in unicodedata.normalize("NFKC", char)):
+                    return
+        starts = [0]
+        find = source.find
+        index = find(b"\n")
+        while index != -1:
+            starts.append(index + 1)
+            index = find(b"\n", index + 1)
+        self._source = source
+        self._starts = starts
+
+    def may_spell(self, node: ast.AST, names: frozenset[str]) -> bool:
+        """False only when *node*'s source text holds none of *names*."""
+        source = self._source
+        if source is None:
+            return True
+        try:
+            start = self._starts[node.lineno - 1] + node.col_offset  # type: ignore[attr-defined]
+            end_line = node.end_lineno  # type: ignore[attr-defined]
+            end_col = node.end_col_offset  # type: ignore[attr-defined]
+            if end_line is None or end_col is None:
+                return True
+            end = self._starts[end_line - 1] + end_col
+        except (AttributeError, IndexError, TypeError):
+            return True
+        find = source.find
+        return any(find(name.encode(), start, end) != -1 for name in names)
+
+
 _PY_STATEMENT_HOLDERS = (ast.stmt, ast.excepthandler, ast.match_case)
 
 
@@ -344,9 +402,13 @@ def _python_function_local_names(
 
 
 def _python_type_checking_aliases(
-    tree: ast.Module,
+    tree: ast.Module, spans: Optional[_PythonSourceSpans] = None,
 ) -> tuple[frozenset[str], frozenset[str]]:
-    """Return unshadowed aliases for ``typing.TYPE_CHECKING``."""
+    """Return unshadowed aliases for ``typing.TYPE_CHECKING``.
+
+    *spans*, the file's source spans, lets a statement that spells none of
+    the aliases skip its binding scan.
+    """
     has_typing_import = False
     for statement in tree.body:
         if isinstance(statement, ast.Import):
@@ -363,6 +425,7 @@ def _python_type_checking_aliases(
     names: set[str] = set()
     modules: set[str] = set()
     shadowed: set[str] = set()
+    others: list[ast.stmt] = []
     for statement in tree.body:
         if isinstance(statement, ast.Import):
             for alias in statement.names:
@@ -379,9 +442,15 @@ def _python_type_checking_aliases(
                 elif alias.name != "*":
                     shadowed.add(alias.asname or alias.name)
         else:
-            bindings = _PythonScopeBindingVisitor()
-            bindings.visit(statement)
-            shadowed.update(bindings.names)
+            others.append(statement)
+    # Only the aliases' own names matter in *shadowed*.
+    asked = frozenset(names | modules)
+    for statement in others:
+        if spans is not None and not spans.may_spell(statement, asked):
+            continue
+        bindings = _PythonScopeBindingVisitor()
+        bindings.visit(statement)
+        shadowed.update(bindings.names)
     return frozenset(names - shadowed), frozenset(modules - shadowed)
 
 
@@ -444,11 +513,21 @@ class _PythonUnreachableCallVisitor(ast.NodeVisitor):
         self,
         type_checking_names: frozenset[str],
         typing_modules: frozenset[str],
+        spans: Optional[_PythonSourceSpans] = None,
     ) -> None:
         self._dead = False
         self.positions: set[tuple[int, int]] = set()
         self._type_checking_names = type_checking_names
         self._typing_modules = typing_modules
+        self._spans = spans
+
+    def _scope_may_shadow(self, node: ast.AST) -> bool:
+        """Whether *node*'s scope could bind a ``TYPE_CHECKING`` alias."""
+        names = self._type_checking_names | self._typing_modules
+        if not names:
+            return False
+        spans = self._spans
+        return spans is None or spans.may_spell(node, names)
 
     def visit_Module(self, node: ast.Module) -> None:  # noqa: N802
         self._visit_statements(node.body, dead=False)
@@ -494,7 +573,7 @@ class _PythonUnreachableCallVisitor(ast.NodeVisitor):
 
         outer_names = self._type_checking_names
         outer_modules = self._typing_modules
-        if outer_names or outer_modules:
+        if self._scope_may_shadow(node):
             bindings = _PythonScopeBindingVisitor()
             for statement in node.body:
                 bindings.visit(statement)
@@ -539,7 +618,7 @@ class _PythonUnreachableCallVisitor(ast.NodeVisitor):
 
         outer_names = self._type_checking_names
         outer_modules = self._typing_modules
-        if outer_names or outer_modules:
+        if self._scope_may_shadow(node):
             bindings = _PythonScopeBindingVisitor()
             for statement in node.body:
                 bindings.visit(statement)
@@ -610,10 +689,12 @@ def _python_unreachable_call_positions(
     tree = _python_module_ast(source)
     if tree is None:
         return frozenset()
-    type_checking_names, typing_modules = _python_type_checking_aliases(tree)
+    spans = _PythonSourceSpans(source)
+    type_checking_names, typing_modules = _python_type_checking_aliases(tree, spans)
     visitor = _PythonUnreachableCallVisitor(
         type_checking_names,
         typing_modules,
+        spans,
     )
     visitor.visit(tree)
     return frozenset(visitor.positions)
@@ -649,10 +730,12 @@ def _python_unreachable_import_positions(
     tree = _python_module_ast(source)
     if tree is None:
         return frozenset()
-    type_checking_names, typing_modules = _python_type_checking_aliases(tree)
+    spans = _PythonSourceSpans(source)
+    type_checking_names, typing_modules = _python_type_checking_aliases(tree, spans)
     visitor = _PythonUnreachableImportVisitor(
         type_checking_names | {"TYPE_CHECKING"},
         typing_modules,
+        spans,
     )
     visitor.visit(tree)
     return frozenset(visitor.positions)
@@ -947,6 +1030,15 @@ def use_parser_probe_record(path: Optional[Path]) -> None:
     (path, size and modification time), so a changed library is probed again.
     """
     _PARSER_PROBE_RECORD[0] = Path(path) if path is not None else None
+    if path is None:
+        return
+    # Grammars this process already probed before the record was named.
+    with _PARSER_PROBE_LOCK:
+        passed = sorted(grammar for grammar, ok in _PARSER_PROBE_RESULTS.items() if ok)
+    for grammar in passed:
+        recorded, identity = _recorded_probe_passed(grammar)
+        if not recorded and identity is not None:
+            _record_probe_passed(grammar, identity)
 
 
 def _parser_probe_identity(grammar: str) -> Optional[str]:
