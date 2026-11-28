@@ -3127,6 +3127,10 @@ def _parse_single_file(
             parser = _get_code_parser_cls()(Path(repo_root_str))
             _PARSE_WORKER_STATE.parser = parser
             _PARSE_WORKER_STATE.repo_root = repo_root_str
+            if summary_dir is not None and fingerprint is not None:
+                parser.use_python_skeletons(
+                    Path(summary_dir).parent / _MODULE_FACT_DIR, fingerprint,
+                )
         nodes, edges = parser.parse_bytes(abs_path, raw)
         if summary_dir is not None:
             _save_build_summary(
@@ -3407,6 +3411,10 @@ def full_build(
         fingerprint = _summary_fingerprint(repo_root)
         if fingerprint is not None:
             summary_args = (str(copy_dir), fingerprint)
+            parser.use_python_skeletons(copy_dir.parent / _MODULE_FACT_DIR, fingerprint)
+        from .parser import use_parser_probe_record
+
+        use_parser_probe_record(copy_dir.parent / _PARSER_PROBE_RECORD_NAME)
 
     with store.bulk_edge_load() if fast_engine_enabled() else nullcontext():
         if use_serial or file_count < 8:
@@ -3589,6 +3597,13 @@ _WILDCARD_IMPORT_RE = re.compile(
 # old bytes back from here when Git does not have them (the file was saved
 # again before a commit), instead of re-parsing every importer.
 _SOURCE_COPY_DIR = "source-copies"
+# In the data dir: the grammar loads whose crash probe passed (see
+# ``parser.use_parser_probe_record``).
+_PARSER_PROBE_RECORD_NAME = "parser-probes.json"
+# In the data dir, beside the copies: facts read from Python modules (their
+# skeleton, property and return annotations) keyed by the module's sha256, so
+# an update reads them instead of parsing every module a changed file imports.
+_MODULE_FACT_DIR = "module-facts"
 _SHA256_HEX_RE = re.compile(r"[0-9a-f]{64}")
 _GIT_COMMIT_RE = re.compile(r"[0-9a-f]{40}|[0-9a-f]{64}")
 
@@ -3658,21 +3673,25 @@ def _save_source_copies(
 
 
 def _prune_source_copies(store: GraphStore, copy_dir: Path | None) -> None:
-    """Delete the kept copies whose hash no file in the graph holds."""
-    if copy_dir is None or not copy_dir.is_dir():
+    """Delete the kept copies and module facts whose hash no file holds."""
+    if copy_dir is None:
+        return
+    dirs = [d for d in (copy_dir, copy_dir.parent / _MODULE_FACT_DIR) if d.is_dir()]
+    if not dirs:
         return
     held = {
         row[0] for row in store._conn.execute(
             "SELECT file_hash FROM nodes WHERE kind = 'File'"
         )
     }
-    try:
-        for entry in copy_dir.iterdir():
-            # ``<hash>`` and ``<hash>.summary`` go with the file that holds it.
-            if entry.name.split(".", 1)[0] not in held:
-                entry.unlink()
-    except OSError as exc:
-        logger.warning("Pruning source copies in %s failed: %s", copy_dir, exc)
+    for directory in dirs:
+        try:
+            for entry in directory.iterdir():
+                # ``<hash>`` and ``<hash>.<kind>`` go with the file that holds it.
+                if entry.name.split(".", 1)[0] not in held:
+                    entry.unlink()
+        except OSError as exc:
+            logger.warning("Pruning kept files in %s failed: %s", directory, exc)
 
 
 def _committed_bytes(
@@ -4440,6 +4459,19 @@ def incremental_update(
         _assert_graph_matches_root(repo_root, store)
     store.bind_repo_root(repo_root)
     parser = _get_code_parser_cls()(repo_root)
+    from .parser import fast_engine_enabled
+
+    if fast_engine_enabled():
+        skeleton_dir = _source_copy_dir(store, repo_root)
+        skeleton_print = _summary_fingerprint(repo_root) if skeleton_dir else None
+        if skeleton_dir is not None and skeleton_print is not None:
+            parser.use_python_skeletons(
+                skeleton_dir.parent / _MODULE_FACT_DIR, skeleton_print,
+            )
+        if skeleton_dir is not None:
+            from .parser import use_parser_probe_record
+
+            use_parser_probe_record(skeleton_dir.parent / _PARSER_PROBE_RECORD_NAME)
     ignore_patterns = _load_ignore_patterns(repo_root)
     vcs = detect_vcs(repo_root)
     stored_git_sha = store.get_metadata("git_head_sha") if vcs == "git" else None

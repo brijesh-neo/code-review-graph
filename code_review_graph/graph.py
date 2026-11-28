@@ -4290,12 +4290,16 @@ class GraphStore:
         rows = self._conn.execute(
             "SELECT e.id, e.source_qualified, e.target_qualified, e.file_path, "
             "e.line, e.extra, s.parent_name, t.id target_id "
-            "FROM edges e "
-            "JOIN nodes s ON s.qualified_name = e.source_qualified "
+            # Drive the join from the (few) C++ nodes: starting from every
+            # CALLS edge costs a node lookup per edge in a mostly non-C++ graph.
+            "FROM nodes s "
+            "CROSS JOIN edges e ON e.source_qualified = s.qualified_name "
+            "AND e.kind = 'CALLS' "
             "LEFT JOIN nodes t ON t.qualified_name = e.target_qualified "
-            "WHERE e.kind = 'CALLS' AND s.language = 'cpp' "
+            "WHERE s.language = 'cpp' "
             "AND ((t.id IS NULL AND e.target_qualified LIKE '%::%') "
-            "OR e.extra LIKE '%\"cpp_scoped_target\"%')",
+            "OR e.extra LIKE '%\"cpp_scoped_target\"%') "
+            "ORDER BY e.id",
         ).fetchall()
         if not rows:
             return 0

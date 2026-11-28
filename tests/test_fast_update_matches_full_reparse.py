@@ -350,8 +350,13 @@ def test_a_full_build_drops_copies_no_file_holds(
     held = hashlib.sha256((base_repo / "lib.py").read_bytes()).hexdigest()
     (copies / held).write_bytes((base_repo / "lib.py").read_bytes())
     (copies / ("0" * 64)).write_bytes(b"gone\n")
+    facts = data / "module-facts"
+    facts.mkdir()
+    (facts / f"{held}.rets").write_bytes(b"kept\n")
+    (facts / f"{'0' * 64}.skel").write_bytes(b"gone\n")
     assert build_or_update_graph(full_rebuild=True, repo_root=str(base_repo))["status"] == "ok"
     assert sorted(p.name for p in copies.iterdir()) == [held]
+    assert sorted(p.name for p in facts.iterdir()) == [f"{held}.rets"]
 
 
 # Two definitions of one name: the second one in the file takes a collision

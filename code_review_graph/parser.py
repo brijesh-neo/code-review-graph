@@ -935,6 +935,72 @@ def _run_parser_load_probe(grammar: str, timeout_seconds: float) -> bool:
     return False
 
 
+# Where grammar loads that passed their probe are recorded across processes
+# (see ``use_parser_probe_record``), or None to probe in every process.
+_PARSER_PROBE_RECORD: list[Optional[Path]] = [None]
+
+
+def use_parser_probe_record(path: Optional[Path]) -> None:
+    """Record grammar probes that passed in *path* and trust them later.
+
+    A record names the interpreter and the exact grammar library it loaded
+    (path, size and modification time), so a changed library is probed again.
+    """
+    _PARSER_PROBE_RECORD[0] = Path(path) if path is not None else None
+
+
+def _parser_probe_identity(grammar: str) -> Optional[str]:
+    """What a passed probe of *grammar* vouches for, or None when unknown."""
+    try:
+        spec = importlib.util.find_spec("tree_sitter_language_pack")
+        origin = spec.origin if spec is not None else None
+        if not origin:
+            return None
+        package = Path(origin).resolve()
+        library = package.parent / "bindings" / f"{grammar}.abi3.so"
+        package_stat = package.stat()
+        library_stat = library.stat()
+    except (OSError, ValueError, ImportError):
+        return None
+    return json.dumps([
+        os.path.realpath(sys.executable), str(package), package_stat.st_mtime_ns,
+        package_stat.st_size, str(library), library_stat.st_mtime_ns, library_stat.st_size,
+    ])
+
+
+def _read_parser_probe_record(path: Path) -> dict[str, str]:
+    try:
+        record = json.loads(path.read_text("utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return record if isinstance(record, dict) else {}
+
+
+def _recorded_probe_passed(grammar: str) -> tuple[bool, Optional[str]]:
+    """Whether the record vouches for *grammar*, and the identity to record."""
+    path = _PARSER_PROBE_RECORD[0]
+    if path is None:
+        return False, None
+    identity = _parser_probe_identity(grammar)
+    if identity is None:
+        return False, None
+    return _read_parser_probe_record(path).get(grammar) == identity, identity
+
+
+def _record_probe_passed(grammar: str, identity: str) -> None:
+    path = _PARSER_PROBE_RECORD[0]
+    if path is None:
+        return
+    record = _read_parser_probe_record(path)
+    record[grammar] = identity
+    partial = path.with_name(f".{path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
+    try:
+        partial.write_text(json.dumps(record, sort_keys=True), "utf-8")
+        os.replace(partial, path)
+    except OSError as exc:
+        logger.debug("Recording the %s parser probe failed: %s", grammar, exc)
+
+
 def _parser_load_probe_succeeds(
     grammar: str,
     timeout_seconds: float | None = None,
@@ -959,12 +1025,19 @@ def _parser_load_probe_succeeds(
             cached = _PARSER_PROBE_RESULTS.get(grammar)
             if cached is not None:
                 return cached
+        recorded, identity = _recorded_probe_passed(grammar)
+        if recorded:
+            with _PARSER_PROBE_LOCK:
+                _PARSER_PROBE_RESULTS[grammar] = True
+            return True
         timeout = (
             _parser_load_timeout_seconds()
             if timeout_seconds is None
             else timeout_seconds
         )
         result = _run_parser_load_probe(grammar, timeout)
+        if result and identity is not None:
+            _record_probe_passed(grammar, identity)
         with _PARSER_PROBE_LOCK:
             _PARSER_PROBE_RESULTS[grammar] = result
             detail = _PARSER_PROBE_FAILURE_DETAILS.get(grammar) if not result else None
@@ -1078,6 +1151,7 @@ def _clear_parser_probe_cache() -> None:
         _PARSER_PROBE_RESULTS.clear()
         _PARSER_PROBE_FAILURE_DETAILS.clear()
         _PARSER_PROBE_GRAMMAR_LOCKS.clear()
+        _PARSER_PROBE_RECORD[0] = None
 
 
 # Grammars the native engine (``CRG_FAST_ENGINE=1``) parses. Others,
@@ -4046,6 +4120,10 @@ class CodeParser:
         self._python_tree_cache: dict[bytes, object] = {}
         self._python_tree_bytes = 0
         self._python_tree_lock = threading.Lock()
+        # Where skeletons of imported modules are kept, and the fingerprint of
+        # the code that made them (see ``use_python_skeletons``).
+        self._python_skeleton_dir: Optional[Path] = None
+        self._python_skeleton_header = b""
         self._module_file_cache: dict[str, Optional[str]] = {}
         # Ignore patterns per repository boundary, so a resolver never names
         # a path the build will not index; see :meth:`_path_is_indexed`.
@@ -4164,6 +4242,129 @@ class CodeParser:
                 del cache[oldest]
                 self._python_tree_bytes -= len(oldest)
         return tree
+
+    # A skeleton keeps a module's top-level statements and stubs its function
+    # and class definitions, which star-export discovery reads only by name;
+    # it parses in a tenth of the time. Version 1.
+    _PYTHON_SKELETON_STUBS = {
+        "function_definition": b"def %s(): pass\n",
+        "class_definition": b"class %s: pass\n",
+    }
+
+    def use_python_skeletons(self, directory: Path, fingerprint: str) -> None:
+        """Keep and read star-export skeletons of Python modules in *directory*.
+
+        A skeleton is named by the sha256 of the bytes it was made from and
+        holds *fingerprint*, the code that made it, so it is used only for
+        those bytes and that code.
+        """
+        self._python_skeleton_dir = Path(directory)
+        self._python_skeleton_header = f"crg-skel 1 {fingerprint}\n".encode()
+
+    def _load_python_fact(self, digest: str, kind: str) -> Optional[bytes]:
+        """The kept *kind* fact of the bytes whose sha256 is *digest*, if any."""
+        directory = self._python_skeleton_dir
+        if directory is None:
+            return None
+        try:
+            data = (directory / f"{digest}.{kind}").read_bytes()
+        except OSError:
+            return None
+        header = self._python_skeleton_header
+        return data[len(header):] if data.startswith(header) else None
+
+    def _python_skeleton_of(self, parser, source: bytes, root) -> Optional[bytes]:
+        """The skeleton of *source*, or None when it would not read the same.
+
+        The skeleton is parsed back and must give the same top-level nodes:
+        each copied statement the same tree, each stub the same name.
+        """
+        if root.has_error:
+            return None
+        parts: list[bytes] = []
+        stubbed: list[Optional[str]] = []
+        for child in root.children:
+            target = child
+            if child.type == "decorated_definition":
+                target = next(
+                    (inner for inner in child.children
+                     if inner.type in self._PYTHON_SKELETON_STUBS),
+                    child,
+                )
+            stub = self._PYTHON_SKELETON_STUBS.get(target.type)
+            name = (
+                self._get_name(
+                    target, "python",
+                    "class" if target.type == "class_definition" else "function",
+                )
+                if stub is not None else None
+            )
+            if stub is not None and name and name.isidentifier():
+                parts.append(stub % name.encode())
+                stubbed.append(name)
+            else:
+                parts.append(source[child.start_byte:child.end_byte] + b"\n")
+                stubbed.append(None)
+        skeleton = b"".join(parts)
+        try:
+            skeleton_root = parser.parse(skeleton).root_node
+        except (RecursionError, ValueError):  # pragma: no cover
+            return None
+        if skeleton_root.has_error:
+            return None
+        skeleton_children = skeleton_root.children
+        if len(skeleton_children) != len(stubbed):
+            return None
+        for original, copied, name in zip(root.children, skeleton_children, stubbed):
+            if name is not None:
+                if copied.type not in self._PYTHON_SKELETON_STUBS or self._get_name(
+                    copied, "python",
+                    "class" if copied.type == "class_definition" else "function",
+                ) != name:
+                    return None
+                continue
+            pending = [(original, copied)]
+            while pending:
+                left, right = pending.pop()
+                if left.type != right.type or left.child_count != right.child_count:
+                    return None
+                if left.child_count == 0:
+                    if left.text != right.text:
+                        return None
+                    continue
+                pending.extend(zip(left.children, right.children))
+        return skeleton
+
+    def _store_python_fact(self, digest: str, kind: str, payload: bytes) -> None:
+        directory = self._python_skeleton_dir
+        if directory is None:
+            return
+        target = directory / f"{digest}.{kind}"
+        partial = directory / f".{digest}.{os.getpid()}.{threading.get_ident()}.tmp"
+        try:
+            directory.mkdir(exist_ok=True)
+            partial.write_bytes(self._python_skeleton_header + payload)
+            os.replace(partial, target)
+        except OSError as exc:
+            logger.debug("Keeping the %s of %s failed: %s", kind, digest, exc)
+
+    def _kept_python_fact(self, source: bytes, kind: str, compute, encode, decode):
+        """*compute()*, or its kept answer for these exact bytes.
+
+        Only for facts that are a function of the module's bytes alone.
+        """
+        if self._python_skeleton_dir is None:
+            return compute()
+        digest = hashlib.sha256(source).hexdigest()
+        kept = self._load_python_fact(digest, kind)
+        if kept is not None:
+            try:
+                return decode(kept)
+            except (ValueError, TypeError) as exc:
+                logger.debug("Ignoring the kept %s of %s: %s", kind, digest, exc)
+        value = compute()
+        self._store_python_fact(digest, kind, encode(value))
+        return value
 
     def clear_caches(
         self, include_parsers: bool = False, release_memory: bool = True
@@ -10146,9 +10347,21 @@ class CodeParser:
         """
         if source is None:
             try:
-                source = module_path.read_bytes()
+                file_bytes = module_path.read_bytes()
             except (OSError, PermissionError):
                 return {}
+            return self._kept_python_fact(
+                file_bytes, "props",
+                lambda: self._read_python_property_return_annotations(
+                    module_path, file_bytes,
+                ),
+                lambda value: json.dumps(
+                    [[owner, name, text] for (owner, name), text in value.items()],
+                ).encode(),
+                lambda data: {
+                    (owner, name): text for owner, name, text in json.loads(data)
+                },
+            )
         parser = self._get_parser("python")
         if not parser:
             return {}
@@ -10719,9 +10932,15 @@ class CodeParser:
         """
         if source is None:
             try:
-                source = module_path.read_bytes()
+                file_bytes = module_path.read_bytes()
             except (OSError, PermissionError):
                 return {}
+            return self._kept_python_fact(
+                file_bytes, "rets",
+                lambda: self._read_python_return_annotations(module_path, file_bytes),
+                lambda value: json.dumps(list(value.items())).encode(),
+                lambda data: {name: text for name, text in json.loads(data)},
+            )
         parser = self._get_parser("python")
         if not parser:
             return {}
@@ -20568,16 +20787,26 @@ class CodeParser:
         *source* stands in for the file's bytes when given.
         """
         resolved_module = normalize_file_path(module_path)
+        digest: Optional[str] = None
         if source is None:
             try:
                 source = module_path.read_bytes()
             except (OSError, PermissionError):
                 return {}
+            if self._python_skeleton_dir is not None:
+                digest = hashlib.sha256(source).hexdigest()
+                skeleton = self._load_python_fact(digest, "skel")
+                if skeleton is not None:
+                    source, digest = skeleton, None
         try:
             parser = self._get_parser("python")
             if not parser:
                 return {}
             tree = self._python_tree(parser, source)  # type: ignore[union-attr]
+            if digest is not None:
+                made = self._python_skeleton_of(parser, source, tree.root_node)
+                if made is not None:
+                    self._store_python_fact(digest, "skel", made)
             import_map, defined_names = self._collect_file_scope(
                 tree.root_node, "python", source, resolved_module,
             )

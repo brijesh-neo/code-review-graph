@@ -970,8 +970,9 @@ def remap_community_assignments(
     conn.execute("BEGIN IMMEDIATE")
     try:
         cur = conn.executemany(
-            "UPDATE nodes SET community_id = ? WHERE qualified_name = ?",
-            [(cid, qn) for qn, cid in items],
+            "UPDATE nodes SET community_id = ? WHERE qualified_name = ? "
+            "AND community_id IS NOT ?",
+            [(cid, qn, cid) for qn, cid in items],
         )
         updated = max(cur.rowcount, 0)
         conn.commit()
