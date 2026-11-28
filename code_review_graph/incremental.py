@@ -3063,6 +3063,7 @@ def find_dependents(
     store: GraphStore,
     file_path: str,
     max_hops: int = _MAX_DEPENDENT_HOPS,
+    _batched: bool = True,
 ) -> DependentList:
     """Find files that import from or depend on the given file.
 
@@ -3073,13 +3074,22 @@ def find_dependents(
     carries a ``.truncated`` flag.  When ``truncated is True`` the
     returned list is capped at ``_MAX_DEPENDENT_FILES`` and the full
     set of dependents was not explored.  See issue #261.
+
+    A hop over several files asks the store once for all of them. That gives
+    the same set as one query per file, but the set keeps its members in
+    another order, and a capped list is the first ``_MAX_DEPENDENT_FILES``
+    of that order. So a walk that reaches the cap is run again one file at a
+    time, which keeps the files it returns.
     """
     all_dependents: set[str] = set()
     visited: set[str] = {file_path}
     frontier: set[str] = {file_path}
     for _hop in range(max_hops):
         next_frontier: set[str] = set()
-        if len(frontier) > 1 and all(normalize_file_path(fp) == fp for fp in frontier):
+        if (
+            _batched and len(frontier) > 1
+            and all(normalize_file_path(fp) == fp for fp in frontier)
+        ):
             # Each path is its own normal form, so the per-file answers drop
             # only spellings already visited: their union is the batch's.
             next_frontier = store.get_direct_dependent_files_of_all(sorted(frontier)) - visited
@@ -3095,6 +3105,8 @@ def find_dependents(
         if not frontier:
             break
         if len(all_dependents) > _MAX_DEPENDENT_FILES:
+            if _batched:
+                return find_dependents(store, file_path, max_hops, _batched=False)
             logger.warning(
                 "Dependent expansion capped at %d files for %s",
                 len(all_dependents),
